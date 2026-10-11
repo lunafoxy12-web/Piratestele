@@ -1,0 +1,8 @@
+{
+  "name": "Remix Remix Remix Pirates world Tele Solution",
+  "description": "Production-ready outbound SIP/IP-to-IP call-center platform for real-time campaign routing, queue management, agent bridging, and DTMF monitoring.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

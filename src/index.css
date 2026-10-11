@@ -1,0 +1,16 @@
+@import "tailwindcss";
+
+/* Hide any floating Zadarma or external softphone widgets/icons */
+#zdrm-webphone-widget,
+#zdrm-webphone-container,
+.zdrm-webphone-widget,
+.zdrm-webphone-icon,
+.zdrm-webphone-btn,
+.zdrm-webphone-call-btn-container,
+[id*="zdrm-webphone"],
+[class*="zdrm-webphone"] {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+  opacity: 0 !important;
+}
