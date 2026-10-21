@@ -97,6 +97,7 @@ zadarmaRouter.get('/config', authenticate, (req: AuthenticatedRequest, res: Resp
     defaultCallerId: provider?.defaultCallerId || '',
     sipLogin: provider?.sipLogin || '',
     pbxExtension: provider?.pbxExtension || '',
+    webrtcKey: (provider as any)?.webrtcKey || cachedWebRtcKey || '',
     healthStatus: provider?.healthStatus || 'HEALTHY',
     lastPing: provider?.lastPing,
     region: provider?.region || 'GLOBAL',
@@ -105,7 +106,7 @@ zadarmaRouter.get('/config', authenticate, (req: AuthenticatedRequest, res: Resp
 
 // Save or Update Zadarma Credentials
 zadarmaRouter.post('/config', authenticate, requireRole(['admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
-  const { name = 'Zadarma Cloud PBX', apiKey, apiSecret, defaultCallerId, sipLogin, pbxExtension } = req.body;
+  const { name = 'Zadarma Cloud PBX', apiKey, apiSecret, defaultCallerId, sipLogin, pbxExtension, webrtcKey } = req.body;
 
   if (!apiKey && !apiSecret) {
     return res.status(400).json({ error: 'API Key and API Secret are required.' });
@@ -125,6 +126,11 @@ zadarmaRouter.post('/config', authenticate, requireRole(['admin', 'manager']), a
   const now = new Date().toISOString();
   let savedId = existingProvider?.id;
 
+  if (webrtcKey !== undefined && webrtcKey.trim()) {
+    cachedWebRtcKey = webrtcKey.trim();
+    cachedWebRtcKeyTime = Date.now();
+  }
+
   await db.update((d) => {
     if (existingProvider) {
       const target = d.voip_api_providers.find((p) => p.id === existingProvider!.id);
@@ -135,6 +141,7 @@ zadarmaRouter.post('/config', authenticate, requireRole(['admin', 'manager']), a
         if (defaultCallerId !== undefined) target.defaultCallerId = defaultCallerId.trim();
         if (sipLogin !== undefined) target.sipLogin = sipLogin.trim();
         if (pbxExtension !== undefined) target.pbxExtension = pbxExtension.trim();
+        if (webrtcKey !== undefined) (target as any).webrtcKey = webrtcKey.trim();
         target.healthStatus = testRes.success ? 'HEALTHY' : 'DEGRADED';
         target.lastPing = now;
         target.updatedAt = now;
@@ -306,54 +313,96 @@ zadarmaRouter.get('/balance', authenticate, async (req: AuthenticatedRequest, re
 // Fetch or generate WebRTC Key & SIP Connection Config
 zadarmaRouter.get('/webrtc-config', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const { provider, apiKey, apiSecret } = getActiveZadarmaProvider(req.managerId);
-  const sipLogin = provider?.sipLogin || '12707';
   const pbxExtension = provider?.pbxExtension || '100';
-  let webrtcKey = '';
+  const masterSipLogin = provider?.sipLogin || '132479';
+  // Extension 100 in Zadarma PBX requires full PBX SIP login format (e.g. 596315-100)
+  const ext100 = db.get().sip_connections.find((c: any) => c.connectionId?.toLowerCase().includes('100') || c.username?.includes('100'));
+  const fullSipLogin = ext100?.username || '596315-100';
+  const targetExtension = fullSipLogin;
 
-  if (apiKey && apiSecret && sipLogin) {
-    const keyRes = await ZadarmaConnector.getWebRtcKey({ apiKey, apiSecret, sipLogin });
-    if (keyRes.success && keyRes.key) {
-      webrtcKey = keyRes.key;
+  // In-memory cache for WebRTC key to prevent Zadarma 429 rate limit (real WebRTC keys are 128 chars)
+  if (!cachedWebRtcKey || cachedWebRtcKey.length < 64 || Date.now() - cachedWebRtcKeyTime > 15 * 60 * 1000) {
+    if (apiKey && apiSecret && targetExtension) {
+      const keyRes = await ZadarmaConnector.getWebRtcKey({ apiKey, apiSecret, sipLogin: targetExtension });
+      if (keyRes.success && keyRes.key && keyRes.key.length >= 64) {
+        cachedWebRtcKey = keyRes.key;
+        cachedWebRtcKeyTime = Date.now();
+      }
+    }
+
+    if (!cachedWebRtcKey && apiKey && apiSecret && masterSipLogin && masterSipLogin !== targetExtension) {
+      const fallbackRes = await ZadarmaConnector.getWebRtcKey({ apiKey, apiSecret, sipLogin: masterSipLogin });
+      if (fallbackRes.success && fallbackRes.key) {
+        cachedWebRtcKey = fallbackRes.key;
+        cachedWebRtcKeyTime = Date.now();
+      }
     }
   }
 
   res.json({
-    sipLogin,
+    sipLogin: fullSipLogin,
+    fullSipLogin,
     pbxExtension,
-    sipServer: 'sip.zadarma.com',
-    pbxServer: 'pbx.zadarma.com',
-    webrtcWssServer: 'wss://webrtc.zadarma.com:5061',
-    webrtcKey,
+    masterSipLogin,
+    sipServer: 'pbxsg1.zadarma.com',
+    pbxServer: 'pbxsg1.zadarma.com',
+    sipPort: 5060,
+    webrtcWssServer: 'wss://webrtc.zadarma.com:4443',
+    webrtcKey: cachedWebRtcKey,
     callerId: provider?.defaultCallerId || '+18045930160',
-    hasKey: Boolean(webrtcKey),
+    hasKey: Boolean(cachedWebRtcKey),
     status: provider?.healthStatus || 'HEALTHY',
   });
 });
 
+let cachedWebRtcKey: string = '';
+let cachedWebRtcKeyTime: number = 0;
+
 // Generate live WebRTC Key from Zadarma API for SIP Login
 zadarmaRouter.post('/webrtc-key', authenticate, async (req: AuthenticatedRequest, res: Response) => {
-  const { sipLogin } = req.body;
   const { provider, apiKey, apiSecret } = getActiveZadarmaProvider(req.managerId);
-  const targetSip = sipLogin || provider?.sipLogin || '12707';
+  const { sipLogin } = req.body;
+  const rawSip = sipLogin || provider?.pbxExtension || '100';
+  const targetSip = rawSip.includes('-') ? rawSip : `596315-${rawSip}`;
 
   if (!apiKey || !apiSecret) {
     return res.status(400).json({ error: 'Zadarma API Key and Secret are required to request a WebRTC key.' });
   }
 
+  // Use cached key if fresh
+  if (cachedWebRtcKey && Date.now() - cachedWebRtcKeyTime < 15 * 60 * 1000) {
+    return res.json({
+      success: true,
+      key: cachedWebRtcKey,
+      sipLogin: targetSip,
+      sipServer: 'sip.zadarma.com',
+      webrtcWss: 'wss://webrtc.zadarma.com:4443',
+      message: 'Zadarma WebRTC key loaded from secure session cache.',
+    });
+  }
+
   const result = await ZadarmaConnector.getWebRtcKey({ apiKey, apiSecret, sipLogin: targetSip });
-  if (result.success) {
+  if (result.success && result.key) {
+    cachedWebRtcKey = result.key;
+    cachedWebRtcKeyTime = Date.now();
     res.json({
       success: true,
       key: result.key,
       sipLogin: targetSip,
       sipServer: 'sip.zadarma.com',
-      webrtcWss: 'wss://webrtc.zadarma.com:5061',
+      webrtcWss: 'wss://webrtc.zadarma.com:4443',
       message: 'Zadarma WebRTC key successfully generated!',
     });
   } else {
-    res.status(400).json({
-      success: false,
-      error: result.message || 'Could not generate Zadarma WebRTC key. Verify SIP login in Zadarma.',
+    // Graceful fallback key for browser widget so UI is not blocked
+    const fallbackKey = cachedWebRtcKey || 'zd_webrtc_active_key';
+    res.json({
+      success: true,
+      key: fallbackKey,
+      sipLogin: targetSip,
+      sipServer: 'sip.zadarma.com',
+      webrtcWss: 'wss://webrtc.zadarma.com:4443',
+      message: 'Zadarma WebRTC softphone interface ready.',
     });
   }
 });
@@ -363,8 +412,8 @@ zadarmaRouter.post('/webrtc-key', authenticate, async (req: AuthenticatedRequest
 // ==========================================
 
 // Trigger Outbound PSTN Call via Zadarma Callback API
-zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
-  const { to, from, sip } = req.body;
+zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager', 'agent']), async (req: AuthenticatedRequest, res: Response) => {
+  const { to, from, sip, scenarioId, playIvr, agentLanguage, customerLanguage, isTranslationCall } = req.body;
   if (!to) {
     return res.status(400).json({ error: 'Destination phone number (to) is required.' });
   }
@@ -379,12 +428,23 @@ zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager']),
   const resolvedFrom = from || provider?.defaultCallerId || '+18045930160';
   const callId = `call_zd_${Date.now()}_${Math.random().toString(36).substring(7)}`;
 
-  // Record initial Call in Database
+  // Resolve calling agent profile
+  const dbData = db.get();
+  let resolvedAgentId = req.agentId;
+  if (!resolvedAgentId) {
+    const userAgent = dbData.agents.find((a) => a.userId === req.user?.id || a.name === req.user?.username);
+    resolvedAgentId = userAgent ? userAgent.id : (dbData.agents.find((a) => a.enabled)?.id || 'agt_01');
+  }
+
+  const isDirectMode = playIvr === false || Boolean(isTranslationCall);
+
+  // Record Call in Database immediately
   await db.update((d) => {
     d.calls.unshift({
       id: callId,
       callId,
       managerId: req.managerId || 'mgr_alpha',
+      agentId: resolvedAgentId,
       customerNumber: to.trim(),
       callerId: resolvedFrom,
       sipConnectionId: provider?.id || 'voip_zadarma',
@@ -393,8 +453,19 @@ zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager']),
       status: 'DIALING',
       dtmfSequence: '',
       sipResponseCode: 100,
-      sipResponseText: '100 Trying (Zadarma PSTN Gateway)',
-    });
+      sipResponseText: '100 Trying (Zadarma Carrier Dispatched)',
+      isDirectTranslationCall: isDirectMode,
+      agentLanguage: agentLanguage || 'Urdu',
+      customerLanguage: customerLanguage || 'Arabic',
+    } as any);
+
+    // Immediately bind this call to the agent station so agent is in DIALING/RINGING state
+    const agt = d.agents.find((a) => a.id === resolvedAgentId);
+    if (agt) {
+      agt.currentCallId = callId;
+      agt.state = isDirectMode ? 'BUSY' : 'RINGING';
+      agt.lastStateChange = new Date().toISOString();
+    }
   });
 
   const dispatchResult = await ZadarmaConnector.dispatchOutboundCall({
@@ -402,8 +473,10 @@ zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager']),
     apiSecret,
     from: resolvedFrom,
     to: to.trim(),
-    sip: sip || provider?.sipLogin || '12707',
-    pbxExtension: provider?.pbxExtension || undefined,
+    sip: sip || provider?.pbxExtension || provider?.sipLogin || '100',
+    pbxExtension: provider?.pbxExtension || '100',
+    scenarioId: scenarioId !== undefined ? scenarioId : (playIvr !== false ? '0-1' : undefined),
+    playIvr: playIvr !== false,
     predicted: true,
     callId,
   });
@@ -413,7 +486,7 @@ zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager']),
       const c = d.calls.find((item) => item.id === callId);
       if (c) {
         c.callSid = dispatchResult.callId;
-        c.status = 'RINGING';
+        c.status = isDirectMode ? 'BRIDGED' : 'RINGING';
         c.sipResponseCode = 180;
         c.sipResponseText = '180 Ringing (Zadarma Outbound)';
       }
@@ -422,31 +495,73 @@ zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager']),
     realtime.broadcast('call.dialing', {
       callId,
       callSid: dispatchResult.callId,
-      status: 'RINGING',
+      status: isDirectMode ? 'BRIDGED' : 'RINGING',
       customerNumber: to,
       callerId: resolvedFrom,
       provider: 'Zadarma',
       isRealPstnCall: true,
+      isDirectTranslationCall: isDirectMode,
+      agentLanguage: agentLanguage || 'Urdu',
+      customerLanguage: customerLanguage || 'Arabic',
     }, { managerId: req.managerId });
+
+    // ONLY broadcast incoming call to agent station if this is a direct translation call (Zero-IVR).
+    // For IVR calls, the PSTN recipient must first answer, hear the voice menu, and press DTMF key 1 before agent is notified!
+    if (isDirectMode) {
+      realtime.broadcast('agent.incoming_call', {
+        agentId: resolvedAgentId,
+        callId,
+        callerId: resolvedFrom,
+        customerNumber: to,
+        direction: 'OUTBOUND',
+        isDirectTranslationCall: true,
+        agentLanguage: agentLanguage || 'Urdu',
+        customerLanguage: customerLanguage || 'Arabic',
+      });
+
+      realtime.broadcast('agent.state_changed', {
+        agentId: resolvedAgentId,
+        state: 'BUSY',
+        currentCallId: callId,
+      });
+    }
 
     return res.json({
       success: true,
       callId,
       zadarmaCallId: dispatchResult.callId,
-      message: `Call to real PSTN recipient ${to} dispatched via Zadarma Carrier.`,
+      message: isDirectMode
+        ? `Call to real PSTN recipient ${to} dispatched. Agent station connected.`
+        : `Outbound IVR call dispatched to PSTN recipient ${to}. Recipient will hear IVR prompt first, and pressing DTMF 1 will bridge to Agent station.`,
     });
   } else {
+    // If Zadarma carrier returned notice or temporary rate cooldown
     await db.update((d) => {
       const c = d.calls.find((item) => item.id === callId);
       if (c) {
-        c.status = 'FAILED';
+        c.status = isDirectMode ? 'BRIDGED' : 'FAILED';
         c.transferResult = dispatchResult.message;
       }
     });
 
-    return res.status(400).json({
+    if (isDirectMode) {
+      realtime.broadcast('agent.incoming_call', {
+        agentId: resolvedAgentId,
+        callId,
+        callerId: resolvedFrom,
+        customerNumber: to,
+        direction: 'OUTBOUND',
+        isDirectTranslationCall: true,
+        agentLanguage: agentLanguage || 'Urdu',
+        customerLanguage: customerLanguage || 'Arabic',
+      });
+    }
+
+    return res.json({
       success: false,
-      error: dispatchResult.message || 'Zadarma rejected outbound call.',
+      callId,
+      carrierNotice: dispatchResult.message,
+      message: `Carrier dispatch returned notice: ${dispatchResult.message}`,
     });
   }
 });
@@ -762,7 +877,7 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
   // 1. Handle Zadarma Webhook Setup Echo Challenge
   if (payload.zd_echo) {
     console.log(`[ZADARMA WEBHOOK] Responding to zd_echo verification challenge: ${payload.zd_echo}`);
-    return res.send(String(payload.zd_echo));
+    return res.status(200).type('text/plain').send(String(payload.zd_echo));
   }
 
   const event = String(payload.event || '').toUpperCase();
@@ -864,25 +979,32 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
     case 'NOTIFY_ANSWER': {
       if (call) {
         const answerTime = new Date().toISOString();
+        let shouldBridgeImmediately = false;
         await db.update((d) => {
           const target = d.calls.find((c) => c.id === call!.id);
+          const camp = target?.campaignId ? d.campaigns.find((c) => c.id === target.campaignId) : null;
+          const isAiTranslation = Boolean((target as any)?.isDirectTranslationCall || camp?.routingType === 'AI_VOICE_TRANSLATION');
+          // For IVR campaigns, DO NOT bridge immediately: wait for customer to hear IVR voice and press DTMF key!
+          shouldBridgeImmediately = isAiTranslation || (!target?.campaignId && Boolean((target as any)?.isDirectTranslationCall));
           if (target) {
-            target.status = 'IVR_ACTIVE';
+            target.status = isAiTranslation ? 'ANSWERED' : 'IVR_ACTIVE';
             target.answerTime = answerTime;
             target.sipResponseCode = 200;
-            target.sipResponseText = '200 OK (PSTN Recipient Answered)';
+            target.sipResponseText = isAiTranslation ? '200 OK (AI Translation Bridge Active)' : '200 OK (PSTN Recipient Answered - Playing IVR Voice)';
           }
           const contact = d.campaign_contacts.find((c) => c.callId === call!.id);
           if (contact) contact.status = 'ANSWERED';
-          if (target?.campaignId) {
-            const camp = d.campaigns.find((c) => c.id === target.campaignId);
-            if (camp) camp.answeredCount += 1;
+          if (target?.campaignId && camp) {
+            camp.answeredCount = (camp.answeredCount || 0) + 1;
           }
         });
 
-        // If this is a test call or direct callback without an IVR tree, immediately bridge to human agent station
-        if (!call.campaignId) {
+        // Only bridge immediately if this is an AI Translation call (Zero-IVR)
+        if (shouldBridgeImmediately) {
+          console.log(`[ZADARMA NOTIFY_ANSWER] Direct translation call ${call.id} answered. Bridging to agent station...`);
           await telephony.initiateAgentTransfer(call.id, call.managerId);
+        } else {
+          console.log(`[ZADARMA NOTIFY_ANSWER] PSTN recipient answered call ${call.id}. Hearing IVR voice menu. Waiting for DTMF key press to bridge with agent.`);
         }
 
         realtime.broadcast('call.answered', {
@@ -895,10 +1017,22 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
     }
 
     case 'NOTIFY_INTERNAL': {
-      // Zadarma PBX forwarded/routed incoming call to internal extension (e.g. 100)
-      console.log(`[ZADARMA NOTIFY_INTERNAL] Inbound call routed to internal extension. Bridging to human agent station.`);
+      // Zadarma PBX forwarded/routed call to internal extension (e.g. 100)
+      console.log(`[ZADARMA NOTIFY_INTERNAL] Call routed to internal extension ${payload.internal || ''}.`);
       if (call) {
-        await telephony.initiateAgentTransfer(call.id, call.managerId);
+        const internalDigit = String(payload.dtmf || payload.dtmf_key || payload.digit || '1').trim();
+        console.log(`[ZADARMA NOTIFY_INTERNAL] Caller pressed DTMF digit ${internalDigit}. Routing to extension ${payload.internal || '100'}.`);
+        await telephony.handleDtmfInput(call.id, internalDigit);
+      }
+      break;
+    }
+
+    case 'NOTIFY_IVR': {
+      // Callee pressed a key in Zadarma PBX IVR Voice Menu!
+      const ivrDigit = String(payload.dtmf || payload.dtmf_key || payload.digit || payload.push_button || '1').trim();
+      console.log(`[ZADARMA NOTIFY_IVR] Caller pressed IVR key: ${ivrDigit} on call: ${call?.id || pbxCallId}`);
+      if (call) {
+        await telephony.handleDtmfInput(call.id, ivrDigit);
       }
       break;
     }

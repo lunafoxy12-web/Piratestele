@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: pirates-world-tele-solution
+    env: node
+    plan: free
+    region: singapore # or oregon, frankfurt, ohio
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    healthCheckPath: /api/health
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: PORT
+        value: 10000
+      - key: APP_URL
+        value: https://pirates-world-tele-solution.onrender.com
+      - key: GEMINI_API_KEY
+        sync: false

@@ -32,6 +32,8 @@ import {
   User,
   Check,
   Trash2,
+  Sparkles,
+  Languages,
 } from 'lucide-react';
 
 export const ManagerDashboard: React.FC = () => {
@@ -70,6 +72,24 @@ export const ManagerDashboard: React.FC = () => {
     ivrConfigId: '',
     targetPhone: '',
     csvText: '',
+    routingType: 'IVR_THEN_DIRECT_AGENT' as 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION',
+    agentLanguage: 'Urdu',
+    customerLanguage: 'Arabic',
+    autoDetectCustomerLanguage: false,
+    aiBotGreeting: 'مرحباً، جاري توصيلك بممثل الخدمة',
+  });
+  const [managerPolicy, setManagerPolicy] = useState<{
+    allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION' | 'BOTH';
+    enforcedAgentLanguage: string;
+    enforcedCustomerLanguage: string;
+    allowManagerOverrideLanguages: boolean;
+    aiTranslationBotVoice: string;
+  }>({
+    allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT',
+    enforcedAgentLanguage: 'Urdu',
+    enforcedCustomerLanguage: 'Arabic',
+    allowManagerOverrideLanguages: true,
+    aiTranslationBotVoice: 'Aoede',
   });
   const [autoStartCampaign, setAutoStartCampaign] = useState<boolean>(true);
 
@@ -123,6 +143,7 @@ export const ManagerDashboard: React.FC = () => {
       if (agentsData) {
         setAgents(agentsData.agents || []);
         if (agentsData.maxAgents !== undefined) setMaxAgents(agentsData.maxAgents);
+        if (agentsData.managerPolicy) setManagerPolicy(agentsData.managerPolicy);
       }
       if (Array.isArray(campData)) setCampaigns(campData);
       if (Array.isArray(ivrData)) setIvrs(ivrData);
@@ -283,8 +304,8 @@ export const ManagerDashboard: React.FC = () => {
     }
 
     const resolvedIvr = campaignForm.ivrConfigId || ivrs[0]?.id;
-    if (!resolvedIvr) {
-      showNotification('error', 'Please create or select an IVR voice first.');
+    if (campaignForm.routingType === 'IVR_THEN_DIRECT_AGENT' && !resolvedIvr) {
+      showNotification('error', 'Please create or select an IVR voice first for IVR campaign.');
       return;
     }
 
@@ -294,9 +315,14 @@ export const ManagerDashboard: React.FC = () => {
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
         body: JSON.stringify({
           name: campaignForm.name.trim(),
-          ivrConfigId: resolvedIvr,
+          ivrConfigId: resolvedIvr || 'ivr_direct',
           contacts: targetList,
           autoStart: autoStartCampaign,
+          routingType: campaignForm.routingType,
+          agentLanguage: campaignForm.agentLanguage,
+          customerLanguage: campaignForm.customerLanguage,
+          autoDetectCustomerLanguage: campaignForm.autoDetectCustomerLanguage,
+          aiBotGreeting: campaignForm.aiBotGreeting,
         }),
       });
 
@@ -306,9 +332,19 @@ export const ManagerDashboard: React.FC = () => {
         return;
       }
 
-      showNotification('success', `Campaign '${data.name}' created! Calling ${targetList[0].phoneNumber} immediately via admin-assigned route.`);
+      showNotification('success', `Campaign '${data.name}' (${campaignForm.routingType === 'AI_VOICE_TRANSLATION' ? 'AI Translation Bot' : 'IVR Menu'}) created! Calling ${targetList[0].phoneNumber} immediately.`);
       setShowCreateCampaignModal(false);
-      setCampaignForm({ name: '', ivrConfigId: '', targetPhone: '', csvText: '' });
+      setCampaignForm({
+        name: '',
+        ivrConfigId: '',
+        targetPhone: '',
+        csvText: '',
+        routingType: managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION' ? 'AI_VOICE_TRANSLATION' : 'IVR_THEN_DIRECT_AGENT',
+        agentLanguage: managerPolicy.enforcedAgentLanguage || 'Urdu',
+        customerLanguage: managerPolicy.enforcedCustomerLanguage || 'Arabic',
+        autoDetectCustomerLanguage: false,
+        aiBotGreeting: 'مرحباً، جاري توصيلك بممثل الخدمة',
+      });
 
       if (autoStartCampaign && data.id) {
         await handleRunCampaign(data.id);
@@ -699,11 +735,19 @@ export const ManagerDashboard: React.FC = () => {
             </div>
             <button
               onClick={() => {
+                const defaultRouting = managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION'
+                  ? 'AI_VOICE_TRANSLATION'
+                  : 'IVR_THEN_DIRECT_AGENT';
                 setCampaignForm({
                   name: `Campaign ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`,
                   ivrConfigId: ivrs[0]?.id || '',
                   targetPhone: '',
                   csvText: '',
+                  routingType: defaultRouting,
+                  agentLanguage: managerPolicy.enforcedAgentLanguage || 'Urdu',
+                  customerLanguage: managerPolicy.enforcedCustomerLanguage || 'Arabic',
+                  autoDetectCustomerLanguage: false,
+                  aiBotGreeting: 'مرحباً، جاري توصيلك بممثل الخدمة',
                 });
                 setShowCreateCampaignModal(true);
               }}
@@ -743,6 +787,16 @@ export const ManagerDashboard: React.FC = () => {
                         >
                           {camp.status}
                         </span>
+                        {camp.routingType === 'AI_VOICE_TRANSLATION' ? (
+                          <span className="text-[11px] px-2.5 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-1">
+                            <Sparkles className="w-3 h-3 text-emerald-600" />
+                            <span>AI Translation ({camp.agentLanguage || 'Urdu'} ⇄ {camp.customerLanguage || 'Arabic'})</span>
+                          </span>
+                        ) : (
+                          <span className="text-[11px] px-2.5 py-0.5 rounded-full font-bold bg-blue-100 text-blue-800 border border-blue-200 flex items-center gap-1">
+                            <span>📞 IVR → Direct Agent</span>
+                          </span>
+                        )}
                       </div>
                       <p className="text-xs text-slate-500 mt-1">
                         IVR Voice: <strong>{ivrs.find((i) => i.id === camp.ivrConfigId)?.name || 'Standard Service Menu'}</strong> &middot; Created on {new Date(camp.createdAt).toLocaleDateString()}
@@ -1078,7 +1132,7 @@ export const ManagerDashboard: React.FC = () => {
                                 : 'bg-red-100 text-red-800 border border-red-200'
                             }`}
                           >
-                            <span>{call.status}</span>
+                            <span>{call.status === 'IVR_ACTIVE' ? 'IVR VOICE ACTIVE' : call.status}</span>
                           </span>
                         </td>
                         <td className="py-3 px-4 font-mono text-xs font-semibold text-slate-700">
@@ -1086,9 +1140,40 @@ export const ManagerDashboard: React.FC = () => {
                         </td>
                         <td className="py-3 px-4">
                           {call.dtmfSequence ? (
-                            <span className="font-mono font-bold text-xs bg-indigo-100 text-indigo-900 border border-indigo-200 px-2 py-0.5 rounded">
-                              Key [{call.dtmfSequence}] &rarr; Transfer
+                            <span className="font-mono font-bold text-xs bg-indigo-100 text-indigo-900 border border-indigo-200 px-2 py-0.5 rounded inline-flex items-center gap-1">
+                              <span>Key [{call.dtmfSequence}]</span>
+                              <span>&rarr;</span>
+                              <span className="text-emerald-700 font-semibold">Bridged with Agent</span>
                             </span>
+                          ) : call.status === 'IVR_ACTIVE' ? (
+                            <div className="flex flex-col gap-1 items-start">
+                              <span className="text-[10px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded inline-flex items-center gap-1">
+                                <Radio className="w-2.5 h-2.5 text-indigo-600 animate-pulse" />
+                                <span>Playing IVR Voice Prompt</span>
+                              </span>
+                              <button
+                                type="button"
+                                onClick={async () => {
+                                  try {
+                                    const res = await fetch('/api/customer/dtmf', {
+                                      method: 'POST',
+                                      headers: { 'Content-Type': 'application/json' },
+                                      body: JSON.stringify({ callId: call.id, digit: '1' }),
+                                    });
+                                    if (res.ok) {
+                                      showNotification('success', 'DTMF Key 1 processed! Call bridged with agent station.');
+                                      fetchData();
+                                    }
+                                  } catch (err: any) {
+                                    showNotification('error', err.message);
+                                  }
+                                }}
+                                className="text-[10px] font-bold px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded shadow-xs transition-colors cursor-pointer inline-flex items-center gap-1"
+                                title="Press DTMF Key 1 to trigger agent bridge"
+                              >
+                                <span>Press [1] &rarr; Bridge Agent</span>
+                              </button>
+                            </div>
                           ) : (
                             <span className="text-slate-400 text-xs">—</span>
                           )}
@@ -1290,26 +1375,167 @@ export const ManagerDashboard: React.FC = () => {
                 </span>
               </div>
 
-              {/* Select IVR Voice */}
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Select IVR Voice / Prompt</label>
-                <select
-                  required
-                  value={campaignForm.ivrConfigId}
-                  onChange={(e) => setCampaignForm({ ...campaignForm, ivrConfigId: e.target.value })}
-                  className="w-full text-sm border border-slate-300 rounded-lg p-2.5 bg-white font-medium"
-                >
-                  <option value="">-- Choose IVR Voice --</option>
-                  {ivrs.map((ivr) => (
-                    <option key={ivr.id} value={ivr.id}>
-                      🎙️ {ivr.name} (Key 1 &rarr; Transfer to Live Agent)
-                    </option>
-                  ))}
-                </select>
-                <p className="text-[11px] text-slate-500 mt-1">
-                  Recipient hears this exact recorded voice when answering. When they press 1, they connect to the live agent.
-                </p>
+              {/* Campaign Routing & Bridge Mode Selection */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-bold text-slate-800">
+                    Campaign Routing Mode:
+                  </label>
+                  {managerPolicy.allowedRoutingMode !== 'BOTH' && (
+                    <span className="text-[10px] bg-amber-100 text-amber-800 font-semibold px-2 py-0.5 rounded-full border border-amber-200">
+                      Enforced by Admin Policy
+                    </span>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-1 gap-2">
+                  {/* Option 1: IVR then Direct Agent */}
+                  {(managerPolicy.allowedRoutingMode === 'BOTH' || managerPolicy.allowedRoutingMode === 'IVR_THEN_DIRECT_AGENT') && (
+                    <label className={`p-3 rounded-xl border flex items-start gap-3 cursor-pointer transition-all ${
+                      campaignForm.routingType === 'IVR_THEN_DIRECT_AGENT'
+                        ? 'bg-blue-50/70 border-blue-400 ring-1 ring-blue-400'
+                        : 'bg-slate-50 border-slate-200'
+                    }`}>
+                      <input
+                        type="radio"
+                        name="campaignRouting"
+                        disabled={managerPolicy.allowedRoutingMode !== 'BOTH'}
+                        checked={campaignForm.routingType === 'IVR_THEN_DIRECT_AGENT'}
+                        onChange={() => setCampaignForm({ ...campaignForm, routingType: 'IVR_THEN_DIRECT_AGENT' })}
+                        className="mt-0.5 text-blue-600 focus:ring-blue-500"
+                      />
+                      <div className="space-y-0.5">
+                        <div className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
+                          <span>Option 1: Traditional IVR Menu → Direct Human Agent Bridge</span>
+                        </div>
+                        <div className="text-[11px] text-slate-500">
+                          PSTN recipient answers, hears IVR voice prompt, presses DTMF key 1, and bridges directly with live agent in normal voice.
+                        </div>
+                      </div>
+                    </label>
+                  )}
+
+                  {/* Option 2: AI Real-Time Voice Translation Bot */}
+                  {(managerPolicy.allowedRoutingMode === 'BOTH' || managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION') && (
+                    <label className={`p-3 rounded-xl border flex items-start gap-3 cursor-pointer transition-all ${
+                      campaignForm.routingType === 'AI_VOICE_TRANSLATION'
+                        ? 'bg-emerald-50/70 border-emerald-400 ring-1 ring-emerald-400'
+                        : 'bg-slate-50 border-slate-200'
+                    }`}>
+                      <input
+                        type="radio"
+                        name="campaignRouting"
+                        disabled={managerPolicy.allowedRoutingMode !== 'BOTH'}
+                        checked={campaignForm.routingType === 'AI_VOICE_TRANSLATION'}
+                        onChange={() => setCampaignForm({ ...campaignForm, routingType: 'AI_VOICE_TRANSLATION' })}
+                        className="mt-0.5 text-emerald-600 focus:ring-emerald-500"
+                      />
+                      <div className="space-y-0.5">
+                        <div className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
+                          <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
+                          <span>Option 2: Real-Time AI Voice Translation Bot Bridge</span>
+                        </div>
+                        <div className="text-[11px] text-slate-500">
+                          PSTN recipient hears AI Bot voice. Agent speaks in their language (Urdu), receiver hears translated bot voice (Arabic). When customer speaks Arabic, agent hears translated voice in Urdu!
+                        </div>
+                      </div>
+                    </label>
+                  )}
+                </div>
               </div>
+
+              {/* IF OPTION 2: AI TRANSLATION CONFIGURATION */}
+              {campaignForm.routingType === 'AI_VOICE_TRANSLATION' && (
+                <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-3.5 space-y-3">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-bold text-emerald-950 flex items-center gap-1.5">
+                      <Languages className="w-4 h-4 text-emerald-700" />
+                      <span>AI Bidirectional Translation Languages</span>
+                    </span>
+                    {!managerPolicy.allowManagerOverrideLanguages && (
+                      <span className="text-[10px] bg-emerald-200/80 text-emerald-900 font-bold px-2 py-0.5 rounded-full">
+                        Admin Enforced
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Agent Speaks (Flow A):
+                      </label>
+                      <select
+                        disabled={!managerPolicy.allowManagerOverrideLanguages}
+                        value={campaignForm.agentLanguage}
+                        onChange={(e) => setCampaignForm({ ...campaignForm, agentLanguage: e.target.value })}
+                        className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-bold text-blue-900 disabled:bg-slate-100 disabled:text-slate-600"
+                      >
+                        <option value="Urdu">Urdu (اردو)</option>
+                        <option value="English">English</option>
+                        <option value="Hindi">Hindi (हिन्दी)</option>
+                        <option value="Spanish">Spanish (Español)</option>
+                        <option value="French">French (Français)</option>
+                        <option value="German">German (Deutsch)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                        Customer Speaks & Hears (Flow B):
+                      </label>
+                      <select
+                        disabled={!managerPolicy.allowManagerOverrideLanguages}
+                        value={campaignForm.customerLanguage}
+                        onChange={(e) => setCampaignForm({ ...campaignForm, customerLanguage: e.target.value })}
+                        className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-bold text-emerald-900 disabled:bg-slate-100 disabled:text-slate-600"
+                      >
+                        <option value="Arabic">Arabic (العربية)</option>
+                        <option value="Urdu">Urdu (اردو)</option>
+                        <option value="English">English</option>
+                        <option value="French">French (Français)</option>
+                        <option value="Spanish">Spanish (Español)</option>
+                        <option value="Turkish">Turkish (Türkçe)</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Initial Bot Greeting (Spoken to Customer upon answer):
+                    </label>
+                    <input
+                      type="text"
+                      value={campaignForm.aiBotGreeting}
+                      onChange={(e) => setCampaignForm({ ...campaignForm, aiBotGreeting: e.target.value })}
+                      placeholder="e.g. مرحباً، جاري توصيلك بممثل الخدمة"
+                      className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-medium text-slate-900 focus:ring-2 focus:ring-emerald-600"
+                    />
+                  </div>
+                </div>
+              )}
+
+              {/* IF OPTION 1: SELECT IVR VOICE */}
+              {campaignForm.routingType === 'IVR_THEN_DIRECT_AGENT' && (
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">Select IVR Voice / Prompt</label>
+                  <select
+                    required
+                    value={campaignForm.ivrConfigId}
+                    onChange={(e) => setCampaignForm({ ...campaignForm, ivrConfigId: e.target.value })}
+                    className="w-full text-sm border border-slate-300 rounded-lg p-2.5 bg-white font-medium"
+                  >
+                    <option value="">-- Choose IVR Voice --</option>
+                    {ivrs.map((ivr) => (
+                      <option key={ivr.id} value={ivr.id}>
+                        🎙️ {ivr.name} (Key 1 &rarr; Transfer to Live Agent)
+                      </option>
+                    ))}
+                  </select>
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Recipient hears this exact recorded voice when answering. When they press 1, they connect to the live agent.
+                  </p>
+                </div>
+              )}
 
               {/* Recipient Phone Number */}
               <div>

@@ -349,7 +349,7 @@ export class SignalWireTrunkConnector {
       };
     }
 
-    const hostAppUrl = appUrl || process.env.APP_URL || 'https://ais-dev-poipaeays7cgf773toaf6y-679199737507.asia-northeast1.run.app';
+    const hostAppUrl = appUrl || process.env.APP_URL || 'https://pirates-world-tele-solution.onrender.com';
     const authHeader = `Basic ${Buffer.from(`${cleanProjectId}:${cleanToken}`).toString('base64')}`;
 
     const textToSay =

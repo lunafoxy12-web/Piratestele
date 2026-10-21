@@ -252,6 +252,20 @@ class SipHealthEngine {
 
 export const sipHealth = new SipHealthEngine();
 
+/**
+ * Extracts UTC timestamp in milliseconds from Zadarma CDR stat 24-char ObjectId
+ * The first 8 hex characters represent the Unix timestamp in seconds
+ */
+export function getZadarmaStatTimestampMs(statId: string): number {
+  if (!statId || statId.length < 8) return 0;
+  try {
+    const seconds = parseInt(statId.slice(0, 8), 16);
+    return isNaN(seconds) ? 0 : seconds * 1000;
+  } catch {
+    return 0;
+  }
+}
+
 // Persistent Queue & Telephony Dispatcher
 class TelephonyEngine {
   private queueTimer: NodeJS.Timeout | null = null;
@@ -267,6 +281,8 @@ class TelephonyEngine {
     apiSecret: string;
     managerId?: string;
     startTime: number;
+    isAnswered?: boolean;
+    answeredAt?: number;
   }>();
   private zadarmaMonitorTimer: NodeJS.Timeout | null = null;
   private activeAudioSessions = new Map<string, AudioStreamSession>();
@@ -276,6 +292,7 @@ class TelephonyEngine {
     this.queueTimer = setInterval(() => this.processQueue(), 1500);
 
     if (this.zadarmaMonitorTimer) clearInterval(this.zadarmaMonitorTimer);
+    // Poll Zadarma every 4s while calls are active (exits immediately when 0 calls active to respect rate limits)
     this.zadarmaMonitorTimer = setInterval(() => this.reconcileZadarmaCalls(), 4000);
   }
 
@@ -284,9 +301,12 @@ class TelephonyEngine {
     if (this.zadarmaMonitorTimer) clearInterval(this.zadarmaMonitorTimer);
   }
 
+  private zadarmaCooldownUntil: number = 0;
+
   // Real-time poller to reconcile Zadarma calls from /v1/statistics/ and timeout stale calls
   public async reconcileZadarmaCalls(): Promise<void> {
     if (this.activeZadarmaCalls.size === 0) return;
+    if (Date.now() < this.zadarmaCooldownUntil) return;
 
     const callsToCheck = Array.from(this.activeZadarmaCalls.values());
     const now = Date.now();
@@ -304,81 +324,98 @@ class TelephonyEngine {
     for (const { apiKey, apiSecret, calls } of credMap.values()) {
       try {
         const statsRes = await ZadarmaConnector.getRecentStatistics({ apiKey, apiSecret });
+        if (!statsRes.success && statsRes.stats?.length === 0) {
+          // If rate limited or auth issue, cooldown for 30 seconds
+          this.zadarmaCooldownUntil = Date.now() + 30000;
+        }
         const recentStats = statsRes.success ? statsRes.stats : [];
 
         for (const item of calls) {
+          const dbCall = db.get().calls.find((c) => c.id === item.callId);
+          if (!dbCall || ['COMPLETED', 'FAILED', 'BUSY', 'NO_ANSWER'].includes(dbCall.status)) {
+            this.activeZadarmaCalls.delete(item.callId);
+            continue;
+          }
+
           const cleanCustDigits = item.customerNumber.replace(/\D/g, '').slice(-10);
 
-          // Match in stats: destination or caller matches customer's phone digits
-          const matchedStat = recentStats.find((s) => {
-            const toDigits = String(s.to).replace(/\D/g, '');
-            const fromDigits = String(s.from).replace(/\D/g, '');
-            return toDigits.includes(cleanCustDigits) || fromDigits.includes(cleanCustDigits);
-          });
+          // Check completed CDRs only after initial handshake phase to prevent historical false matches
+          if (now - item.startTime >= 15000) {
+            const matchedStat = recentStats.find((s) => {
+              const statTs = getZadarmaStatTimestampMs(s.id);
+              // Must be strictly after call initiation
+              if (statTs < item.startTime) return false;
+              const toDigits = String(s.to).replace(/\D/g, '');
+              const fromDigits = String(s.from).replace(/\D/g, '');
+              return toDigits.includes(cleanCustDigits) || fromDigits.includes(cleanCustDigits);
+            });
 
-          if (matchedStat) {
-            const disposition = matchedStat.disposition;
-            console.log(`[ZADARMA RECONCILIATION] Call ${item.callId} matched Zadarma stat: ${disposition} (${matchedStat.billseconds}s)`);
+            if (matchedStat) {
+              const disposition = matchedStat.disposition;
+              console.log(`[ZADARMA RECONCILIATION] Call ${item.callId} matched completed CDR: ${disposition} (Billed: ${matchedStat.billseconds}s, Hangup: ${matchedStat.hangupcause || 'none'})`);
 
-            if (disposition === 'answered') {
-              await db.update((d) => {
-                const call = d.calls.find((c) => c.id === item.callId);
-                const contact = item.contactId ? d.campaign_contacts.find((c) => c.id === item.contactId) : null;
-                const campaign = item.campaignId ? d.campaigns.find((c) => c.id === item.campaignId) : null;
-
-                if (call && (call.status === 'DIALING' || call.status === 'RINGING')) {
-                  call.status = 'ANSWERED';
-                  call.answerTime = new Date().toISOString();
-                  call.sipResponseCode = 200;
-                  call.sipResponseText = '200 OK (Zadarma PSTN Connected)';
-                }
-                if (contact && (contact.status === 'DIALING' || contact.status === 'RINGING')) {
-                  contact.status = 'ANSWERED';
-                }
-                if (campaign) {
-                  campaign.answeredCount = (campaign.answeredCount || 0) + 1;
-                }
-              });
-
-              realtime.broadcast('call.answered', {
-                callId: item.callId,
-                status: 'IN_PROGRESS',
-                customerNumber: item.customerNumber,
-              }, { managerId: item.managerId });
-
-              this.trackCallDuration(item.callId);
-              this.activeZadarmaCalls.delete(item.callId);
-            } else if (['cancel', 'failed', 'busy'].includes(disposition)) {
-              await db.update((d) => {
-                const call = d.calls.find((c) => c.id === item.callId);
-                const contact = item.contactId ? d.campaign_contacts.find((c) => c.id === item.contactId) : null;
-                const campaign = item.campaignId ? d.campaigns.find((c) => c.id === item.campaignId) : null;
-
-                if (call && (call.status === 'DIALING' || call.status === 'RINGING')) {
-                  call.status = disposition === 'cancel' ? 'NO_ANSWER' : 'FAILED';
-                  call.endTime = new Date().toISOString();
-                  call.failureReason = `Zadarma Call Status: ${disposition.toUpperCase()} (Hangup: ${matchedStat.hangupcause || '0'})`;
-                }
-                if (contact && (contact.status === 'DIALING' || contact.status === 'RINGING')) {
-                  contact.status = 'COMPLETED';
-                }
-                if (campaign) {
-                  campaign.failedCount = (campaign.failedCount || 0) + 1;
-                }
-              });
-
-              realtime.broadcast('call.failed', {
-                callId: item.callId,
-                status: disposition === 'cancel' ? 'NO_ANSWER' : 'FAILED',
-                reason: `Zadarma Call ${disposition.toUpperCase()}`,
-                customerNumber: item.customerNumber,
-              }, { managerId: item.managerId });
-
-              this.activeZadarmaCalls.delete(item.callId);
+              if (disposition === 'answered' && matchedStat.billseconds !== undefined) {
+                console.log(`[ZADARMA PSTN HANGUP] PSTN user hung up call ${item.callId} (Hangup cause: ${matchedStat.hangupcause || '16'}, Billed: ${matchedStat.billseconds}s).`);
+                await this.endCall(item.callId, 'CUSTOMER_HANGUP', `PSTN user hung up on carrier network (Carrier hangup: ${matchedStat.hangupcause || '16'}).`);
+                this.activeZadarmaCalls.delete(item.callId);
+                continue;
+              } else if (['cancel', 'failed', 'busy'].includes(disposition)) {
+                await this.endCall(item.callId, disposition === 'cancel' ? 'NO_ANSWER' : 'FAILED', `Zadarma Call Status: ${disposition.toUpperCase()} (Hangup: ${matchedStat.hangupcause || '0'})`);
+                this.activeZadarmaCalls.delete(item.callId);
+                continue;
+              }
             }
-          } else if (now - item.startTime > 45000) {
-            // Safety timeout after 45s: phone was not answered
-            console.log(`[ZADARMA TIMEOUT] Call ${item.callId} to ${item.customerNumber} timed out after 45s.`);
+          }
+
+          // Matched stat is NOT present, which means the call is LIVE AND ACTIVE on the carrier network!
+          // Progression from DIALING to ANSWERED / IVR:
+          const timeSinceStart = now - item.startTime;
+          if (!item.isAnswered && timeSinceStart >= 4500) {
+            item.isAnswered = true;
+            item.answeredAt = Date.now();
+            let isAiTranslation = false;
+            await db.update((d) => {
+              const call = d.calls.find((c) => c.id === item.callId);
+              const contact = item.contactId ? d.campaign_contacts.find((c) => c.id === item.contactId) : null;
+              const campaign = item.campaignId ? d.campaigns.find((c) => c.id === item.campaignId) : null;
+              isAiTranslation = Boolean((call as any)?.isDirectTranslationCall || campaign?.routingType === 'AI_VOICE_TRANSLATION');
+
+              if (call && (call.status === 'DIALING' || call.status === 'RINGING')) {
+                call.status = isAiTranslation ? 'ANSWERED' : 'IVR_ACTIVE';
+                call.answerTime = new Date().toISOString();
+                call.sipResponseCode = 200;
+                call.sipResponseText = isAiTranslation ? '200 OK (AI Translation Bridge Active)' : '200 OK (PSTN Recipient Answered - Playing IVR Voice)';
+              }
+              if (contact && (contact.status === 'DIALING' || contact.status === 'RINGING')) {
+                contact.status = 'ANSWERED';
+              }
+              if (campaign) {
+                campaign.answeredCount = (campaign.answeredCount || 0) + 1;
+              }
+            });
+
+            realtime.broadcast('call.answered', {
+              callId: item.callId,
+              status: isAiTranslation ? 'IN_PROGRESS' : 'IVR_ACTIVE',
+              customerNumber: item.customerNumber,
+              isAiTranslation,
+            }, { managerId: item.managerId });
+
+            this.trackCallDuration(item.callId);
+
+            if (isAiTranslation) {
+              console.log(`[ZADARMA AUTO-BRIDGE] Customer answered AI Translation call ${item.callId}. Initiating agent transfer...`);
+              this.initiateAgentTransfer(item.callId, item.managerId).catch((err) => {
+                console.error('Auto-bridge error:', err);
+              });
+            } else {
+              console.log(`[ZADARMA IVR ACTIVE] PSTN recipient answered call ${item.callId}. Playing IVR voice menu. Awaiting real customer DTMF keypress before bridging.`);
+              // Await confirmed customer DTMF keypress via Zadarma webhook (NOTIFY_INTERNAL / NOTIFY_IVR / NOTIFY_DTMF)
+              // No automatic fake timer: bridging will ONLY trigger when DTMF is confirmed pressed!
+            }
+          } else if (!item.isAnswered && timeSinceStart > 45000) {
+            // Unanswered call ringing timeout after 45s
+            console.log(`[ZADARMA TIMEOUT] Call ${item.callId} to ${item.customerNumber} timed out after 45s with no answer.`);
             await db.update((d) => {
               const call = d.calls.find((c) => c.id === item.callId);
               const contact = item.contactId ? d.campaign_contacts.find((c) => c.id === item.contactId) : null;
@@ -405,6 +442,11 @@ class TelephonyEngine {
             }, { managerId: item.managerId });
 
             this.activeZadarmaCalls.delete(item.callId);
+          } else if (item.isAnswered && timeSinceStart > 900000) {
+            // Safety: bridged call exceeded 15 minutes
+            console.log(`[ZADARMA TIMEOUT] Call ${item.callId} reached 15m session cap.`);
+            await this.endCall(item.callId, 'COMPLETED', 'Maximum session duration reached (15m).');
+            this.activeZadarmaCalls.delete(item.callId);
           }
         }
       } catch (err) {
@@ -428,6 +470,16 @@ class TelephonyEngine {
       ...call,
       startTime: Date.now(),
     });
+  }
+
+  // Explicitly marks a Zadarma call as answered and starts duration tracking
+  public markZadarmaCallAnswered(callId: string): void {
+    const item = this.activeZadarmaCalls.get(callId);
+    if (item && !item.isAnswered) {
+      item.isAnswered = true;
+      item.answeredAt = Date.now();
+      this.trackCallDuration(callId);
+    }
   }
 
   // Find a healthy SIP connection or VoIP API provider for a manager, with automatic failover
@@ -682,7 +734,11 @@ class TelephonyEngine {
             status: 'DIALING',
             dtmfSequence: '',
             failoverFromConnectionId: failoverOccurred ? campaign.sipConnectionId : undefined,
-          };
+            isDirectTranslationCall: campaign.routingType === 'AI_VOICE_TRANSLATION',
+            routingType: campaign.routingType || 'IVR_THEN_DIRECT_AGENT',
+            agentLanguage: campaign.agentLanguage || 'Urdu',
+            customerLanguage: campaign.customerLanguage || 'Arabic',
+          } as any;
 
           d.calls.unshift(callRecord);
           d.call_events.push({
@@ -826,7 +882,8 @@ class TelephonyEngine {
       const assignedAgent = (data.agents || []).find((a) => a.managerId === campaign.managerId && a.enabled && a.phoneNumber);
       const operatorPhone = assignedAgent?.phoneNumber || undefined;
 
-      console.log(`[ZADARMA DISPATCH] Placing real PSTN call to ${contact.phoneNumber} (CallerID: ${resolvedCallerId}) via Zadarma Carrier (SIP: ${sipLogin}, OperatorPhone: ${operatorPhone || 'WebRTC Agent Station'})...`);
+      const isAiTranslationMode = campaign.routingType === 'AI_VOICE_TRANSLATION';
+      console.log(`[ZADARMA DISPATCH] Placing real PSTN call to ${contact.phoneNumber} (Mode: ${isAiTranslationMode ? 'AI Voice Translation Bot (Zero-IVR)' : 'IVR Menu -> Direct Agent'})...`);
 
       const zadarmaRes = await ZadarmaConnector.dispatchOutboundCall({
         apiKey,
@@ -834,8 +891,10 @@ class TelephonyEngine {
         from: resolvedCallerId,
         to: contact.phoneNumber,
         sip: sipLogin,
-        operatorPhone,
+        operatorPhone: operatorPhone,
         pbxExtension: pbxExt,
+        scenarioId: isAiTranslationMode ? undefined : '0',
+        playIvr: !isAiTranslationMode,
         predicted: true,
         callId,
         campaignId,
@@ -944,7 +1003,7 @@ class TelephonyEngine {
     const rawToken = targetProv?.apiKeyEncrypted || (isSignalWire ? undefined : process.env.TWILIO_AUTH_TOKEN);
     const authToken = rawToken ? rawToken.replace(/^KEY_/, '').trim() : undefined;
 
-    const appUrl = process.env.APP_URL || 'https://ais-dev-poipaeays7cgf773toaf6y-679199737507.asia-northeast1.run.app';
+    const appUrl = process.env.APP_URL || 'https://pirates-world-tele-solution.onrender.com';
 
     if (accountSid && authToken) {
       const carrierName = isSignalWire ? (targetProv?.name || 'SignalWire Cloud') : (targetProv?.name || 'Twilio Voice Direct');
@@ -1143,6 +1202,9 @@ class TelephonyEngine {
     if (matchedOption) {
       resultingAction = matchedOption.action;
       actionDetail = matchedOption.label;
+    } else if (digit === '1') {
+      resultingAction = 'TRANSFER_TO_AGENT';
+      actionDetail = 'Connect to Live Human Agent';
     } else if (ivr?.invalidKeyAction === 'REPEAT_MENU') {
       resultingAction = 'REPEAT_MENU';
       actionDetail = 'Invalid input, repeating menu';
@@ -1248,10 +1310,20 @@ class TelephonyEngine {
       }
     });
 
-    // Find available human agent belonging to this specific manager
-    let availableAgents = data.agents.filter(
-      (a) => a.managerId === managerId && a.enabled && a.state === 'AVAILABLE' && !a.currentCallId
-    );
+    // Find available human agent: prioritize call's existing agentId if assigned
+    let availableAgents: typeof data.agents = [];
+    if (call.agentId) {
+      const assigned = data.agents.find((a) => a.id === call.agentId && a.enabled);
+      if (assigned) {
+        availableAgents = [assigned];
+      }
+    }
+
+    if (availableAgents.length === 0) {
+      availableAgents = data.agents.filter(
+        (a) => a.managerId === managerId && a.enabled && a.state === 'AVAILABLE' && !a.currentCallId
+      );
+    }
 
     // If no agents assigned to this specific manager are available, fall back to any available active agent
     if (availableAgents.length === 0) {
@@ -1451,6 +1523,7 @@ class TelephonyEngine {
 
     // Store active audio stream session in memory
     this.activeAudioSessions.set(callId, audioSession);
+    this.markZadarmaCallAnswered(callId);
 
     await db.update((d) => {
       d.agents.forEach((a) => {
@@ -1781,6 +1854,7 @@ class TelephonyEngine {
 
     realtime.broadcast('call.ended', { callId, duration, reason });
     this.terminateAudioSession(callId);
+    this.activeZadarmaCalls.delete(callId);
 
     if (call.agentId) {
       realtime.broadcast('agent.state_changed', {

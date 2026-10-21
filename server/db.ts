@@ -33,6 +33,11 @@ export interface Manager {
   assignedRouteId?: string;
   enabled: boolean;
   notes?: string;
+  allowedRoutingMode?: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION' | 'BOTH';
+  enforcedAgentLanguage?: string;
+  enforcedCustomerLanguage?: string;
+  allowManagerOverrideLanguages?: boolean;
+  aiTranslationBotVoice?: string;
   createdAt: string;
 }
 
@@ -199,6 +204,12 @@ export interface Campaign {
   ivrCompletedCount: number;
   agentConnectedCount: number;
   failedCount: number;
+  routingType?: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION';
+  agentLanguage?: string;
+  customerLanguage?: string;
+  autoDetectCustomerLanguage?: boolean;
+  aiBotGreeting?: string;
+  aiVoicePersona?: string;
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
@@ -467,6 +478,11 @@ class DatabaseService {
       maxAgents: 10,
       enabled: true,
       notes: 'Tier-1 outbound campaign team',
+      allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT',
+      enforcedAgentLanguage: 'Urdu',
+      enforcedCustomerLanguage: 'Arabic',
+      allowManagerOverrideLanguages: true,
+      aiTranslationBotVoice: 'Aoede',
       createdAt: new Date().toISOString(),
     };
 

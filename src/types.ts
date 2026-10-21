@@ -28,6 +28,11 @@ export interface ManagerItem {
   assignedVoipIds?: string[];
   enabled: boolean;
   notes?: string;
+  allowedRoutingMode?: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION' | 'BOTH';
+  enforcedAgentLanguage?: string;
+  enforcedCustomerLanguage?: string;
+  allowManagerOverrideLanguages?: boolean;
+  aiTranslationBotVoice?: string;
   createdAt: string;
 }
 
@@ -129,6 +134,12 @@ export interface CampaignItem {
   ivrCompletedCount: number;
   agentConnectedCount: number;
   failedCount: number;
+  routingType?: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION';
+  agentLanguage?: string;
+  customerLanguage?: string;
+  autoDetectCustomerLanguage?: boolean;
+  aiBotGreeting?: string;
+  aiVoicePersona?: string;
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
@@ -221,6 +232,7 @@ export interface VoipApiProviderItem {
   sipLogin?: string;
   pbxExtension?: string;
   defaultCallerId?: string;
+  webrtcKey?: string;
   region: string;
   rules: VoipProviderRules;
   enabled: boolean;
@@ -229,3 +241,25 @@ export interface VoipApiProviderItem {
   createdAt: string;
   updatedAt: string;
 }
+
+export interface TranslationTurn {
+  id: string;
+  callId: string;
+  speaker: 'agent' | 'customer';
+  originalText: string;
+  sourceLanguage: string;
+  targetLanguage: string;
+  translatedText: string;
+  audioBase64?: string;
+  latencyMs: number;
+  timestamp: string;
+  detectedLanguage?: string;
+}
+
+export interface TranslationLanguage {
+  code: string;
+  name: string;
+  nativeName: string;
+  voiceDefault: string;
+}
+

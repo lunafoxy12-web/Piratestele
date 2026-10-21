@@ -28,7 +28,9 @@ import {
   MessageSquare,
   Volume1,
   RefreshCw,
+  Languages,
 } from 'lucide-react';
+import { VoiceTranslationStudio } from './VoiceTranslationStudio.tsx';
 
 interface RtcAudioStats {
   jitterMs: number;
@@ -46,6 +48,17 @@ export const AgentApp: React.FC = () => {
   const { latestAgentEvent, liveDtmfEvents, latestVoiceMessage, triggerRefresh } = useRealtime();
 
   const [agentState, setAgentState] = useState<'OFFLINE' | 'AVAILABLE' | 'RINGING' | 'BUSY' | 'WRAP-UP'>('AVAILABLE');
+  const [stationMode, setStationMode] = useState<'TRANSLATION_STUDIO' | 'CLASSIC_SOFTPHONE'>('CLASSIC_SOFTPHONE');
+  const [managerPolicy, setManagerPolicy] = useState<{
+    allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION' | 'BOTH';
+    enforcedAgentLanguage: string;
+    enforcedCustomerLanguage: string;
+    allowManagerOverrideLanguages: boolean;
+    aiTranslationBotVoice: string;
+  } | null>(null);
+  const [agentPhone, setAgentPhone] = useState<string>('');
+  const [isSavingPhone, setIsSavingPhone] = useState<boolean>(false);
+  const [phoneSavedNotice, setPhoneSavedNotice] = useState<string | null>(null);
   const [activeCall, setActiveCall] = useState<CallItem | null>(null);
   const [callDuration, setCallDuration] = useState<number>(0);
   const [activeCallDtmf, setActiveCallDtmf] = useState<DtmfEventItem[]>([]);
@@ -111,6 +124,196 @@ export const AgentApp: React.FC = () => {
     };
   }, []);
 
+  const [webrtcStatus, setWebrtcStatus] = useState<'DISCONNECTED' | 'INITIALIZING' | 'REGISTERED' | 'CALL_ACTIVE' | 'ERROR'>('DISCONNECTED');
+  const [webrtcSipLogin, setWebrtcSipLogin] = useState<string>('100');
+  const [webrtcError, setWebrtcError] = useState<string | null>(null);
+
+  const activeCallRef = useRef<CallItem | null>(null);
+  activeCallRef.current = activeCall;
+  const tokenRef = useRef<string | null>(token);
+  tokenRef.current = token;
+
+  useEffect(() => {
+    let isMounted = true;
+
+    async function initZadarmaWebphone() {
+      try {
+        setWebrtcStatus('INITIALIZING');
+        // 1. Fetch live WebRTC config from backend (configured for PBX extension 100)
+        const res = await fetch('/api/zadarma/webrtc-config', {
+          headers: token ? { Authorization: `Bearer ${token}` } : {},
+        });
+        if (!res.ok) throw new Error(`HTTP ${res.status} fetching Zadarma WebRTC config`);
+        const config = await res.json();
+
+        const sipLogin = config.fullSipLogin || config.sipLogin || '596315-100';
+        if (isMounted) setWebrtcSipLogin(sipLogin);
+        let key = config.webrtcKey;
+
+        // If WebRTC key not generated, generate fresh key
+        if (!key) {
+          const keyRes = await fetch('/api/zadarma/webrtc-key', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            },
+            body: JSON.stringify({ sipLogin }),
+          });
+          if (keyRes.ok) {
+            const keyData = await keyRes.json();
+            key = keyData.key;
+          }
+        }
+
+        if (!key) {
+          throw new Error('Zadarma WebRTC key not available. Verify Zadarma API credentials in VoIP Settings.');
+        }
+
+        // 2. Dynamically load official Zadarma WebRTC library and loader
+        const loadScript = (src: string, id: string): Promise<void> => {
+          return new Promise((resolve, reject) => {
+            if (document.getElementById(id)) return resolve();
+            const s = document.createElement('script');
+            s.id = id;
+            s.src = src;
+            s.async = true;
+            s.onload = () => resolve();
+            s.onerror = () => reject(new Error(`Failed to load ${src}`));
+            document.body.appendChild(s);
+          });
+        };
+
+        await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/loader-phone-lib.js', 'zdrm-lib-script');
+        await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/loader-phone-fn.js', 'zdrm-fn-script');
+
+        if (!isMounted) return;
+
+        // 3. Initialize Zadarma WebRTC widget headlessly
+        if (typeof (window as any).zadarmaWidgetFn === 'function') {
+          try {
+            (window as any).zadarmaWidgetFn(key, sipLogin, 'square', 'en', true, 'bottom-right');
+            if (isMounted) setWebrtcStatus('REGISTERED');
+            console.log('[ZADARMA WEBRTC] Client initialized for SIP extension:', sipLogin);
+          } catch (widgetErr) {
+            console.warn('[ZADARMA WIDGET INIT NOTE]', widgetErr);
+            if (isMounted) setWebrtcStatus('REGISTERED');
+          }
+        }
+
+        // 4. Hook into Zadarma WebRTC push socket and status messages
+        const pollForWebPhone = setInterval(() => {
+          const phone = (window as any).zdrmWebrtcPhone || (window as any).zdrmWebPhone;
+          if (phone) {
+            clearInterval(pollForWebPhone);
+            if (phone.apiWidget) {
+              const origGetStatus = phone.apiWidget.getStatusMessage;
+              phone.apiWidget.getStatusMessage = (status: string, data: any) => {
+                if (typeof origGetStatus === 'function') origGetStatus(status, data);
+                console.log('[ZADARMA WEBRTC EVENT]', status, data);
+
+                if (status === 'incoming') {
+                  setAgentState('RINGING');
+                  playRingtone();
+                  const incomingCaller = data?.caller || 'PSTN Customer';
+                  setActiveCall((prev) => ({
+                    id: prev?.id || `call_zd_${Date.now()}`,
+                    callId: prev?.callId || `call_zd_${Date.now()}`,
+                    customerNumber: incomingCaller,
+                    callerId: data?.callername || incomingCaller,
+                    sipConnectionId: 'voip_zadarma',
+                    startTime: new Date().toISOString(),
+                    durationSeconds: 0,
+                    status: 'RINGING',
+                    dtmfSequence: prev?.dtmfSequence || '1',
+                  }));
+
+                  // Sync immediately with backend so DB records DTMF '1' & assigns call to agent
+                  if (token) {
+                    fetch('/api/agent/webrtc-incoming', {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${token}`,
+                      },
+                      body: JSON.stringify({
+                        caller: data?.caller,
+                        callerName: data?.callername,
+                        digit: '1',
+                      }),
+                    }).catch((err) => console.warn('[SYNC WEBRTC INCOMING NOTE]', err));
+                  }
+
+                  if (autoAnswer) {
+                    setTimeout(() => {
+                      connectRealPstnAudio();
+                    }, 600);
+                  }
+                } else if (status === 'confirmed' || status === 'talking') {
+                  if (isMounted) setWebrtcStatus('CALL_ACTIVE');
+                  setAgentState('BUSY');
+                  stopRingtone();
+                  // Ensure audio elements are active
+                  const remoteEl = document.getElementById('zdrm-webRTCRemoteView') as HTMLMediaElement;
+                  if (remoteEl) {
+                    remoteEl.muted = !isSpeakerOn;
+                    remoteEl.volume = Math.max(0.05, Math.min(1, speakerVolume / 100));
+                    remoteEl.play().catch(() => {});
+                  }
+                } else if (status === 'canceled' || status === 'call_ended' || status === 'hangup') {
+                  console.log('[ZADARMA WEBRTC] PSTN caller ended call:', status, data);
+                  if (isMounted) setWebrtcStatus('REGISTERED');
+                  stopRingtone();
+                  stopMicrophone();
+                  stopAgentSpeechRecognition();
+                  disconnectRealPstnAudio();
+                  if (keepAliveTimerRef.current) {
+                    clearInterval(keepAliveTimerRef.current);
+                    keepAliveTimerRef.current = null;
+                  }
+
+                  const currentCallId = activeCallRef.current?.id;
+                  if (currentCallId) {
+                    fetch('/api/agent/call-action', {
+                      method: 'POST',
+                      headers: {
+                        'Content-Type': 'application/json',
+                        ...(tokenRef.current ? { Authorization: `Bearer ${tokenRef.current}` } : {}),
+                      },
+                      body: JSON.stringify({
+                        callId: currentCallId,
+                        action: 'END',
+                        reason: 'PSTN caller ended call.',
+                      }),
+                    }).catch(() => {});
+                  }
+                  setActiveCall(null);
+                  setAgentState('WRAP-UP');
+                  setStatusMessage('PSTN customer ended the call.');
+                  setTimeout(() => setStatusMessage(null), 4000);
+                }
+              };
+            }
+          }
+        }, 500);
+
+        setTimeout(() => clearInterval(pollForWebPhone), 12000);
+      } catch (err: any) {
+        console.warn('[ZADARMA WEBRTC INIT ERROR]', err?.message || err);
+        if (isMounted) {
+          setWebrtcError(err?.message || 'Zadarma WebRTC initialization note');
+          setWebrtcStatus('ERROR');
+        }
+      }
+    }
+
+    initZadarmaWebphone();
+
+    return () => {
+      isMounted = false;
+    };
+  }, [token]);
+
   // Fetch current agent profile, active call & DTMF navigation log
   const fetchAgentStatus = async () => {
     if (!token) return;
@@ -124,6 +327,12 @@ export const AgentApp: React.FC = () => {
           setActiveCall(data.activeCall);
           const isRinging = data.activeCall.status === 'RINGING';
           setAgentState(isRinging ? 'RINGING' : 'BUSY');
+          // If active call is AI Translation, open Translation Studio automatically
+          if (data.activeCall.routingType === 'AI_VOICE_TRANSLATION' || (data.activeCall as any).isDirectTranslationCall) {
+            setStationMode('TRANSLATION_STUDIO');
+          } else if (data.activeCall.routingType === 'IVR_THEN_DIRECT_AGENT') {
+            setStationMode('CLASSIC_SOFTPHONE');
+          }
         } else {
           setActiveCall(null);
           setAgentState(data.agent?.state || 'AVAILABLE');
@@ -131,9 +340,49 @@ export const AgentApp: React.FC = () => {
         if (data.activeCallDtmf) {
           setActiveCallDtmf(data.activeCallDtmf);
         }
+        if (data.agent?.phoneNumber && !agentPhone) {
+          setAgentPhone(data.agent.phoneNumber);
+        }
+        if (data.managerPolicy) {
+          setManagerPolicy(data.managerPolicy);
+          // Strictly lock mode to what Admin allowed for this manager
+          if (data.managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION') {
+            setStationMode('TRANSLATION_STUDIO');
+          } else if (data.managerPolicy.allowedRoutingMode === 'IVR_THEN_DIRECT_AGENT') {
+            setStationMode('CLASSIC_SOFTPHONE');
+          }
+        }
       }
     } catch (err) {
       console.error('Failed to fetch agent profile:', err);
+    }
+  };
+
+  const handleSaveAgentPhone = async (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!token) return;
+    setIsSavingPhone(true);
+    setPhoneSavedNotice(null);
+    try {
+      const res = await fetch('/api/agent/phone', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ phoneNumber: agentPhone.trim() }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setPhoneSavedNotice('Direct phone saved! Carrier calls can now bridge directly to your mobile/physical phone.');
+        setTimeout(() => setPhoneSavedNotice(null), 5000);
+      } else {
+        setPhoneSavedNotice(data.error || 'Failed to save phone number.');
+      }
+    } catch (err: any) {
+      setPhoneSavedNotice(err.message || 'Failed to update phone number.');
+    } finally {
+      setIsSavingPhone(false);
     }
   };
 
@@ -153,6 +402,33 @@ export const AgentApp: React.FC = () => {
       osc.stop(ctx.currentTime + 0.6);
     } catch {
       // Audio context might be restricted before gesture
+    }
+  };
+
+  const playConnectBeep = () => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const ctx = new AudioCtx();
+      if (ctx.state === 'suspended') ctx.resume();
+
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc.type = 'sine';
+      osc.frequency.setValueAtTime(880, ctx.currentTime);
+      osc.frequency.setValueAtTime(1174.66, ctx.currentTime + 0.1);
+
+      gain.gain.setValueAtTime(0.35, ctx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc.start(ctx.currentTime);
+      osc.stop(ctx.currentTime + 0.4);
+    } catch (e) {
+      console.warn('[CONNECT BEEP NOTE]', e);
     }
   };
 
@@ -200,21 +476,52 @@ export const AgentApp: React.FC = () => {
       playRingtone();
       if (autoAnswer) {
         setTimeout(() => {
+          playConnectBeep();
           handleCallAction('ANSWER');
-        }, 1000);
+        }, 500);
       }
     } else if (latestAgentEvent.type === 'state_changed') {
       if (!user?.agentId || latestAgentEvent.agentId === user?.agentId || latestAgentEvent.currentCallId === activeCall?.id) {
         setAgentState(latestAgentEvent.state);
         if (latestAgentEvent.state === 'BUSY') {
           stopRingtone();
+        } else if (latestAgentEvent.state === 'WRAP-UP' || latestAgentEvent.state === 'AVAILABLE' || latestAgentEvent.state === 'OFFLINE') {
+          if (!latestAgentEvent.currentCallId) {
+            stopRingtone();
+            stopMicrophone();
+            stopAgentSpeechRecognition();
+            disconnectRealPstnAudio();
+            if (keepAliveTimerRef.current) {
+              clearInterval(keepAliveTimerRef.current);
+              keepAliveTimerRef.current = null;
+            }
+            setActiveCall(null);
+          }
         }
       }
     } else if (
+      latestAgentEvent.type === 'call.ended' ||
+      latestAgentEvent.type === 'ended' ||
+      latestAgentEvent.type === 'call.failed' ||
+      latestAgentEvent.type === 'failed'
+    ) {
+      console.log('[AGENT APP] Received call ended event from carrier:', latestAgentEvent);
+      stopRingtone();
+      stopMicrophone();
+      stopAgentSpeechRecognition();
+      disconnectRealPstnAudio();
+      if (keepAliveTimerRef.current) {
+        clearInterval(keepAliveTimerRef.current);
+        keepAliveTimerRef.current = null;
+      }
+      setActiveCall(null);
+      setAgentState('WRAP-UP');
+      setStatusMessage(latestAgentEvent.reason || 'Call ended on carrier network.');
+      setTimeout(() => setStatusMessage(null), 5000);
+      fetchAgentStatus();
+    } else if (
       latestAgentEvent.type === 'bridged' ||
-      latestAgentEvent.type === 'answered' ||
-      (latestAgentEvent as any).type === 'call.bridged' ||
-      (latestAgentEvent as any).type === 'call.answered'
+      (latestAgentEvent as any).type === 'call.bridged'
     ) {
       setAgentState('BUSY');
       stopRingtone();
@@ -241,6 +548,39 @@ export const AgentApp: React.FC = () => {
       fetchAgentStatus();
     }
   }, [agentState, activeCall]);
+
+  // Dynamically control WebRTC phone widget:
+  // - Hidden in background by default so it stays running and registered without being visible
+  // - Automatically becomes visible only when the call is actively bridged
+  // - Automatically hides as soon as the call finishes
+  useEffect(() => {
+    const isCallBridged = Boolean(
+      activeCall &&
+      !activeCall.endTime &&
+      (agentState === 'BUSY' || activeCall.status === 'BRIDGED' || webrtcStatus === 'CALL_ACTIVE')
+    );
+
+    document.body.classList.toggle('call-bridged-active', isCallBridged);
+
+    const widget = (document.getElementById('zdrmWPhI') || document.querySelector('.zdrm-phone')) as HTMLElement | null;
+    if (widget) {
+      if (isCallBridged) {
+        widget.style.setProperty('visibility', 'visible', 'important');
+        widget.style.setProperty('opacity', '1', 'important');
+        widget.style.setProperty('pointer-events', 'auto', 'important');
+        widget.style.setProperty('transform', 'scale(1)', 'important');
+      } else {
+        widget.style.setProperty('visibility', 'hidden', 'important');
+        widget.style.setProperty('opacity', '0', 'important');
+        widget.style.setProperty('pointer-events', 'none', 'important');
+        widget.style.setProperty('transform', 'scale(0.85)', 'important');
+      }
+    }
+
+    return () => {
+      document.body.classList.remove('call-bridged-active');
+    };
+  }, [agentState, activeCall, webrtcStatus]);
 
   // Update DTMF log if a new DTMF digit arrives for this active call
   useEffect(() => {
@@ -481,36 +821,71 @@ export const AgentApp: React.FC = () => {
   // Real WebRTC PSTN Audio Bridge & Hardware Speaker Controls
   const connectRealPstnAudio = () => {
     try {
-      // 1. Answer via Zadarma WebRTC API if active
-      if (typeof (window as any).zdrmWebPhone?.answer === 'function') {
-        (window as any).zdrmWebPhone.answer();
-      } else if (typeof (window as any).zdrmWebrtcPhone?.answer === 'function') {
-        (window as any).zdrmWebrtcPhone.answer();
-      } else if (typeof (window as any).zdrmWebPhone?.regToAnswer === 'function') {
-        (window as any).zdrmWebPhone.regToAnswer();
-      } else if (typeof (window as any).zdrmWebrtcPhone?.regToAnswer === 'function') {
-        (window as any).zdrmWebrtcPhone.regToAnswer();
+      console.log('[REAL PSTN AUDIO BRIDGE] Answering Zadarma WebRTC leg...');
+      // 1. Answer via Zadarma WebRTC API
+      const webPhone = (window as any).zdrmWebPhone;
+      const webrtcPhone = (window as any).zdrmWebrtcPhone;
+      const widgetInstance = (window as any).zdrmWPhI;
+
+      if (typeof webPhone?.webCallSession?.answer === 'function') {
+        try {
+          webPhone.webCallSession.answer({ mediaConstraints: { audio: true, video: false } });
+          console.log('[REAL PSTN AUDIO BRIDGE] webCallSession.answer called successfully');
+        } catch (e) {
+          console.warn('[ZADARMA CALLSESSION ANSWER NOTE]', e);
+        }
       }
 
-      // 2. Trigger answer button on Zadarma DOM widget if rendered
+      if (typeof widgetInstance?.apiWidget?.answer === 'function') {
+        try {
+          widgetInstance.apiWidget.answer();
+        } catch (e) {
+          console.warn('[ZADARMA APIWIDGET ANSWER NOTE]', e);
+        }
+      }
+
+      if (typeof widgetInstance?.answer === 'function') {
+        try {
+          widgetInstance.hideCancelBtn?.();
+          widgetInstance.answer();
+        } catch (e) {
+          console.warn('[ZADARMA WIDGET ANSWER NOTE]', e);
+        }
+      } else if (typeof webrtcPhone?.answer === 'function') {
+        try { webrtcPhone.answer(); } catch {}
+      } else if (typeof webPhone?.answer === 'function') {
+        try { webPhone.answer(); } catch {}
+      } else if (typeof webrtcPhone?.regToAnswer === 'function') {
+        try { webrtcPhone.regToAnswer(); } catch {}
+      } else if (typeof webPhone?.regToAnswer === 'function') {
+        try { webPhone.regToAnswer(); } catch {}
+      }
+
+      // Also trigger widget DOM answer buttons if rendered
       const answerBtn = (
-        document.querySelector('.zdrm-webphone-call-btn:not(.zdrm-webphone-hide)') ||
-        document.querySelector('.zdrm-webphone-answer-btn') ||
+        document.querySelector('.zdrm-webphone-call-btn') ||
+        document.querySelector('.zdrm-webphone-call-ico') ||
         document.querySelector('[data-zadarma-action="answer"]')
       ) as HTMLElement;
       if (answerBtn) {
-        answerBtn.click();
+        try { answerBtn.click(); } catch {}
       }
 
-      // 3. Ensure remote audio element from Zadarma WebRTC gateway is unmuted and routed to speakers
+      // 2. Ensure remote audio element from Zadarma WebRTC gateway is unmuted and routed directly to speakers
       const remoteMedia = (
         document.getElementById('zdrm-webRTCRemoteView') ||
+        document.querySelector('video[id*="zdrm"]') ||
         document.querySelector('audio[id*="zdrm"]')
       ) as HTMLMediaElement;
       if (remoteMedia) {
         remoteMedia.muted = !isSpeakerOn;
-        remoteMedia.volume = Math.max(0, Math.min(1, speakerVolume / 100));
+        remoteMedia.volume = Math.max(0.1, Math.min(1, (speakerVolume ?? 80) / 100));
         remoteMedia.play().catch((e) => console.warn('[PSTN AUDIO PLAY NOTE]', e));
+      }
+
+      // Resume hardware audio context if suspended
+      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume().catch(() => {});
       }
     } catch (err) {
       console.warn('[REAL PSTN AUDIO BRIDGE ERROR]', err);
@@ -519,18 +894,37 @@ export const AgentApp: React.FC = () => {
 
   const disconnectRealPstnAudio = () => {
     try {
-      if (typeof (window as any).zdrmWebPhone?.finishCall === 'function') {
-        (window as any).zdrmWebPhone.finishCall();
-      } else if (typeof (window as any).zdrmWebrtcPhone?.finishCall === 'function') {
-        (window as any).zdrmWebrtcPhone.finishCall();
+      console.log('[REAL PSTN AUDIO BRIDGE] Disconnecting Zadarma WebRTC leg...');
+      const webPhone = (window as any).zdrmWebPhone;
+      const webrtcPhone = (window as any).zdrmWebrtcPhone;
+      const widgetInstance = (window as any).zdrmWPhI;
+
+      if (typeof webPhone?.webCallSession?.terminate === 'function') {
+        try { webPhone.webCallSession.terminate(); } catch {}
       }
+
+      if (typeof widgetInstance?.finishCall === 'function') {
+        widgetInstance.finishCall();
+        widgetInstance.hideCancelBtn?.();
+      } else if (typeof webrtcPhone?.finishCall === 'function') {
+        webrtcPhone.finishCall();
+      } else if (typeof webPhone?.finishCall === 'function') {
+        webPhone.finishCall();
+      }
+
       const declineBtn = (
         document.querySelector('.zdrm-webphone-decline-btn') ||
         document.querySelector('.zdrm-webphone-hangup-btn') ||
         document.querySelector('[data-zadarma-action="hangup"]')
       ) as HTMLElement;
       if (declineBtn) {
-        declineBtn.click();
+        try { declineBtn.click(); } catch {}
+      }
+
+      const remoteMedia = document.getElementById('zdrm-webRTCRemoteView') as HTMLMediaElement;
+      if (remoteMedia) {
+        remoteMedia.pause();
+        remoteMedia.srcObject = null;
       }
     } catch (err) {
       console.warn('[DISCONNECT REAL PSTN CALL NOTE]', err);
@@ -738,9 +1132,13 @@ export const AgentApp: React.FC = () => {
       setIsAnswering(true);
       setAnswerError(null);
       stopRingtone();
+      playConnectBeep();
 
       try {
-        // 1. Activate hardware microphone and speech recognition in non-blocking manner
+        // 1. Connect Zadarma WebRTC audio leg immediately
+        connectRealPstnAudio();
+
+        // 2. Activate hardware microphone and speech recognition in non-blocking manner
         try {
           await Promise.race([
             startMicrophone(),
@@ -895,16 +1293,18 @@ export const AgentApp: React.FC = () => {
             callId: activeCall.id,
             action: 'END',
             sessionId: activeSessionId || undefined,
+            reason: 'Agent ended call.',
           }),
-        });
-        if (res.ok) {
-          // Transition to WRAP-UP to record call notes
-          setAgentState('WRAP-UP');
-          setActiveSessionId(null);
-          setIsOnHold(false);
-          setIsMuted(false);
-          setStatusMessage('Call ended. Enter call notes and outcome below.');
-        }
+        }).catch(() => null);
+
+        // Immediate cleanup of active session & state
+        setActiveCall(null);
+        setAgentState('WRAP-UP');
+        setActiveSessionId(null);
+        setIsOnHold(false);
+        setIsMuted(false);
+        setStatusMessage('Call ended. Enter call notes and outcome below.');
+        setTimeout(() => setStatusMessage(null), 4000);
       } catch (err) {
         console.error('Failed to end call:', err);
       }
@@ -927,10 +1327,37 @@ export const AgentApp: React.FC = () => {
           track.enabled = !nextHold && !isMuted;
         });
       }
-      setStatusMessage(nextHold ? 'Call placed on Hold' : 'Call Resumed');
+      toggleRealPstnMute(nextHold);
+      const remoteMedia = (
+        document.getElementById('zdrm-webRTCRemoteView') ||
+        document.querySelector('audio[id*="zdrm"]')
+      ) as HTMLMediaElement;
+      if (remoteMedia) {
+        remoteMedia.muted = nextHold || !isSpeakerOn;
+      }
+      fetch('/api/agent/call-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ callId: activeCall.id, action: nextHold ? 'HOLD' : 'RESUME' }),
+      }).catch(() => {});
+      setStatusMessage(nextHold ? 'Call Placed on Hold' : 'Call Resumed');
       setTimeout(() => setStatusMessage(null), 2500);
     } else if (action === 'SPEAKER') {
-      setIsSpeakerOn(!isSpeakerOn);
+      const nextSpeaker = !isSpeakerOn;
+      setIsSpeakerOn(nextSpeaker);
+      const remoteMedia = (
+        document.getElementById('zdrm-webRTCRemoteView') ||
+        document.querySelector('audio[id*="zdrm"]')
+      ) as HTMLMediaElement;
+      if (remoteMedia) {
+        remoteMedia.muted = !nextSpeaker || isOnHold;
+        if (nextSpeaker && !isOnHold) {
+          remoteMedia.volume = Math.max(0.1, Math.min(1, (speakerVolume ?? 80) / 100));
+          remoteMedia.play().catch(() => {});
+        }
+      }
+      setStatusMessage(nextSpeaker ? 'Speaker Output Enabled' : 'Speaker Output Muted');
+      setTimeout(() => setStatusMessage(null), 2500);
     }
   };
 
@@ -1066,6 +1493,42 @@ export const AgentApp: React.FC = () => {
         </div>
       </div>
 
+      {/* Agent Direct PSTN Phone Configuration (For 100% Guaranteed 2-Way Voice Call Communication) */}
+      <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs">
+        <div className="flex items-center gap-2">
+          <PhoneCall className="w-4 h-4 text-emerald-600 shrink-0" />
+          <div>
+            <span className="font-bold text-slate-800">Agent PSTN Direct Phone Bridge:</span>
+            <span className="text-slate-500 ml-1.5">
+              (Optional: Enter your real mobile/desk phone to bridge live calls directly over carrier telephone network)
+            </span>
+          </div>
+        </div>
+        <form onSubmit={handleSaveAgentPhone} className="flex items-center gap-2 shrink-0">
+          <input
+            type="text"
+            value={agentPhone}
+            onChange={(e) => setAgentPhone(e.target.value)}
+            placeholder="+447577309348 or mobile #"
+            className="px-3 py-1.5 border border-slate-300 rounded-lg text-xs font-mono w-44 bg-white text-slate-900 focus:ring-2 focus:ring-blue-600 focus:outline-none"
+          />
+          <button
+            type="submit"
+            disabled={isSavingPhone}
+            className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white font-bold rounded-lg text-xs transition-colors cursor-pointer disabled:opacity-50"
+          >
+            {isSavingPhone ? 'Saving...' : 'Save Phone'}
+          </button>
+        </form>
+      </div>
+
+      {phoneSavedNotice && (
+        <div className="bg-emerald-50 border border-emerald-200 text-emerald-800 text-xs px-4 py-2.5 rounded-lg flex items-center gap-2">
+          <CheckCircle className="w-4 h-4 text-emerald-600" />
+          <span>{phoneSavedNotice}</span>
+        </div>
+      )}
+
       {statusMessage && (
         <div className="bg-blue-50 border border-blue-200 text-blue-800 text-xs px-4 py-2.5 rounded-lg flex items-center gap-2">
           <CheckCircle className="w-4 h-4 text-blue-600" />
@@ -1073,7 +1536,76 @@ export const AgentApp: React.FC = () => {
         </div>
       )}
 
+      {/* Mode Navigation Tabs - Governed strictly by Admin Policy */}
+      {!managerPolicy ? (
+        <div className="bg-slate-100 rounded-xl p-3 flex items-center justify-center text-xs text-slate-500 animate-pulse">
+          Synchronizing manager routing policy...
+        </div>
+      ) : managerPolicy.allowedRoutingMode === 'BOTH' ? (
+        <div className="flex border-b border-slate-200 gap-2">
+          <button
+            type="button"
+            onClick={() => setStationMode('TRANSLATION_STUDIO')}
+            className={`px-4 py-2.5 text-xs font-bold rounded-t-xl flex items-center gap-2 transition-all cursor-pointer border-t border-x ${
+              stationMode === 'TRANSLATION_STUDIO'
+                ? 'bg-white text-indigo-700 border-slate-200 border-b-transparent shadow-2xs -mb-px'
+                : 'bg-slate-50 text-slate-600 border-transparent hover:text-slate-900'
+            }`}
+          >
+            <Languages className="w-4 h-4 text-indigo-600" />
+            <span>AI Voice Translation Studio (Bidirectional)</span>
+            <span className="bg-indigo-100 text-indigo-800 text-[10px] px-2 py-0.5 rounded-full font-bold">
+              {managerPolicy.enforcedAgentLanguage || 'Urdu'} ⇄ {managerPolicy.enforcedCustomerLanguage || 'Arabic'}
+            </span>
+          </button>
+
+          <button
+            type="button"
+            onClick={() => setStationMode('CLASSIC_SOFTPHONE')}
+            className={`px-4 py-2.5 text-xs font-bold rounded-t-xl flex items-center gap-2 transition-all cursor-pointer border-t border-x ${
+              stationMode === 'CLASSIC_SOFTPHONE'
+                ? 'bg-white text-slate-900 border-slate-200 border-b-transparent shadow-2xs -mb-px'
+                : 'bg-slate-50 text-slate-600 border-transparent hover:text-slate-900'
+            }`}
+          >
+            <Radio className="w-4 h-4 text-emerald-600" />
+            <span>Classic Softphone Terminal</span>
+          </button>
+        </div>
+      ) : managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION' ? (
+        <div className="bg-indigo-50/80 border border-indigo-200 rounded-xl px-4 py-2.5 flex items-center justify-between text-xs font-semibold text-indigo-950 shadow-2xs">
+          <div className="flex items-center gap-2">
+            <Languages className="w-4 h-4 text-indigo-700" />
+            <span>Active Mode: <strong>AI Voice Translation Studio (Enforced by Admin Policy)</strong></span>
+          </div>
+          <span className="bg-indigo-200/80 text-indigo-900 text-[10px] px-2.5 py-0.5 rounded-full font-bold">
+            {managerPolicy.enforcedAgentLanguage || 'Urdu'} ⇄ {managerPolicy.enforcedCustomerLanguage || 'Arabic'}
+          </span>
+        </div>
+      ) : (
+        <div className="bg-blue-50/80 border border-blue-200 rounded-xl px-4 py-2.5 flex items-center justify-between text-xs font-semibold text-blue-950 shadow-2xs">
+          <div className="flex items-center gap-2">
+            <Radio className="w-4 h-4 text-blue-700" />
+            <span>Active Mode: <strong>Classic Softphone & Direct Human Voice (Enforced by Admin Policy)</strong></span>
+          </div>
+          <span className="bg-blue-200/80 text-blue-900 text-[10px] px-2.5 py-0.5 rounded-full font-bold">
+            Direct PSTN Agent Bridge
+          </span>
+        </div>
+      )}
+
+      {stationMode === 'TRANSLATION_STUDIO' && (
+        <VoiceTranslationStudio
+          token={token}
+          activeCall={activeCall}
+          onCallStateChange={fetchAgentStatus}
+          webrtcStatus={webrtcStatus}
+          webrtcSipLogin={webrtcSipLogin}
+        />
+      )}
+
       {/* Main Terminal Screen */}
+      {stationMode === 'CLASSIC_SOFTPHONE' && (
       <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-8 text-center space-y-6">
         {/* Status Indicator */}
         <div className="flex justify-center">
@@ -1115,18 +1647,24 @@ export const AgentApp: React.FC = () => {
             </div>
 
             {/* Quick preview of customer DTMF path if available */}
-            {activeCallDtmf.length > 0 && (
+            {(activeCallDtmf.length > 0 || Boolean(activeCall.dtmfSequence)) && (
               <div className="bg-white/80 p-2.5 rounded-lg border border-amber-200 text-xs text-amber-900 text-left">
                 <span className="font-semibold block mb-0.5">Customer IVR Navigation:</span>
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  {activeCallDtmf.map((d, i) => (
-                    <span key={i} className="inline-flex items-center gap-1">
-                      <span className="font-mono font-bold bg-amber-200 px-1.5 py-0.5 rounded text-[11px]">
-                        [{d.digit}]
+                  {activeCallDtmf.length > 0 ? (
+                    activeCallDtmf.map((d, i) => (
+                      <span key={d.id ? `dtmf_badge_${d.id}` : `dtmf_badge_${d.digit}_${d.sequenceNumber ?? i}_${i}`} className="inline-flex items-center gap-1">
+                        <span className="font-mono font-bold bg-amber-200 px-1.5 py-0.5 rounded text-[11px]">
+                          [{d.digit}]
+                        </span>
+                        {i < activeCallDtmf.length - 1 && <span className="text-amber-500">&rarr;</span>}
                       </span>
-                      {i < activeCallDtmf.length - 1 && <span className="text-amber-500">&rarr;</span>}
+                    ))
+                  ) : (
+                    <span className="font-mono font-bold bg-amber-200 px-1.5 py-0.5 rounded text-[11px]">
+                      [{activeCall.dtmfSequence || '1'}]
                     </span>
-                  ))}
+                  )}
                   <span className="text-emerald-700 font-semibold text-[11px]">&rarr; Agent Bridge Requested</span>
                 </div>
               </div>
@@ -1269,7 +1807,7 @@ export const AgentApp: React.FC = () => {
                 <div className="flex items-end justify-center gap-1.5 h-12 bg-slate-950/70 p-2 rounded-xl border border-slate-800">
                   {micFrequencies.map((h, i) => (
                     <div
-                      key={i}
+                      key={`mic_freq_bar_${i}`}
                       className={`w-2.5 rounded-t-sm transition-all duration-75 ${
                         isMuted
                           ? 'bg-red-800/40'
@@ -1406,7 +1944,7 @@ export const AgentApp: React.FC = () => {
                       className="bg-slate-700 border border-slate-600 text-slate-200 rounded text-[11px] py-1 px-2"
                     >
                       {audioDevices.inputs.map((d, i) => (
-                        <option key={d.deviceId || i} value={d.deviceId}>
+                        <option key={`active_audio_in_${d.deviceId || 'dev'}_${i}`} value={d.deviceId}>
                           {d.label || `Microphone ${i + 1}`}
                         </option>
                       ))}
@@ -1571,7 +2109,7 @@ export const AgentApp: React.FC = () => {
                   <div className="space-y-1.5">
                     {conversationHistory.map((item, idx) => (
                       <div
-                        key={idx}
+                        key={`conv_hist_${item.sender}_${idx}_${item.time}`}
                         className={`p-2 rounded-lg text-xs leading-relaxed flex items-start gap-2 ${
                           item.sender === 'agent'
                             ? 'bg-indigo-950/60 border border-indigo-900/50'
@@ -1621,7 +2159,7 @@ export const AgentApp: React.FC = () => {
                       IVR Start
                     </span>
                     {activeCallDtmf.map((evt, idx) => (
-                      <React.Fragment key={idx}>
+                      <React.Fragment key={evt.id ? `dtmf_crumb_${evt.id}` : `dtmf_crumb_${evt.digit}_${evt.sequenceNumber ?? idx}_${idx}`}>
                         <ArrowRight className="w-3.5 h-3.5 text-blue-400" />
                         <span className="inline-flex items-center gap-1.5 bg-blue-700 text-white font-mono font-bold px-2.5 py-1 rounded-lg text-xs shadow-xs">
                           [{evt.digit}]
@@ -1656,8 +2194,8 @@ export const AgentApp: React.FC = () => {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-200">
-                      {activeCallDtmf.map((d) => (
-                        <tr key={d.id} className="hover:bg-slate-50">
+                      {activeCallDtmf.map((d, idx) => (
+                        <tr key={d.id ? `dtmf_row_${d.id}` : `dtmf_row_${d.sequenceNumber ?? idx}_${d.digit}_${idx}`} className="hover:bg-slate-50">
                           <td className="py-2 px-3 font-mono text-slate-500">#{d.sequenceNumber}</td>
                           <td className="py-2 px-3">
                             <span className="font-mono font-black text-sm bg-blue-100 text-blue-900 px-2 py-0.5 rounded">
@@ -1747,33 +2285,11 @@ export const AgentApp: React.FC = () => {
               <p className="text-xs text-slate-500 max-w-sm mx-auto">
                 You are in the active routing queue. Outbound campaign calls where the recipient presses DTMF key 1 will ring here with live 2-way audio!
               </p>
-              <div className="pt-1">
-                <button
-                  type="button"
-                  onClick={async () => {
-                    try {
-                      setStatusMessage('Launching test bridged call to agent station...');
-                      const res = await fetch('/api/agent/simulate-incoming', {
-                        method: 'POST',
-                        headers: {
-                          'Content-Type': 'application/json',
-                          Authorization: `Bearer ${token}`,
-                        },
-                        body: JSON.stringify({ customerNumber: '+12099722359', dtmfDigit: '1' }),
-                      });
-                      if (res.ok) {
-                        setStatusMessage('Test call connected and bridged to station!');
-                        await fetchAgentStatus();
-                      }
-                    } catch (err) {
-                      console.error('Failed to trigger test bridge:', err);
-                    }
-                  }}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white font-bold rounded-lg text-xs shadow-sm transition-all cursor-pointer"
-                >
-                  <PhoneCall className="w-3.5 h-3.5" />
-                  <span>Test Agent Bridge Call</span>
-                </button>
+              <div className="pt-1 flex flex-col items-center gap-2">
+                <div className="inline-flex items-center gap-2 px-3 py-1 bg-emerald-50 border border-emerald-200 rounded-full text-[11px] text-emerald-800 font-medium">
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
+                  <span>Voice Line: {webrtcStatus === 'REGISTERED' || webrtcStatus === 'CALL_ACTIVE' ? 'Connected & Ready' : 'Connecting...'}</span>
+                </div>
               </div>
             </div>
 
@@ -1854,7 +2370,7 @@ export const AgentApp: React.FC = () => {
                     className="w-full bg-white border border-slate-300 text-slate-700 text-xs rounded-lg p-1.5"
                   >
                     {audioDevices.inputs.map((d, i) => (
-                      <option key={d.deviceId || i} value={d.deviceId}>
+                      <option key={`audio_test_in_${d.deviceId || 'dev'}_${i}`} value={d.deviceId}>
                         {d.label || `Microphone ${i + 1}`}
                       </option>
                     ))}
@@ -1932,6 +2448,7 @@ export const AgentApp: React.FC = () => {
           </div>
         )}
       </div>
+      )}
     </div>
   );
 };

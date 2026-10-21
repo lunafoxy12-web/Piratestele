@@ -355,9 +355,10 @@ export class ZadarmaConnector {
     apiSecret: string;
     from?: string; // Caller ID or purchased Zadarma number
     to: string; // Real PSTN phone number (e.g. +12099722359)
-    sip?: string; // SIP login or PBX extension (defaults to verified 12707)
+    sip?: string; // SIP login or PBX extension
     pbxExtension?: string;
     scenarioId?: string; // PBX Scenario ID e.g. '0-1'
+    playIvr?: boolean; // Whether to play IVR voice menu to customer (default true)
     operatorPhone?: string; // Real physical phone of agent/operator
     predicted?: boolean;
     callId: string;
@@ -366,39 +367,56 @@ export class ZadarmaConnector {
     dialMethod?: 'callback' | 'checknumber';
   }): Promise<ZadarmaCallbackResponse> {
     try {
-      // Clean recipient number into standard international E.164 format with leading '+'
-      let cleanTo = params.to.trim().replace(/[\s\-\(\)]/g, '');
+      // Clean recipient number for Zadarma (pure international digits)
+      let cleanTo = params.to.trim().replace(/[^0-9]/g, '');
       if (cleanTo.startsWith('00')) {
-        cleanTo = `+${cleanTo.slice(2)}`;
-      } else if (!cleanTo.startsWith('+')) {
-        cleanTo = `+${cleanTo}`;
+        cleanTo = cleanTo.slice(2);
+      }
+      // Normalize UK domestic mobile (07xxx -> 447xxx)
+      if (cleanTo.startsWith('07') && cleanTo.length === 11) {
+        cleanTo = `44${cleanTo.slice(1)}`;
+      }
+      // Normalize UK with extra leading 0 after 44 (4407xxx -> 447xxx)
+      if (cleanTo.startsWith('4407') && cleanTo.length === 13) {
+        cleanTo = `447${cleanTo.slice(4)}`;
+      }
+      // Normalize North American 10-digit number (2099722359 -> 12099722359)
+      if (cleanTo.length === 10 && !cleanTo.startsWith('0')) {
+        cleanTo = `1${cleanTo}`;
       }
 
-      // Ensure caller ID is in standard E.164 format with leading '+'
-      let cleanFrom = (params.from || '').trim().replace(/[\s\-\(\)]/g, '');
-      if (!cleanFrom.startsWith('+')) {
-        cleanFrom = `+${cleanFrom}`;
+      // CRITICAL: Zadarma requires international destination numbers to begin with '+'
+      // If '+' is omitted, Zadarma applies the account's home country rule (Thailand +66)
+      // and prepends '66', turning '447577309348' into '66447577309348' which fails with hangupcause 1!
+      const targetInternationalTo = `+${cleanTo}`;
+
+      // Ensure caller ID is in standard digits format without '+'
+      let cleanFrom = (params.from || '').trim().replace(/[^0-9]/g, '');
+      if (cleanFrom.startsWith('00')) {
+        cleanFrom = cleanFrom.slice(2);
       }
 
       // Fallback to purchased Zadarma number
       if (!cleanFrom || cleanFrom === cleanTo || cleanFrom.length < 5) {
-        cleanFrom = '+18045930160';
+        cleanFrom = '18045930160';
       }
 
       let res: any = null;
 
-      // 1. Direct Phone-to-Phone mode if operator/agent phone number is provided
-      if (params.operatorPhone && params.operatorPhone.length >= 7) {
-        let cleanOp = params.operatorPhone.trim().replace(/[\s\-\(\)]/g, '');
-        if (!cleanOp.startsWith('+')) cleanOp = `+${cleanOp}`;
-        console.log(`[ZADARMA DISPATCH] Initiating real Phone-to-Phone call: Customer ${cleanTo} <-> Agent Phone ${cleanOp}...`);
+      // 1. Direct Phone-to-Phone mode (if agent physical/mobile phone is provided)
+      let cleanOp = (params.operatorPhone || '').trim().replace(/[^0-9]/g, '');
+      if (cleanOp.startsWith('00')) cleanOp = cleanOp.slice(2);
+
+      if (cleanOp && cleanOp.length >= 7) {
+        const intlOp = cleanOp.startsWith('+') ? cleanOp : `+${cleanOp}`;
+        console.log(`[ZADARMA DISPATCH] Initiating real Phone-to-Phone carrier bridge: Customer ${targetInternationalTo} <-> Agent Mobile/Direct Phone ${intlOp}...`);
         const p2pParams: Record<string, any> = {
-          from: cleanOp,
-          to: cleanTo,
+          from: targetInternationalTo,
+          to: intlOp,
           predicted: 'true',
         };
         if (cleanFrom) {
-          p2pParams.caller_id = cleanFrom.replace(/^\+/, '');
+          p2pParams.caller_id = cleanFrom;
         }
 
         res = await this.requestApi(
@@ -409,58 +427,96 @@ export class ZadarmaConnector {
         );
       }
 
-      // 2. Direct SIP Trunk Leg mode (routes directly to agent station / Zadarma WebRTC / softphone without handset error)
+      // 2. Outbound Dispatch: Call PSTN Recipient FIRST (to = targetInternationalTo)
+      // When predicted='true', Zadarma dials 'to' (PSTN recipient) FIRST.
+      // Once the PSTN recipient answers:
+      // - IVR Campaign: plays PBX IVR Voice Menu 0 ('from' = '0-1' or menu_id = 0) so the customer hears the IVR greeting.
+      //                 When they press DTMF key 1, Zadarma PBX bridges them to Agent Softphone (Ext 100).
+      // - Direct Mode: connects recipient directly to Agent Softphone ('from' = targetExt).
       if (!res || res.status === 'error') {
-        const sipLeg = (params.sip || '12707').trim();
-        console.log(`[ZADARMA DISPATCH] Initiating direct real PSTN call to ${cleanTo} via Zadarma SIP Trunk ${sipLeg}...`);
+        const targetExt = (params.pbxExtension || params.sip || '100').trim();
+        const isIvrMode = params.playIvr !== false;
 
-        // Ensure SIP redirection is not stuck pointing to offline PBX extension
-        try {
-          await this.requestApi(
-            '/v1/sip/redirection/',
-            { id: sipLeg, status: 'off' },
+        if (isIvrMode) {
+          // '0' connects caller to Voice Menu 0 so customer hears the IVR greeting first!
+          // When customer presses key 1, Zadarma PBX triggers Scenario 1 and bridges to Ext 100.
+          const targetVoiceMenu = params.scenarioId && params.scenarioId !== '0-1' ? params.scenarioId : '0';
+          console.log(`[ZADARMA DISPATCH] Outbound IVR Campaign: Calling PSTN Recipient ${targetInternationalTo} first -> IVR Voice Menu ${targetVoiceMenu} on answer -> DTMF key 1 bridges to Agent (Ext ${targetExt})...`);
+
+          const ivrCallbackParams: Record<string, any> = {
+            from: targetVoiceMenu,
+            to: targetInternationalTo,
+            sip: targetExt,
+            menu_id: 0,
+            predicted: 'true',
+          };
+          if (cleanFrom) {
+            ivrCallbackParams.caller_id = cleanFrom;
+          }
+
+          res = await this.requestApi(
+            '/v1/request/callback/',
+            ivrCallbackParams,
             { apiKey: params.apiKey, apiSecret: params.apiSecret },
-            'PUT'
+            'GET'
           );
-        } catch {
-          // Ignore if redirection call already configured
+
+          // If '0' returned notice, fallback to '0-1'
+          if (!res || res.status === 'error') {
+            console.warn(`[ZADARMA DISPATCH] Menu ${targetVoiceMenu} returned notice (${res?.message}), trying fallback from='0-1'...`);
+            const retryParams: Record<string, any> = {
+              from: '0-1',
+              to: targetInternationalTo,
+              sip: targetExt,
+              menu_id: 0,
+              predicted: 'true',
+            };
+            if (cleanFrom) retryParams.caller_id = cleanFrom;
+            res = await this.requestApi(
+              '/v1/request/callback/',
+              retryParams,
+              { apiKey: params.apiKey, apiSecret: params.apiSecret },
+              'GET'
+            );
+          }
+
+          // Additional fallback if needed: from=targetExt, menu_id=0
+          if (!res || res.status === 'error') {
+            console.warn(`[ZADARMA DISPATCH] Fallback 1 returned notice, trying from=${targetExt} with menu_id=0...`);
+            const retryParams2: Record<string, any> = {
+              from: targetExt,
+              to: targetInternationalTo,
+              sip: targetExt,
+              menu_id: 0,
+              predicted: 'true',
+            };
+            if (cleanFrom) retryParams2.caller_id = cleanFrom;
+            res = await this.requestApi(
+              '/v1/request/callback/',
+              retryParams2,
+              { apiKey: params.apiKey, apiSecret: params.apiSecret },
+              'GET'
+            );
+          }
+        } else {
+          console.log(`[ZADARMA DISPATCH] Outbound Direct Translation Call: Calling PSTN Recipient ${targetInternationalTo} first -> Agent Softphone Ext ${targetExt}...`);
+          const directCallbackParams: Record<string, any> = {
+            from: targetExt,
+            to: targetInternationalTo,
+            sip: targetExt,
+            predicted: 'true',
+          };
+          if (cleanFrom) {
+            directCallbackParams.caller_id = cleanFrom;
+          }
+
+          res = await this.requestApi(
+            '/v1/request/callback/',
+            directCallbackParams,
+            { apiKey: params.apiKey, apiSecret: params.apiSecret },
+            'GET'
+          );
         }
-
-        const sipParams: Record<string, any> = {
-          from: sipLeg,
-          to: cleanTo,
-          predicted: 'true',
-        };
-        if (cleanFrom) {
-          sipParams.caller_id = cleanFrom.replace(/^\+/, '');
-        }
-
-        res = await this.requestApi(
-          '/v1/request/callback/',
-          sipParams,
-          { apiKey: params.apiKey, apiSecret: params.apiSecret },
-          'GET'
-        );
-      }
-
-      // 3. Explicit PBX Scenario mode ONLY if scenarioId is specifically requested by user (never default)
-      if ((!res || res.status === 'error') && params.scenarioId && params.scenarioId !== '0-1') {
-        console.log(`[ZADARMA DISPATCH] Attempting requested PBX Scenario ${params.scenarioId} to ${cleanTo}...`);
-        const scenParams: Record<string, any> = {
-          from: params.scenarioId,
-          to: cleanTo,
-          predicted: 'true',
-        };
-        if (cleanFrom) {
-          scenParams.caller_id = cleanFrom.replace(/^\+/, '');
-        }
-
-        res = await this.requestApi(
-          '/v1/request/callback/',
-          scenParams,
-          { apiKey: params.apiKey, apiSecret: params.apiSecret },
-          'GET'
-        );
       }
 
       if (res && (res.status === 'success' || res.status === 'ok')) {

@@ -113,6 +113,7 @@ export const VoipProviderSettings: React.FC<VoipProviderSettingsProps> = ({ toke
           if (data.defaultCallerId) setZdCallerId(data.defaultCallerId);
           if (data.sipLogin) setZdSipLogin(data.sipLogin);
           if (data.pbxExtension) setZdPbxExtension(data.pbxExtension);
+          if (data.webrtcKey) setZdWebrtcKey(data.webrtcKey);
           setZdHealthStatus(data.healthStatus || 'HEALTHY');
 
           // Query live balance, SIP accounts, and extensions
@@ -274,6 +275,7 @@ export const VoipProviderSettings: React.FC<VoipProviderSettingsProps> = ({ toke
           defaultCallerId: zdCallerId.trim(),
           sipLogin: zdSipLogin.trim(),
           pbxExtension: zdPbxExtension.trim(),
+          webrtcKey: zdWebrtcKey.trim(),
         }),
       });
 
@@ -682,7 +684,7 @@ export const VoipProviderSettings: React.FC<VoipProviderSettingsProps> = ({ toke
               </div>
               <div className="bg-slate-900/80 p-2.5 rounded-lg border border-blue-900/60">
                 <span className="text-[10px] text-slate-400 block uppercase font-bold">WebRTC Gateway</span>
-                <span className="font-mono text-cyan-300 font-semibold text-xs">wss://webrtc.zadarma.com:5061</span>
+                <span className="font-mono text-cyan-300 font-semibold text-xs">wss://webrtc.zadarma.com:4443</span>
               </div>
               <div className="bg-slate-900/80 p-2.5 rounded-lg border border-blue-900/60">
                 <span className="text-[10px] text-slate-400 block uppercase font-bold">WebRTC Token Status</span>
@@ -806,7 +808,39 @@ export const VoipProviderSettings: React.FC<VoipProviderSettingsProps> = ({ toke
                     className="w-full pl-9 pr-3 py-2 text-xs border border-slate-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-blue-500 font-mono"
                   />
                 </div>
-                <p className="text-[10px] text-slate-500 mt-1">API secret from Zadarma API page or WebRTC key.</p>
+                <p className="text-[10px] text-slate-500 mt-1">API secret from Zadarma API page (used for authenticating Zadarma REST API calls).</p>
+              </div>
+
+              {/* Dedicated WebRTC Widget Key / Click-to-Call Key Field */}
+              <div className="md:col-span-2 bg-gradient-to-r from-blue-50 to-indigo-50 border-2 border-blue-200 rounded-xl p-4 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-bold text-blue-950 flex items-center gap-1.5">
+                    <Key className="w-4 h-4 text-blue-600" />
+                    Zadarma WebRTC Widget Key / Click-to-Call Key
+                  </label>
+                  {zdWebrtcKey ? (
+                    <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full border border-emerald-300">
+                      Key Loaded ({zdWebrtcKey.length} chars)
+                    </span>
+                  ) : (
+                    <span className="text-[10px] bg-amber-100 text-amber-800 font-semibold px-2 py-0.5 rounded-full border border-amber-300">
+                      Paste from my.zadarma.com
+                    </span>
+                  )}
+                </div>
+                <div className="relative">
+                  <Key className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                  <input
+                    type="text"
+                    value={zdWebrtcKey || ''}
+                    onChange={(e) => setZdWebrtcKey(e.target.value)}
+                    placeholder="e.g. ee9167bbc19c0bde60a3f9150d6eaabaabe35d0fc83d7703a859bcde05c0bde1c636f96a6c2bdfd869b76ae997db2a858bbe6d993f88331757d8467c9e6adfaa"
+                    className="w-full pl-9 pr-3 py-2 text-xs border border-blue-300 rounded-lg focus:ring-2 focus:ring-blue-500 font-mono bg-white text-slate-900"
+                  />
+                </div>
+                <p className="text-[11px] text-blue-900 leading-relaxed">
+                  <strong>Where to get this key:</strong> In your Zadarma portal (<a href="https://my.zadarma.com" target="_blank" rel="noreferrer" className="underline text-blue-700 font-semibold">my.zadarma.com</a>), navigate to <strong>Settings &rarr; Integrations and API &rarr; WebRTC Widget</strong> (or <strong>Services &rarr; WebRTC</strong>), click <em>Add/Create Widget</em>, link it to your PBX Extension (e.g. <strong>100</strong>), and copy the widget key here.
+                </p>
               </div>
             </div>
 

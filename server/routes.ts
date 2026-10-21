@@ -10,13 +10,127 @@ import { ZadarmaConnector } from './zadarma.ts';
 import zadarmaRouter, { getActiveZadarmaProvider } from './routes/zadarmaRouter.ts';
 import twilioRouter from './routes/twilioRouter.ts';
 import signalwireRouter from './routes/signalwireRouter.ts';
+import customVoipRouter from './routes/customVoipRouter.ts';
+import { TranslationService } from './services/translationService.ts';
 
 const router = express.Router();
 
-// Mount Dedicated Separated VoIP Provider Routers
+// Mount Dedicated Separated VoIP Provider Routers (Fully Isolated)
 router.use('/zadarma', zadarmaRouter);
 router.use('/twilio', twilioRouter);
 router.use('/signalwire', signalwireRouter);
+router.use('/voip', customVoipRouter);
+
+// ==========================================
+// BIDIRECTIONAL REAL-TIME AI VOICE TRANSLATION
+// ==========================================
+
+const SUPPORTED_TRANSLATION_LANGUAGES = [
+  { code: 'ur', name: 'Urdu', nativeName: 'اردو', voiceDefault: 'Kore' },
+  { code: 'ar', name: 'Arabic', nativeName: 'العربية', voiceDefault: 'Aoede' },
+  { code: 'en', name: 'English', nativeName: 'English', voiceDefault: 'Puck' },
+  { code: 'es', name: 'Spanish', nativeName: 'Español', voiceDefault: 'Aoede' },
+  { code: 'fr', name: 'French', nativeName: 'Français', voiceDefault: 'Kore' },
+  { code: 'de', name: 'German', nativeName: 'Deutsch', voiceDefault: 'Fenrir' },
+  { code: 'hi', name: 'Hindi', nativeName: 'हिन्दी', voiceDefault: 'Kore' },
+  { code: 'tr', name: 'Turkish', nativeName: 'Türkçe', voiceDefault: 'Aoede' },
+  { code: 'fa', name: 'Persian', nativeName: 'فارسی', voiceDefault: 'Kore' },
+  { code: 'ru', name: 'Russian', nativeName: 'Русский', voiceDefault: 'Fenrir' },
+  { code: 'zh', name: 'Mandarin Chinese', nativeName: '中文', voiceDefault: 'Kore' },
+  { code: 'pt', name: 'Portuguese', nativeName: 'Português', voiceDefault: 'Aoede' },
+  { code: 'it', name: 'Italian', nativeName: 'Italiano', voiceDefault: 'Aoede' },
+  { code: 'ja', name: 'Japanese', nativeName: '日本語', voiceDefault: 'Kore' },
+  { code: 'bn', name: 'Bengali', nativeName: 'বাংলা', voiceDefault: 'Kore' },
+];
+
+router.get('/translation/languages', (_req: Request, res: Response) => {
+  res.json({
+    languages: SUPPORTED_TRANSLATION_LANGUAGES,
+    defaultAgentLanguage: 'ur',
+    defaultCustomerLanguage: 'ar',
+  });
+});
+
+// Process a live conversational turn in the bidirectional translation pipeline
+router.post('/translation/turn', async (req: Request, res: Response) => {
+  try {
+    const {
+      callId,
+      speaker = 'agent',
+      text,
+      sourceLanguage = 'Urdu',
+      targetLanguage = 'Arabic',
+      autoDetect = false,
+      generateAudio = true,
+      context = '',
+    } = req.body;
+
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'Text utterance is required for translation.' });
+    }
+
+    const result = await TranslationService.processBidirectionalTurn({
+      text: text.trim(),
+      sourceLanguage,
+      targetLanguage,
+      autoDetect: Boolean(autoDetect),
+      speaker: speaker as 'agent' | 'customer',
+      generateAudio: Boolean(generateAudio),
+      context,
+    });
+
+    // Record turn in Call Data if callId is provided
+    if (callId) {
+      realtime.broadcast('translation.turn', {
+        callId,
+        speaker,
+        ...result,
+        timestamp: new Date().toISOString(),
+      });
+    }
+
+    res.json({
+      success: true,
+      callId,
+      speaker,
+      ...result,
+    });
+  } catch (err: any) {
+    console.error('[TRANSLATION TURN ERROR]', err);
+    res.status(500).json({
+      success: false,
+      error: err?.message || 'Translation processing failed.',
+    });
+  }
+});
+
+// Synthesize speech on-demand for target language
+router.post('/translation/synthesize', async (req: Request, res: Response) => {
+  try {
+    const { text, language = 'Arabic', voice } = req.body;
+    if (!text || !text.trim()) {
+      return res.status(400).json({ error: 'Text is required for TTS synthesis.' });
+    }
+
+    const audioBase64 = await TranslationService.synthesizeSpeech({
+      text: text.trim(),
+      language,
+      voice,
+    });
+
+    if (!audioBase64) {
+      return res.status(500).json({ error: 'Audio synthesis failed.' });
+    }
+
+    res.json({
+      success: true,
+      audioBase64,
+      mimeType: 'audio/wav',
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Speech synthesis failed.' });
+  }
+});
 
 // Bi-directional live voice channel endpoint for agent & receiver audio
 router.post('/telephony/voice-message', (req: Request, res: Response) => {
@@ -34,12 +148,125 @@ router.post('/telephony/voice-message', (req: Request, res: Response) => {
   res.json({ success: true, callId, text });
 });
 
-// Helper to normalize phone numbers (e.g. +18005550199 or 18005550199)
+// Outbound direct call dispatch for Agent Terminal & Voice Translation Studio
+router.post('/zadarma/callback', authenticate, async (req: AuthenticatedRequest, res: Response) => {
+  const {
+    to,
+    sip,
+    playIvr = false,
+    isTranslationCall = false,
+    agentLanguage = 'Urdu',
+    customerLanguage = 'Arabic',
+    operatorPhone,
+  } = req.body;
+
+  if (!to) return res.status(400).json({ error: 'Destination phone number is required.' });
+
+  const data = db.get();
+  const zdProv = (data.voip_api_providers || []).find(
+    (p) => p.enabled && (p.providerType === 'ZADARMA' || p.name.toLowerCase().includes('zadarma'))
+  );
+  if (!zdProv) {
+    return res.status(500).json({ error: 'Zadarma provider is not configured or enabled.' });
+  }
+
+  const apiKey = zdProv.apiKeyEncrypted.replace(/^KEY_/, '').trim();
+  const apiSecret = (zdProv.apiSecretEncrypted || '').replace(/^SEC_/, '').trim();
+  const callerId = zdProv.defaultCallerId || '+18045930160';
+  const sipLogin = zdProv.sipLogin || '12707';
+  const callId = `call_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+  // Find agent profile
+  let agentId = req.agentId;
+  if (!agentId) {
+    const userAgent = data.agents.find((a) => a.userId === req.user?.id || a.name === req.user?.username);
+    agentId = userAgent ? userAgent.id : (data.agents.find((a) => a.enabled)?.id || 'agt_01');
+  }
+
+  const currentAgent = data.agents.find((a) => a.id === agentId);
+  const resolvedOperatorPhone = operatorPhone || currentAgent?.phoneNumber || undefined;
+
+  const zadarmaRes = await ZadarmaConnector.dispatchOutboundCall({
+    apiKey,
+    apiSecret,
+    from: callerId,
+    to,
+    sip: sipLogin,
+    operatorPhone: resolvedOperatorPhone,
+    pbxExtension: zdProv.pbxExtension || '100',
+    scenarioId: playIvr ? '0' : undefined,
+    playIvr: Boolean(playIvr),
+    predicted: true,
+    callId,
+  });
+
+  if (zadarmaRes.success) {
+    const newCall: any = {
+      id: callId,
+      callId,
+      customerNumber: to,
+      callerId,
+      sipConnectionId: zdProv.id,
+      sipResponseCode: 100,
+      sipResponseText: '100 Trying (Outbound PSTN Dispatch)',
+      agentId,
+      startTime: new Date().toISOString(),
+      durationSeconds: 0,
+      status: 'DIALING',
+      isDirectTranslationCall: Boolean(isTranslationCall),
+      routingType: isTranslationCall ? 'AI_VOICE_TRANSLATION' : 'IVR_THEN_DIRECT_AGENT',
+      agentLanguage,
+      customerLanguage,
+    };
+
+    await db.update((d) => {
+      d.calls.unshift(newCall);
+      const agt = d.agents.find((a) => a.id === agentId);
+      if (agt) {
+        agt.currentCallId = callId;
+        agt.state = 'RINGING';
+      }
+    });
+
+    realtime.broadcast('call.created', newCall);
+    return res.json({ success: true, callId, message: zadarmaRes.message });
+  }
+
+  return res.status(500).json({ error: zadarmaRes.message || 'Failed to dispatch carrier call.' });
+});
+
+// Helper to normalize phone numbers (e.g. +18005550199 or +447577309348)
 function normalizePhoneNumber(raw: string): { valid: boolean; normalized: string; reason?: string } {
   if (!raw || !raw.trim()) {
     return { valid: false, normalized: '', reason: 'Empty phone number' };
   }
-  const cleaned = raw.trim().replace(/[\s\-\(\)\.]/g, '');
+  let cleaned = raw.trim().replace(/[\s\-\(\)\.]/g, '');
+
+  // Strip international 00 prefix if present
+  if (cleaned.startsWith('00')) {
+    cleaned = cleaned.slice(2);
+  }
+
+  // Normalize UK domestic formats:
+  // 1. Domestic mobile with leading +0 (e.g. +07577309348 -> +447577309348)
+  if (cleaned.startsWith('+07') && cleaned.length === 12) {
+    cleaned = `447${cleaned.slice(3)}`;
+  }
+  // 2. Domestic mobile starting with 07 (e.g. 07577309348 -> +447577309348)
+  else if (cleaned.startsWith('07') && cleaned.length === 11) {
+    cleaned = `447${cleaned.slice(2)}`;
+  }
+  // 3. International with domestic 0 preserved (e.g. +4407577309348 -> +447577309348)
+  else if (cleaned.startsWith('+4407') && cleaned.length === 14) {
+    cleaned = `447${cleaned.slice(5)}`;
+  } else if (cleaned.startsWith('4407') && cleaned.length === 13) {
+    cleaned = `447${cleaned.slice(4)}`;
+  }
+  // 4. US domestic 10-digit number (e.g. 2099722359 -> +12099722359)
+  else if (cleaned.length === 10 && !cleaned.startsWith('0') && !cleaned.startsWith('+')) {
+    cleaned = `1${cleaned}`;
+  }
+
   if (!/^(\+?[0-9]{7,15})$/.test(cleaned)) {
     return { valid: false, normalized: raw, reason: 'Invalid format (must be 7-15 digits, optional +)' };
   }
@@ -238,6 +465,11 @@ router.get('/admin/managers', authenticate, requireRole(['admin']), (req: Authen
 
     return {
       ...mgr,
+      allowedRoutingMode: mgr.allowedRoutingMode || 'IVR_THEN_DIRECT_AGENT',
+      enforcedAgentLanguage: mgr.enforcedAgentLanguage || 'Urdu',
+      enforcedCustomerLanguage: mgr.enforcedCustomerLanguage || 'Arabic',
+      allowManagerOverrideLanguages: mgr.allowManagerOverrideLanguages !== false,
+      aiTranslationBotVoice: mgr.aiTranslationBotVoice || 'Aoede',
       username: user?.username || '',
       email: user?.email || '',
       currentAgentsCount: agentCount,
@@ -357,7 +589,19 @@ router.post('/admin/managers', authenticate, requireRole(['admin']), async (req:
 
 router.put('/admin/managers/:id', authenticate, requireRole(['admin']), async (req: AuthenticatedRequest, res: Response) => {
   const { id } = req.params;
-  const { name, maxAgents, enabled, notes, assignedVoipIds, assignedSipIds } = req.body;
+  const {
+    name,
+    maxAgents,
+    enabled,
+    notes,
+    assignedVoipIds,
+    assignedSipIds,
+    allowedRoutingMode,
+    enforcedAgentLanguage,
+    enforcedCustomerLanguage,
+    allowManagerOverrideLanguages,
+    aiTranslationBotVoice,
+  } = req.body;
 
   const data = db.get();
   const manager = data.managers.find((m) => m.id === id);
@@ -372,6 +616,11 @@ router.put('/admin/managers/:id', authenticate, requireRole(['admin']), async (r
       if (maxAgents !== undefined) mgr.maxAgents = Math.max(1, parseInt(maxAgents, 10));
       if (enabled !== undefined) mgr.enabled = Boolean(enabled);
       if (notes !== undefined) mgr.notes = notes;
+      if (allowedRoutingMode !== undefined) mgr.allowedRoutingMode = allowedRoutingMode;
+      if (enforcedAgentLanguage !== undefined) mgr.enforcedAgentLanguage = enforcedAgentLanguage;
+      if (enforcedCustomerLanguage !== undefined) mgr.enforcedCustomerLanguage = enforcedCustomerLanguage;
+      if (allowManagerOverrideLanguages !== undefined) mgr.allowManagerOverrideLanguages = Boolean(allowManagerOverrideLanguages);
+      if (aiTranslationBotVoice !== undefined) mgr.aiTranslationBotVoice = aiTranslationBotVoice;
 
       const user = d.users.find((u) => u.id === mgr.userId);
       if (user && enabled !== undefined) {
@@ -1863,6 +2112,26 @@ router.get('/manager/agents', authenticate, requireRole(['manager', 'admin']), (
     maxAgents: manager?.maxAgents || 50,
     currentCount: agents.length,
     agents,
+    managerPolicy: {
+      allowedRoutingMode: manager?.allowedRoutingMode || 'BOTH',
+      enforcedAgentLanguage: manager?.enforcedAgentLanguage || 'Urdu',
+      enforcedCustomerLanguage: manager?.enforcedCustomerLanguage || 'Arabic',
+      allowManagerOverrideLanguages: manager?.allowManagerOverrideLanguages !== false,
+      aiTranslationBotVoice: manager?.aiTranslationBotVoice || 'Aoede',
+    },
+  });
+});
+
+router.get('/manager/policy', authenticate, requireRole(['manager', 'admin']), (req: AuthenticatedRequest, res: Response) => {
+  const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : 'mgr_alpha');
+  const data = db.get();
+  const manager = data.managers.find((m) => m.id === managerId || m.userId === req.user?.id);
+  res.json({
+    allowedRoutingMode: manager?.allowedRoutingMode || 'IVR_THEN_DIRECT_AGENT',
+    enforcedAgentLanguage: manager?.enforcedAgentLanguage || 'Urdu',
+    enforcedCustomerLanguage: manager?.enforcedCustomerLanguage || 'Arabic',
+    allowManagerOverrideLanguages: manager?.allowManagerOverrideLanguages !== false,
+    aiTranslationBotVoice: manager?.aiTranslationBotVoice || 'Aoede',
   });
 });
 
@@ -2551,17 +2820,47 @@ router.get('/manager/campaigns', authenticate, requireRole(['manager', 'admin'])
 
 router.post('/manager/campaigns', authenticate, requireRole(['manager', 'admin']), async (req: AuthenticatedRequest, res: Response) => {
   const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : 'mgr_alpha');
-  const { name, ivrConfigId, contacts, autoStart } = req.body;
+  const {
+    name,
+    ivrConfigId,
+    contacts,
+    autoStart,
+    routingType = 'IVR_THEN_DIRECT_AGENT',
+    agentLanguage,
+    customerLanguage,
+    autoDetectCustomerLanguage,
+    aiBotGreeting,
+  } = req.body;
   let { sipConnectionId, callerIdNumber } = req.body;
 
-  if (!name || !ivrConfigId || !Array.isArray(contacts)) {
-    return res.status(400).json({ error: 'Campaign name, IVR workflow, and contacts list are required.' });
+  if (!name || (!ivrConfigId && routingType !== 'AI_VOICE_TRANSLATION') || !Array.isArray(contacts)) {
+    return res.status(400).json({ error: 'Campaign name, workflow configuration, and contacts list are required.' });
   }
 
   const data = db.get();
-
-  // 1. Strictly use route assigned by Admin to this manager
   const currentMgr = data.managers.find((m) => m.id === managerId);
+
+  // Policy validation set by Admin for this Manager
+  const allowedMode = currentMgr?.allowedRoutingMode || 'BOTH';
+  if (allowedMode === 'IVR_THEN_DIRECT_AGENT' && routingType === 'AI_VOICE_TRANSLATION') {
+    return res.status(403).json({
+      error: 'Admin policy restriction: You are authorized to create only "IVR Then Direct Agent" campaigns.',
+    });
+  }
+  if (allowedMode === 'AI_VOICE_TRANSLATION' && routingType === 'IVR_THEN_DIRECT_AGENT') {
+    return res.status(403).json({
+      error: 'Admin policy restriction: You are authorized to create only "AI Real-Time Voice Translation" campaigns.',
+    });
+  }
+
+  // Resolve languages for AI Voice Translation mode
+  let finalAgentLang = agentLanguage || currentMgr?.enforcedAgentLanguage || 'Urdu';
+  let finalCustomerLang = customerLanguage || currentMgr?.enforcedCustomerLanguage || 'Arabic';
+  if (currentMgr?.allowManagerOverrideLanguages === false) {
+    // Admin strictly locked languages
+    finalAgentLang = currentMgr.enforcedAgentLanguage || 'Urdu';
+    finalCustomerLang = currentMgr.enforcedCustomerLanguage || 'Arabic';
+  }
   if (currentMgr?.assignedRouteId) {
     sipConnectionId = currentMgr.assignedRouteId;
   } else if (!sipConnectionId) {
@@ -2682,6 +2981,11 @@ router.post('/manager/campaigns', authenticate, requireRole(['manager', 'admin']
     ivrCompletedCount: 0,
     agentConnectedCount: 0,
     failedCount: 0,
+    routingType,
+    agentLanguage: finalAgentLang,
+    customerLanguage: finalCustomerLang,
+    autoDetectCustomerLanguage: Boolean(autoDetectCustomerLanguage),
+    aiBotGreeting: aiBotGreeting || (routingType === 'AI_VOICE_TRANSLATION' ? 'مرحباً، جاري توصيلك بممثل الخدمة' : undefined),
     createdAt: now,
   };
 
@@ -2837,21 +3141,53 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
 
   // 1. Check if agent already has an active call assigned via currentCallId
   if (agent.currentCallId) {
-    activeCall = data.calls.find((c) => c.id === agent!.currentCallId);
+    const assignedCall = data.calls.find((c) => c.id === agent!.currentCallId);
     if (
-      activeCall &&
-      !activeCall.endTime &&
-      ['BRIDGED', 'RINGING', 'ANSWERED', 'IVR_ACTIVE', 'IN_PROGRESS', 'DIALING'].includes(activeCall.status)
+      assignedCall &&
+      !assignedCall.endTime &&
+      ['BRIDGED', 'RINGING', 'DIALING', 'ANSWERED'].includes(assignedCall.status)
     ) {
-      activeCallDtmf = data.dtmf_events
-        .filter((d) => d.callId === agent!.currentCallId)
-        .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+      // If the call is still strictly in IVR_ACTIVE (not yet transferred to agent), do not assign to agent UI
+      if (assignedCall.status === 'IVR_ACTIVE') {
+        activeCall = null;
+        agent.currentCallId = null;
+        if (agent.state === 'RINGING' || agent.state === 'BUSY') {
+          agent.state = 'AVAILABLE';
+        }
+        await db.update((d) => {
+          const agt = d.agents.find((a) => a.id === agent!.id);
+          if (agt) {
+            agt.currentCallId = null;
+            if (agt.state === 'RINGING' || agt.state === 'BUSY') {
+              agt.state = 'AVAILABLE';
+            }
+          }
+        });
+      } else {
+        activeCall = assignedCall;
+        activeCallDtmf = data.dtmf_events
+          .filter((d) => d.callId === agent!.currentCallId)
+          .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
+      }
     } else {
       activeCall = null;
+      agent.currentCallId = null;
+      if (agent.state === 'RINGING' || agent.state === 'BUSY') {
+        agent.state = 'AVAILABLE';
+      }
+      await db.update((d) => {
+        const agt = d.agents.find((a) => a.id === agent!.id);
+        if (agt) {
+          agt.currentCallId = null;
+          if (agt.state === 'RINGING' || agt.state === 'BUSY') {
+            agt.state = 'AVAILABLE';
+          }
+        }
+      });
     }
   }
 
-  // 2. If no active call assigned via currentCallId, scan for any active call waiting or in progress
+  // 2. If no active call assigned via currentCallId, check calls transferred to or initiated by this agent
   if (!activeCall) {
     const openCalls = (data.calls || []).filter(
       (c) =>
@@ -2861,33 +3197,19 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
     // Sort newest first
     openCalls.sort((a, b) => new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime());
 
-    // Priority 1: Open call specifically assigned to this agent ID
-    let candidate = openCalls.find((c) => c.agentId === agent!.id);
-
-    // Priority 2: Any call that is in 'BRIDGED' status in the entire platform
-    if (!candidate) {
-      candidate = openCalls.find((c) => c.status === 'BRIDGED');
-    }
-
-    // Priority 3: Open call belonging to this agent's manager
-    if (!candidate && agent!.managerId) {
-      candidate = openCalls.find((c) => c.managerId === agent!.managerId);
-    }
-
-    // Priority 4: Any open call that is ringing, answered, or in progress
-    if (!candidate && openCalls.length > 0) {
-      candidate = openCalls[0];
-    }
+    const candidate = openCalls.find((c) => {
+      if (c.agentId !== agent!.id) return false;
+      if (!['BRIDGED', 'RINGING', 'DIALING', 'ANSWERED'].includes(c.status)) return false;
+      if (c.campaignId && !(c as any).isDirectTranslationCall && (!c.dtmfSequence || c.dtmfSequence.length === 0)) return false;
+      return true;
+    });
 
     if (candidate) {
       activeCall = candidate;
-      const isConnected = ['BRIDGED', 'ANSWERED', 'IVR_ACTIVE'].includes(candidate.status);
+      const isConnected = ['BRIDGED', 'ANSWERED'].includes(candidate.status);
       const targetState = isConnected ? 'BUSY' : 'RINGING';
-
       agent.state = targetState;
       agent.currentCallId = candidate.id;
-      if (isConnected) candidate.status = 'BRIDGED';
-
       await db.update((d) => {
         const agt = d.agents.find((a) => a.id === agent!.id);
         if (agt) {
@@ -2895,26 +3217,12 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
           agt.currentCallId = candidate!.id;
           agt.lastStateChange = new Date().toISOString();
         }
-        const callItem = d.calls.find((item) => item.id === candidate!.id);
-        if (callItem) {
-          callItem.agentId = agent!.id;
-          if (isConnected) {
-            callItem.status = 'BRIDGED';
-            if (!callItem.transferResult || callItem.transferResult.includes('Ringing')) {
-              callItem.transferResult = `Bridged with ${agent!.name} (Audio Stream: ACTIVE)`;
-            }
-            if (!callItem.answerTime) callItem.answerTime = new Date().toISOString();
-          } else {
-            callItem.transferResult = `Ringing Agent Station: ${agent!.name}`;
-          }
-        }
       });
-
       activeCallDtmf = data.dtmf_events
         .filter((d) => d.callId === candidate!.id)
         .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
     } else {
-      // No open calls anywhere: if agent was stuck in RINGING or BUSY without an active call, reset to AVAILABLE
+      // No valid call for agent: ensure agent is NOT ringing or busy on a phantom call
       if (agent.state === 'RINGING' || (agent.state === 'BUSY' && !agent.currentCallId)) {
         await db.update((d) => {
           const agt = d.agents.find((a) => a.id === agent!.id);
@@ -2929,7 +3237,84 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
     }
   }
 
-  res.json({ agent, activeCall, activeCallDtmf });
+  const currentManager = data.managers.find((m) => m.id === agent?.managerId || m.userId === agent?.userId);
+  const managerPolicy = {
+    allowedRoutingMode: currentManager?.allowedRoutingMode || 'IVR_THEN_DIRECT_AGENT',
+    enforcedAgentLanguage: currentManager?.enforcedAgentLanguage || 'Urdu',
+    enforcedCustomerLanguage: currentManager?.enforcedCustomerLanguage || 'Arabic',
+    allowManagerOverrideLanguages: currentManager?.allowManagerOverrideLanguages !== false,
+    aiTranslationBotVoice: currentManager?.aiTranslationBotVoice || 'Aoede',
+  };
+
+  res.json({ agent, activeCall, activeCallDtmf, managerPolicy });
+});
+
+// Update Agent Direct PSTN Phone Number for hardware / mobile phone bridging
+router.post('/agent/phone', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const { phoneNumber } = req.body;
+  const data = db.get();
+  let agentId = req.agentId;
+  if (!agentId) {
+    const userAgent = data.agents.find((a) => a.userId === req.user?.id || a.name === req.user?.username);
+    agentId = userAgent ? userAgent.id : (data.agents.find((a) => a.enabled)?.id || 'agt_01');
+  }
+  const cleanPhone = phoneNumber ? String(phoneNumber).trim() : '';
+  await db.update((d) => {
+    const agt = d.agents.find((a) => a.id === agentId);
+    if (agt) {
+      agt.phoneNumber = cleanPhone || undefined;
+    }
+  });
+  res.json({ success: true, phoneNumber: cleanPhone, message: 'Agent phone updated successfully.' });
+});
+
+// Force-bridge an active or dialing call directly with agent station
+router.post('/agent/force-bridge', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const { callId } = req.body;
+  if (!callId) return res.status(400).json({ error: 'Call ID is required.' });
+  const data = db.get();
+  const call = data.calls.find((c) => c.id === callId);
+  if (!call) return res.status(404).json({ error: 'Call not found.' });
+
+  let agentId = req.agentId;
+  if (!agentId) {
+    const userAgent = data.agents.find((a) => a.userId === req.user?.id || a.name === req.user?.username);
+    agentId = userAgent ? userAgent.id : (data.agents.find((a) => a.enabled)?.id || 'agt_01');
+  }
+
+  await db.update((d) => {
+    const c = d.calls.find((item) => item.id === callId);
+    if (c) {
+      c.status = 'BRIDGED';
+      c.agentId = agentId;
+      c.answerTime = c.answerTime || new Date().toISOString();
+      c.sipResponseCode = 200;
+      c.sipResponseText = '200 OK (Direct Agent Bridge Active)';
+    }
+    const agt = d.agents.find((a) => a.id === agentId);
+    if (agt) {
+      agt.currentCallId = callId;
+      agt.state = 'BUSY';
+    }
+  });
+
+  await telephony.agentAnswerCall(agentId, callId, {
+    sessionId: `sess_${callId}_${Date.now()}`,
+    mediaState: 'ACTIVE',
+  });
+
+  realtime.broadcast('call.answered', {
+    callId,
+    status: 'BRIDGED',
+    customerNumber: call.customerNumber,
+  });
+  realtime.broadcast('agent.state_changed', {
+    agentId,
+    state: 'BUSY',
+    currentCallId: callId,
+  });
+
+  res.json({ success: true, message: 'Call forcefully bridged with live audio stream active.' });
 });
 
 router.get('/agent/active-call-dtmf/:callId', authenticate, requireRole(['agent', 'admin', 'manager']), (req: AuthenticatedRequest, res: Response) => {
@@ -2992,7 +3377,8 @@ router.post('/agent/call-action', authenticate, requireRole(['agent', 'admin', '
       session: result.session,
     });
   } else if (action === 'END') {
-    await telephony.endCall(callId, 'AGENT_HANGUP', 'Agent terminated bridged call.');
+    const endReason = req.body?.reason || 'Agent terminated bridged call.';
+    await telephony.endCall(callId, 'AGENT_HANGUP', endReason);
     telephony.terminateAudioSession(callId, sessionId);
     return res.json({ success: true, message: 'Call ended.' });
   }
@@ -3013,6 +3399,138 @@ router.post('/agent/call-notes', authenticate, requireRole(['agent', 'admin', 'm
   });
 
   res.json({ success: true, message: 'Call notes saved successfully.' });
+});
+
+// Record incoming WebRTC call triggered when Zadarma PBX transfers call to extension 100 after DTMF keypress
+router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const agentId = req.agentId || 'agt_01';
+  const { caller, digit = '1' } = req.body;
+  const data = db.get();
+
+  const cleanDigits = (s?: string) => (s ? String(s).replace(/\D/g, '').slice(-10) : '');
+  const callerDigits = cleanDigits(caller);
+
+  // Look for any active campaign or outbound call in the system that matches this caller
+  let call = data.calls.find((c) => {
+    if (c.endTime || ['COMPLETED', 'FAILED', 'CANCELLED'].includes(c.status)) return false;
+    const cCustDigits = cleanDigits(c.customerNumber);
+    if (callerDigits && cCustDigits === callerDigits) return true;
+    return false;
+  });
+
+  if (!call) {
+    // If no direct digit match, find newest active campaign call that is dialing or in IVR
+    call = data.calls.find((c) => {
+      if (c.endTime || ['COMPLETED', 'FAILED', 'CANCELLED'].includes(c.status)) return false;
+      return Boolean(c.campaignId);
+    });
+  }
+
+  const now = new Date().toISOString();
+
+  if (call) {
+    const existingSeq = call.dtmfSequence || '';
+    const newSeq = existingSeq ? `${existingSeq}${digit}` : String(digit);
+
+    await db.update((d) => {
+      const c = d.calls.find((item) => item.id === call!.id);
+      if (c) {
+        c.status = 'RINGING';
+        c.agentId = agentId;
+        c.dtmfSequence = newSeq;
+        c.transferResult = `DTMF Key ${digit} Pressed: Transferred to Agent Station`;
+        c.ivrResult = `Option ${digit} selected (TRANSFER_TO_AGENT)`;
+      }
+
+      const agt = d.agents.find((a) => a.id === agentId);
+      if (agt) {
+        agt.state = 'RINGING';
+        agt.currentCallId = call!.id;
+        agt.lastStateChange = now;
+      }
+
+      d.dtmf_events.push({
+        id: `dtmf_${Date.now()}`,
+        callId: call!.id,
+        customerPhone: call!.customerNumber || caller || 'PSTN Caller',
+        digit: String(digit),
+        timestamp: now,
+        timeOffsetMs: 0,
+        resultingAction: 'TRANSFER_TO_AGENT',
+        sequenceNumber: (d.dtmf_events.filter((e) => e.callId === call!.id).length || 0) + 1,
+      });
+
+      d.call_events.push({
+        id: `evt_dtmf_${Date.now()}`,
+        callId: call!.id,
+        type: 'dtmf.received',
+        timestamp: now,
+        details: { digit: String(digit), target: 'HUMAN_AGENT' },
+      });
+    });
+
+    realtime.broadcast('agent.incoming_call', {
+      callId: call.id,
+      agentId,
+      customerNumber: call.customerNumber,
+      callerId: call.callerId,
+      startTime: call.startTime,
+      directHumanCall: true,
+      dtmfSequence: newSeq,
+    });
+
+    return res.json({ success: true, callId: call.id, agentId });
+  }
+
+  // If no existing call was matched, create an incoming call record linked to this agent
+  const callId = `call_zd_webrtc_${Date.now()}`;
+  await db.update((d) => {
+    d.calls.unshift({
+      id: callId,
+      callId,
+      customerNumber: caller || 'PSTN Caller',
+      callerId: '+18045930160',
+      status: 'RINGING',
+      agentId,
+      managerId: req.managerId || 'mgr_alpha',
+      sipConnectionId: 'voip_zadarma',
+      startTime: now,
+      durationSeconds: 0,
+      dtmfSequence: String(digit),
+      ivrResult: `Option ${digit} selected (TRANSFER_TO_AGENT)`,
+      transferResult: `DTMF ${digit} Pressed: Transferred to Agent Station`,
+    });
+
+    const agt = d.agents.find((a) => a.id === agentId);
+    if (agt) {
+      agt.state = 'RINGING';
+      agt.currentCallId = callId;
+      agt.lastStateChange = now;
+    }
+
+    d.dtmf_events.push({
+      id: `dtmf_${Date.now()}`,
+      callId,
+      customerPhone: caller || 'PSTN Caller',
+      digit: String(digit),
+      timestamp: now,
+      timeOffsetMs: 0,
+      resultingAction: 'TRANSFER_TO_AGENT',
+      sequenceNumber: 1,
+    });
+  });
+
+  realtime.broadcast('agent.incoming_call', {
+    callId,
+    agentId,
+    customerNumber: caller || 'PSTN Caller',
+    callerId: '+18045930160',
+    startTime: now,
+    directHumanCall: true,
+    dtmfSequence: String(digit),
+  });
+
+  res.json({ success: true, callId, agentId });
 });
 
 // Simulate incoming IVR call transferred to agent after DTMF pressed
@@ -3209,7 +3727,7 @@ router.all(['/twilio/call-twiml', '/carrier/call-xml'], (req: Request, res: Resp
   const ivr = campaign ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId) : data.ivr_configs[0];
   const greeting = ivr?.greetingText || 'Hello from Pirates World Tele Solution. Dispatched via carrier cloud. Press 1 to connect with an agent, or 2 to hear this greeting again.';
 
-  const appUrl = process.env.APP_URL || 'https://ais-dev-poipaeays7cgf773toaf6y-679199737507.asia-northeast1.run.app';
+  const appUrl = process.env.APP_URL || 'https://pirates-world-tele-solution.onrender.com';
   const dtmfUrl = `${appUrl}/api/twilio/dtmf${callId ? `?callId=${encodeURIComponent(callId)}` : ''}`;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>

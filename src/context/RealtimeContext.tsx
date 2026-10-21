@@ -11,6 +11,7 @@ interface RealtimeContextType {
   latestSipHealthEvent: any;
   latestSystemError: any;
   latestVoiceMessage: { callId: string; sender: string; text: string; timestamp: string } | null;
+  latestTranslationEvent: any;
   clearLiveDtmf: () => void;
   triggerRefresh: number;
 }
@@ -27,6 +28,7 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [latestSipHealthEvent, setLatestSipHealthEvent] = useState<any>(null);
   const [latestSystemError, setLatestSystemError] = useState<any>(null);
   const [latestVoiceMessage, setLatestVoiceMessage] = useState<any>(null);
+  const [latestTranslationEvent, setLatestTranslationEvent] = useState<any>(null);
   const [triggerRefresh, setTriggerRefresh] = useState<number>(0);
 
   const clearLiveDtmf = useCallback(() => {
@@ -85,14 +87,8 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       setTriggerRefresh((prev) => prev + 1);
     });
 
-    eventSource.addEventListener('call.answered', (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        setLatestAgentEvent({ type: 'answered', ...data });
-        setTriggerRefresh((prev) => prev + 1);
-      } catch {
-        setTriggerRefresh((prev) => prev + 1);
-      }
+    eventSource.addEventListener('call.answered', () => {
+      setTriggerRefresh((prev) => prev + 1);
     });
 
     eventSource.addEventListener('call.bridged', (e) => {
@@ -118,10 +114,22 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     eventSource.addEventListener('call.ended', (e) => {
       try {
         const data = JSON.parse(e.data);
-        setActiveCalls((prev) => prev.filter((c) => c.callId !== data.callId));
+        setActiveCalls((prev) => prev.filter((c) => (c.callId || c.id) !== data.callId));
+        setLatestAgentEvent({ type: 'call.ended', ...data });
         setTriggerRefresh((prev) => prev + 1);
       } catch (err) {
         console.error('Error parsing call.ended:', err);
+      }
+    });
+
+    eventSource.addEventListener('call.failed', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        setActiveCalls((prev) => prev.filter((c) => (c.callId || c.id) !== data.callId));
+        setLatestAgentEvent({ type: 'call.failed', ...data });
+        setTriggerRefresh((prev) => prev + 1);
+      } catch (err) {
+        console.error('Error parsing call.failed:', err);
       }
     });
 
@@ -174,6 +182,15 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     });
 
+    eventSource.addEventListener('translation.turn', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        setLatestTranslationEvent(data);
+      } catch (err) {
+        console.error('Error parsing translation.turn:', err);
+      }
+    });
+
     eventSource.addEventListener('telephony.voice_message', (e) => {
       try {
         const data = JSON.parse(e.data);
@@ -200,6 +217,7 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         latestSipHealthEvent,
         latestSystemError,
         latestVoiceMessage,
+        latestTranslationEvent,
         clearLiveDtmf,
         triggerRefresh,
       }}

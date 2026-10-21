@@ -1,16 +1,43 @@
 @import "tailwindcss";
 
-/* Hide any floating Zadarma or external softphone widgets/icons */
-#zdrm-webphone-widget,
-#zdrm-webphone-container,
-.zdrm-webphone-widget,
-.zdrm-webphone-icon,
-.zdrm-webphone-btn,
-.zdrm-webphone-call-btn-container,
-[id*="zdrm-webphone"],
-[class*="zdrm-webphone"] {
-  display: none !important;
-  visibility: hidden !important;
+/* Keep Zadarma WebRTC audio/media elements active and decoded without display:none */
+#zdrm-webRTCRemoteView,
+#zdrm-webRTCSelfView {
+  display: block !important;
+  position: fixed !important;
+  bottom: 0 !important;
+  right: 0 !important;
+  width: 2px !important;
+  height: 2px !important;
+  opacity: 0.01 !important;
   pointer-events: none !important;
+  z-index: -999 !important;
+}
+
+/* WebRTC Phone Widget: Kept alive in background without display:none; hidden by default */
+#zdrmWPhI,
+.zdrm-phone,
+.zdrm-webphone-widget,
+.zdrm-webphone-icon {
+  display: block !important;
+  position: fixed !important;
+  bottom: 24px !important;
+  right: 24px !important;
+  visibility: hidden !important;
   opacity: 0 !important;
+  pointer-events: none !important;
+  z-index: 99999 !important;
+  transform: scale(0.85);
+  transition: opacity 0.3s ease, transform 0.3s ease;
+}
+
+/* Automatically show the WebRTC Phone Widget ONLY when a call is actively bridged */
+body.call-bridged-active #zdrmWPhI,
+body.call-bridged-active .zdrm-phone,
+body.call-bridged-active .zdrm-webphone-widget,
+body.call-bridged-active .zdrm-webphone-icon {
+  visibility: visible !important;
+  opacity: 1 !important;
+  pointer-events: auto !important;
+  transform: scale(1) !important;
 }

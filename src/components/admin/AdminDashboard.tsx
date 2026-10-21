@@ -45,6 +45,8 @@ import {
   Gauge,
   TrendingDown,
   Wifi,
+  Sliders,
+  Languages,
 } from 'lucide-react';
 import { VoipProviderSettings } from './VoipProviderSettings.tsx';
 import { ConnectionHealthPanel, type DiagnosticReport } from '../agent/ConnectionHealthPanel.tsx';
@@ -88,6 +90,15 @@ export const AdminDashboard: React.FC = () => {
 
   // Modals
   const [showCreateManagerModal, setShowCreateManagerModal] = useState<boolean>(false);
+  const [showManagerPolicyModal, setShowManagerPolicyModal] = useState<boolean>(false);
+  const [selectedManagerForPolicy, setSelectedManagerForPolicy] = useState<ManagerItem | null>(null);
+  const [policyForm, setPolicyForm] = useState({
+    allowedRoutingMode: 'BOTH' as 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION' | 'BOTH',
+    enforcedAgentLanguage: 'Urdu',
+    enforcedCustomerLanguage: 'Arabic',
+    allowManagerOverrideLanguages: true,
+    aiTranslationBotVoice: 'Aoede',
+  });
   const [managerForm, setManagerForm] = useState({
     name: '',
     username: '',
@@ -375,6 +386,39 @@ export const AdminDashboard: React.FC = () => {
       if (res.ok) {
         showNotification('success', `Manager ${mgr.name} ${mgr.enabled ? 'disabled' : 'enabled'}.`);
         fetchData();
+      }
+    } catch (err: any) {
+      showNotification('error', err.message);
+    }
+  };
+
+  const handleOpenPolicyModal = (mgr: ManagerItem) => {
+    setSelectedManagerForPolicy(mgr);
+    setPolicyForm({
+      allowedRoutingMode: mgr.allowedRoutingMode || 'IVR_THEN_DIRECT_AGENT',
+      enforcedAgentLanguage: mgr.enforcedAgentLanguage || 'Urdu',
+      enforcedCustomerLanguage: mgr.enforcedCustomerLanguage || 'Arabic',
+      allowManagerOverrideLanguages: mgr.allowManagerOverrideLanguages !== false,
+      aiTranslationBotVoice: mgr.aiTranslationBotVoice || 'Aoede',
+    });
+    setShowManagerPolicyModal(true);
+  };
+
+  const handleSaveManagerPolicy = async () => {
+    if (!selectedManagerForPolicy || !token) return;
+    try {
+      const res = await fetch(`/api/admin/managers/${selectedManagerForPolicy.id}`, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify(policyForm),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotification('success', `Campaign & AI Translation policy updated for manager '${selectedManagerForPolicy.name}'.`);
+        setShowManagerPolicyModal(false);
+        fetchData();
+      } else {
+        showNotification('error', data.error || 'Failed to update policy.');
       }
     } catch (err: any) {
       showNotification('error', err.message);
@@ -1041,6 +1085,7 @@ export const AdminDashboard: React.FC = () => {
                   <th className="py-3 px-4 text-left">Max Quota</th>
                   <th className="py-3 px-4 text-left">Active Agents</th>
                   <th className="py-3 px-4 text-left">Assigned Outbound Route (Admin Enforced)</th>
+                  <th className="py-3 px-4 text-left">Campaign & AI Policy</th>
                   <th className="py-3 px-4 text-left">Calls & Usage</th>
                   <th className="py-3 px-4 text-left">Status</th>
                   <th className="py-3 px-4 text-right">Actions</th>
@@ -1087,6 +1132,39 @@ export const AdminDashboard: React.FC = () => {
                           <span className="text-[10px] text-slate-500 font-medium">
                             Current Route: <strong>{mgr.assignedRouteName || 'Zadarma Cloud PBX PSTN'}</strong>
                           </span>
+                        </div>
+                      </td>
+                      <td className="py-3 px-4 text-xs">
+                        <div className="space-y-1.5">
+                          <div>
+                            {mgr.allowedRoutingMode === 'IVR_THEN_DIRECT_AGENT' ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-blue-100 text-blue-800 border border-blue-200">
+                                📞 IVR → Direct Agent
+                              </span>
+                            ) : mgr.allowedRoutingMode === 'AI_VOICE_TRANSLATION' ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-200">
+                                🤖 AI Translation Bot
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[10px] font-bold bg-purple-100 text-purple-800 border border-purple-200">
+                                ✨ Both Allowed
+                              </span>
+                            )}
+                          </div>
+                          <div className="text-[10px] text-slate-600 font-medium">
+                            <span className="text-blue-700 font-bold">{mgr.enforcedAgentLanguage || 'Urdu'}</span> ⇄ <span className="text-emerald-700 font-bold">{mgr.enforcedCustomerLanguage || 'Arabic'}</span>
+                            {mgr.allowManagerOverrideLanguages === false && (
+                              <span className="ml-1 text-[9px] bg-slate-200 text-slate-700 px-1 py-0.2 rounded font-semibold">Locked</span>
+                            )}
+                          </div>
+                          <button
+                            type="button"
+                            onClick={() => handleOpenPolicyModal(mgr)}
+                            className="inline-flex items-center gap-1 text-[11px] font-bold text-indigo-700 hover:text-indigo-900 bg-indigo-50 hover:bg-indigo-100 px-2 py-1 rounded-lg border border-indigo-200 cursor-pointer transition-colors"
+                          >
+                            <Sliders className="w-3 h-3" />
+                            <span>Configure Policy</span>
+                          </button>
                         </div>
                       </td>
                       <td className="py-3 px-4 text-xs">
@@ -1236,7 +1314,7 @@ export const AdminDashboard: React.FC = () => {
                               : 'bg-red-100 text-red-800 border border-red-200'
                           }`}
                         >
-                          <span>{call.status}</span>
+                          <span>{call.status === 'IVR_ACTIVE' ? 'IVR VOICE ACTIVE' : call.status}</span>
                         </span>
                       </td>
                       <td className="py-3 px-4 font-mono text-xs font-semibold text-slate-700">
@@ -1244,9 +1322,39 @@ export const AdminDashboard: React.FC = () => {
                       </td>
                       <td className="py-3 px-4">
                         {call.dtmfSequence ? (
-                          <span className="font-mono font-bold text-xs bg-indigo-100 text-indigo-900 border border-indigo-200 px-2 py-0.5 rounded">
-                            Key [{call.dtmfSequence}] &rarr; Agent
+                          <span className="font-mono font-bold text-xs bg-indigo-100 text-indigo-900 border border-indigo-200 px-2 py-0.5 rounded inline-flex items-center gap-1">
+                            <span>Key [{call.dtmfSequence}]</span>
+                            <span>&rarr;</span>
+                            <span className="text-emerald-700 font-semibold">Bridged with Agent</span>
                           </span>
+                        ) : call.status === 'IVR_ACTIVE' ? (
+                          <div className="flex flex-col gap-1 items-start">
+                            <span className="text-[10px] font-semibold text-indigo-700 bg-indigo-50 border border-indigo-200 px-1.5 py-0.5 rounded inline-flex items-center gap-1">
+                              <Radio className="w-2.5 h-2.5 text-indigo-600 animate-pulse" />
+                              <span>Hearing IVR Voice</span>
+                            </span>
+                            <button
+                              type="button"
+                              onClick={async () => {
+                                try {
+                                  const res = await fetch('/api/customer/dtmf', {
+                                    method: 'POST',
+                                    headers: { 'Content-Type': 'application/json' },
+                                    body: JSON.stringify({ callId: call.id, digit: '1' }),
+                                  });
+                                  if (res.ok) {
+                                    fetchData();
+                                  }
+                                } catch (err) {
+                                  console.error(err);
+                                }
+                              }}
+                              className="text-[10px] font-bold px-2 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded shadow-xs transition-colors cursor-pointer inline-flex items-center gap-1"
+                              title="Press DTMF 1 to bridge with live agent"
+                            >
+                              <span>Press [1] &rarr; Bridge</span>
+                            </button>
+                          </div>
                         ) : (
                           <span className="text-slate-400 text-xs">—</span>
                         )}
@@ -2326,6 +2434,192 @@ export const AdminDashboard: React.FC = () => {
                     </div>
                   </div>
                 ))}
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: CONFIGURE MANAGER CAMPAIGN & AI TRANSLATION POLICY */}
+      {showManagerPolicyModal && selectedManagerForPolicy && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-white rounded-2xl shadow-xl max-w-lg w-full p-6 space-y-5 border border-slate-200 my-8">
+            <div className="flex justify-between items-start">
+              <div>
+                <h3 className="text-lg font-bold text-slate-900 flex items-center gap-2">
+                  <Sliders className="w-5 h-5 text-indigo-600" />
+                  <span>Campaign Routing & AI Translation Policy</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Admin settings for Manager: <strong>{selectedManagerForPolicy.name}</strong> (@{selectedManagerForPolicy.username})
+                </p>
+              </div>
+              <button
+                onClick={() => setShowManagerPolicyModal(false)}
+                className="text-slate-400 hover:text-slate-600 text-lg font-bold cursor-pointer"
+              >
+                &times;
+              </button>
+            </div>
+
+            <div className="space-y-4 text-xs">
+              {/* Option 1 & 2 Selector: Allowed Campaign Type */}
+              <div className="space-y-2">
+                <label className="block text-xs font-bold text-slate-800">
+                  Allowed Campaign Routing Mode:
+                </label>
+                <div className="grid grid-cols-1 gap-2">
+                  <label className={`p-3 rounded-xl border flex items-start gap-3 cursor-pointer transition-all ${
+                    policyForm.allowedRoutingMode === 'BOTH' ? 'bg-purple-50/70 border-purple-400 ring-1 ring-purple-400' : 'bg-slate-50 border-slate-200'
+                  }`}>
+                    <input
+                      type="radio"
+                      name="routingMode"
+                      checked={policyForm.allowedRoutingMode === 'BOTH'}
+                      onChange={() => setPolicyForm({ ...policyForm, allowedRoutingMode: 'BOTH' })}
+                      className="mt-0.5 text-purple-600 focus:ring-purple-500"
+                    />
+                    <div>
+                      <div className="font-bold text-slate-900 text-xs">Option A & B Permitted (Manager Choice)</div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        Manager can select either Traditional IVR or Real-Time AI Voice Translation Bot when creating each campaign.
+                      </div>
+                    </div>
+                  </label>
+
+                  <label className={`p-3 rounded-xl border flex items-start gap-3 cursor-pointer transition-all ${
+                    policyForm.allowedRoutingMode === 'IVR_THEN_DIRECT_AGENT' ? 'bg-blue-50/70 border-blue-400 ring-1 ring-blue-400' : 'bg-slate-50 border-slate-200'
+                  }`}>
+                    <input
+                      type="radio"
+                      name="routingMode"
+                      checked={policyForm.allowedRoutingMode === 'IVR_THEN_DIRECT_AGENT'}
+                      onChange={() => setPolicyForm({ ...policyForm, allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT' })}
+                      className="mt-0.5 text-blue-600 focus:ring-blue-500"
+                    />
+                    <div>
+                      <div className="font-bold text-slate-900 text-xs">Option 1 Only: IVR Menu → Direct Human Agent Bridge</div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        PSTN recipient hears recorded IVR greeting, presses DTMF key 1, and bridges directly with live agent in their natural human voice.
+                      </div>
+                    </div>
+                  </label>
+
+                  <label className={`p-3 rounded-xl border flex items-start gap-3 cursor-pointer transition-all ${
+                    policyForm.allowedRoutingMode === 'AI_VOICE_TRANSLATION' ? 'bg-emerald-50/70 border-emerald-400 ring-1 ring-emerald-400' : 'bg-slate-50 border-slate-200'
+                  }`}>
+                    <input
+                      type="radio"
+                      name="routingMode"
+                      checked={policyForm.allowedRoutingMode === 'AI_VOICE_TRANSLATION'}
+                      onChange={() => setPolicyForm({ ...policyForm, allowedRoutingMode: 'AI_VOICE_TRANSLATION' })}
+                      className="mt-0.5 text-emerald-600 focus:ring-emerald-500"
+                    />
+                    <div>
+                      <div className="font-bold text-slate-900 text-xs">Option 2 Only: Real-Time AI Voice Translation Bot Bridge</div>
+                      <div className="text-[11px] text-slate-500 mt-0.5">
+                        Zero-IVR direct bridge. Recipient hears the AI Bot voice. Agent speaks in their language (Urdu), receiver hears translated bot voice (Arabic), and vice versa.
+                      </div>
+                    </div>
+                  </label>
+                </div>
+              </div>
+
+              {/* Languages Configuration */}
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-3">
+                <div className="text-xs font-bold text-slate-800">
+                  Default AI Translation Languages
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                      Agent Spoken Language:
+                    </label>
+                    <select
+                      value={policyForm.enforcedAgentLanguage}
+                      onChange={(e) => setPolicyForm({ ...policyForm, enforcedAgentLanguage: e.target.value })}
+                      className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-indigo-600"
+                    >
+                      <option value="Urdu">Urdu (اردو)</option>
+                      <option value="English">English</option>
+                      <option value="Hindi">Hindi (हिन्दी)</option>
+                      <option value="Spanish">Spanish (Español)</option>
+                      <option value="French">French (Français)</option>
+                      <option value="German">German (Deutsch)</option>
+                      <option value="Persian">Persian (فارسی)</option>
+                      <option value="Turkish">Turkish (Türkçe)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                      Customer Spoken Language:
+                    </label>
+                    <select
+                      value={policyForm.enforcedCustomerLanguage}
+                      onChange={(e) => setPolicyForm({ ...policyForm, enforcedCustomerLanguage: e.target.value })}
+                      className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-semibold text-slate-900 focus:ring-2 focus:ring-indigo-600"
+                    >
+                      <option value="Arabic">Arabic (العربية)</option>
+                      <option value="Urdu">Urdu (اردو)</option>
+                      <option value="English">English</option>
+                      <option value="French">French (Français)</option>
+                      <option value="Spanish">Spanish (Español)</option>
+                      <option value="Turkish">Turkish (Türkçe)</option>
+                      <option value="German">German (Deutsch)</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Lock vs Override Toggle */}
+                <div className="flex items-center justify-between pt-1 border-t border-slate-200">
+                  <div>
+                    <div className="text-[11px] font-bold text-slate-800">Allow Manager to Override Languages</div>
+                    <div className="text-[10px] text-slate-500">If unchecked, Manager campaigns will be locked to the languages above</div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={policyForm.allowManagerOverrideLanguages}
+                    onChange={(e) => setPolicyForm({ ...policyForm, allowManagerOverrideLanguages: e.target.checked })}
+                    className="w-4 h-4 text-indigo-600 rounded cursor-pointer"
+                  />
+                </div>
+              </div>
+
+              {/* Bot Voice Persona */}
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                  AI Bot Voice Persona (Spoken to PSTN User):
+                </label>
+                <select
+                  value={policyForm.aiTranslationBotVoice}
+                  onChange={(e) => setPolicyForm({ ...policyForm, aiTranslationBotVoice: e.target.value })}
+                  className="w-full bg-slate-50 border border-slate-300 rounded-lg p-2 text-xs font-medium text-slate-900 focus:ring-2 focus:ring-indigo-600"
+                >
+                  <option value="Aoede">Aoede (Warm & Natural Female)</option>
+                  <option value="Kore">Kore (Calm & Professional Female)</option>
+                  <option value="Puck">Puck (Friendly & Engaging Male)</option>
+                  <option value="Fenrir">Fenrir (Authoritative Deep Male)</option>
+                </select>
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowManagerPolicyModal(false)}
+                  className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-medium rounded-lg hover:bg-slate-100 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={handleSaveManagerPolicy}
+                  className="px-5 py-2.5 bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold rounded-lg shadow-sm flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Save Policy Settings</span>
+                </button>
               </div>
             </div>
           </div>
