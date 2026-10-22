@@ -67,14 +67,23 @@ async function startServer() {
     next();
   });
 
-  // Global Zadarma zd_echo verification handler:
-  // Catches ?zd_echo=... on any URL (root /, /api, webhook paths) so Zadarma never disables the integration
+  // Global Zadarma Webhook & Echo Fallback:
+  // Catches ?zd_echo=... or Zadarma event payloads on ANY path (root /, /agent, /webhook)
+  // in case the notification URL was configured as root or /agent in Zadarma settings
   app.use((req, res, next) => {
-    const echo = req.query.zd_echo || (req.body && req.body.zd_echo);
+    const payload = { ...req.query, ...req.body };
+    const echo = payload.zd_echo;
     if (echo) {
       console.log(`[ZADARMA GLOBAL ECHO] Answering zd_echo verification challenge: ${echo}`);
       return res.status(200).type('text/plain').send(String(echo));
     }
+
+    // If Zadarma sent a webhook notification to / or /agent instead of /api/zadarma/webhook
+    if (payload.event && !req.path.startsWith('/api/zadarma')) {
+      console.log(`[ZADARMA GLOBAL WEBHOOK REDIRECT] Received ${payload.event} on ${req.path}, forwarding to /api/zadarma/webhook...`);
+      req.url = '/api/zadarma/webhook';
+    }
+
     next();
   });
 

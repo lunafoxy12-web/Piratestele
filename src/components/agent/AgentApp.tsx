@@ -549,6 +549,19 @@ export const AgentApp: React.FC = () => {
     }
   }, [agentState, activeCall]);
 
+  // Auto-connect with chime beep sound whenever station enters RINGING state
+  useEffect(() => {
+    if (agentState === 'RINGING') {
+      playConnectBeep();
+      if (autoAnswer) {
+        const timer = setTimeout(() => {
+          handleCallAction('ANSWER');
+        }, 400);
+        return () => clearTimeout(timer);
+      }
+    }
+  }, [agentState, autoAnswer]);
+
   // Dynamically control WebRTC phone widget:
   // - Hidden in background by default so it stays running and registered without being visible
   // - Automatically becomes visible only when the call is actively bridged
@@ -1126,13 +1139,30 @@ export const AgentApp: React.FC = () => {
   const [selectedDisposition, setSelectedDisposition] = useState<string>('Resolved');
 
   const handleCallAction = async (action: 'ANSWER' | 'MUTE' | 'HOLD' | 'SPEAKER' | 'END') => {
-    if (!token || !activeCall) return;
+    if (!token) return;
+    const currentCall = activeCall || {
+      id: latestAgentEvent?.callId || `call_in_${Date.now()}`,
+      callId: latestAgentEvent?.callId || `call_in_${Date.now()}`,
+      customerNumber: latestAgentEvent?.customerNumber || 'Inbound Caller',
+      callerId: latestAgentEvent?.callerId || '',
+      sipConnectionId: '',
+      startTime: new Date().toISOString(),
+      durationSeconds: 0,
+      status: 'BRIDGED' as const,
+      dtmfSequence: '1',
+    };
+    if (!activeCall && action !== 'ANSWER') return;
 
     if (action === 'ANSWER') {
       setIsAnswering(true);
       setAnswerError(null);
       stopRingtone();
       playConnectBeep();
+      setAgentState('BUSY');
+
+      if (!activeCall) {
+        setActiveCall(currentCall);
+      }
 
       try {
         // 1. Connect Zadarma WebRTC audio leg immediately
@@ -1176,7 +1206,7 @@ export const AgentApp: React.FC = () => {
         }
 
         // 3. Generate explicit audio stream session tracking ID
-        const newSessionId = `sess_${activeCall.id}_${Date.now()}`;
+        const newSessionId = `sess_${currentCall.id}_${Date.now()}`;
         setActiveSessionId(newSessionId);
         setKeepAliveCount(1);
         setLastKeepAliveMs(0);
@@ -1187,7 +1217,7 @@ export const AgentApp: React.FC = () => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({
-            callId: activeCall.id,
+            callId: currentCall.id,
             action: 'ANSWER',
             sessionId: newSessionId,
             sessionMetadata: {
@@ -1212,7 +1242,7 @@ export const AgentApp: React.FC = () => {
 
           // Start continuous Keep-Alive Heartbeat Signal (every 4000ms) to prevent carrier timeout
           if (keepAliveTimerRef.current) clearInterval(keepAliveTimerRef.current);
-          const currentCallId = activeCall.id;
+          const currentCallId = currentCall.id;
           keepAliveTimerRef.current = setInterval(async () => {
             try {
               const pingStart = Date.now();
@@ -1249,7 +1279,7 @@ export const AgentApp: React.FC = () => {
           connectRealPstnAudio();
 
           // Fetch DTMF history for this call
-          fetch(`/api/agent/active-call-dtmf/${activeCall.id}`, {
+          fetch(`/api/agent/active-call-dtmf/${currentCall.id}`, {
             headers: { Authorization: `Bearer ${token}` },
           })
             .then((r) => r.json())
@@ -1290,7 +1320,7 @@ export const AgentApp: React.FC = () => {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({
-            callId: activeCall.id,
+            callId: currentCall.id,
             action: 'END',
             sessionId: activeSessionId || undefined,
             reason: 'Agent ended call.',
@@ -1338,7 +1368,7 @@ export const AgentApp: React.FC = () => {
       fetch('/api/agent/call-action', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-        body: JSON.stringify({ callId: activeCall.id, action: nextHold ? 'HOLD' : 'RESUME' }),
+        body: JSON.stringify({ callId: currentCall.id, action: nextHold ? 'HOLD' : 'RESUME' }),
       }).catch(() => {});
       setStatusMessage(nextHold ? 'Call Placed on Hold' : 'Call Resumed');
       setTimeout(() => setStatusMessage(null), 2500);
@@ -1628,7 +1658,7 @@ export const AgentApp: React.FC = () => {
         </div>
 
         {/* STATE 1: RINGING (INCOMING BRIDGED CALL) */}
-        {activeCall && !activeCall.endTime && (activeCall.status === 'RINGING' || agentState === 'RINGING') && activeCall.status !== 'BRIDGED' && (
+        {(agentState === 'RINGING' || (activeCall && !activeCall.endTime && activeCall.status === 'RINGING')) && activeCall?.status !== 'BRIDGED' && (
           <div className="bg-amber-50 border-2 border-amber-400 rounded-2xl p-6 space-y-4 max-w-md mx-auto shadow-md">
             <div className="w-16 h-16 bg-amber-500 text-white rounded-full flex items-center justify-center mx-auto animate-pulse">
               <PhoneCall className="w-8 h-8" />
@@ -1639,19 +1669,19 @@ export const AgentApp: React.FC = () => {
                 Incoming Bridged Call
               </div>
               <div className="text-2xl font-black text-slate-900 mt-1 font-mono">
-                {activeCall.customerNumber}
+                {activeCall?.customerNumber || latestAgentEvent?.customerNumber || 'Inbound PSTN Caller'}
               </div>
               <div className="text-xs text-slate-600 mt-0.5">
-                Outbound Caller ID: <span className="font-mono">{activeCall.callerId}</span>
+                Outbound Caller ID: <span className="font-mono">{activeCall?.callerId || latestAgentEvent?.callerId || 'Carrier Line'}</span>
               </div>
             </div>
 
             {/* Quick preview of customer DTMF path if available */}
-            {(activeCallDtmf.length > 0 || Boolean(activeCall.dtmfSequence)) && (
+            {((activeCallDtmf && activeCallDtmf.length > 0) || Boolean(activeCall?.dtmfSequence)) && (
               <div className="bg-white/80 p-2.5 rounded-lg border border-amber-200 text-xs text-amber-900 text-left">
                 <span className="font-semibold block mb-0.5">Customer IVR Navigation:</span>
                 <div className="flex items-center gap-1.5 flex-wrap">
-                  {activeCallDtmf.length > 0 ? (
+                  {activeCallDtmf && activeCallDtmf.length > 0 ? (
                     activeCallDtmf.map((d, i) => (
                       <span key={d.id ? `dtmf_badge_${d.id}` : `dtmf_badge_${d.digit}_${d.sequenceNumber ?? i}_${i}`} className="inline-flex items-center gap-1">
                         <span className="font-mono font-bold bg-amber-200 px-1.5 py-0.5 rounded text-[11px]">
@@ -1662,7 +1692,7 @@ export const AgentApp: React.FC = () => {
                     ))
                   ) : (
                     <span className="font-mono font-bold bg-amber-200 px-1.5 py-0.5 rounded text-[11px]">
-                      [{activeCall.dtmfSequence || '1'}]
+                      [{activeCall?.dtmfSequence || '1'}]
                     </span>
                   )}
                   <span className="text-emerald-700 font-semibold text-[11px]">&rarr; Agent Bridge Requested</span>

@@ -1310,33 +1310,48 @@ class TelephonyEngine {
       }
     });
 
-    // Find available human agent: prioritize call's existing agentId if assigned
+    const targetManagerId = managerId || call.managerId || (campaign ? campaign.managerId : undefined);
+
+    // 1. STRICT MANAGER ISOLATION:
+    // Only agents created by / assigned to THIS specific manager can receive this call!
+    // NEVER route calls of one manager to agents of another manager.
     let availableAgents: typeof data.agents = [];
-    if (call.agentId) {
-      const assigned = data.agents.find((a) => a.id === call.agentId && a.enabled);
-      if (assigned) {
-        availableAgents = [assigned];
+
+    if (targetManagerId) {
+      // Find all enabled agents belonging to this specific manager
+      const managerAgents = data.agents.filter(
+        (a) => a.managerId === targetManagerId && a.enabled
+      );
+
+      // Priority 1: If call already had a specific agent assigned from this manager and they are available
+      if (call.agentId) {
+        const assigned = managerAgents.find((a) => a.id === call.agentId);
+        if (assigned && (assigned.state === 'AVAILABLE' || assigned.currentCallId === call.id)) {
+          availableAgents = [assigned];
+        }
       }
-    }
 
-    if (availableAgents.length === 0) {
-      availableAgents = data.agents.filter(
-        (a) => a.managerId === managerId && a.enabled && a.state === 'AVAILABLE' && !a.currentCallId
-      );
-    }
+      // Priority 2: Any currently free or AVAILABLE agent created by this manager
+      if (availableAgents.length === 0) {
+        availableAgents = managerAgents.filter(
+          (a) => a.state === 'AVAILABLE' && !a.currentCallId
+        );
+      }
 
-    // If no agents assigned to this specific manager are available, fall back to any available active agent
-    if (availableAgents.length === 0) {
-      availableAgents = data.agents.filter(
-        (a) => a.enabled && a.state === 'AVAILABLE' && !a.currentCallId
-      );
-    }
-
-    if (availableAgents.length === 0 && data.agents.length > 0) {
-      // If agents exist for this manager, allow the manager's primary agent
-      const mgrAgent = data.agents.find((a) => a.managerId === managerId && a.enabled);
-      if (mgrAgent && mgrAgent.currentCallId !== callId) {
-        availableAgents = [mgrAgent];
+      // If all agents of this manager are busy or offline, do NOT route to other managers' agents.
+      // The call will cleanly queue in this manager's hold queue until one of their agents is free.
+    } else {
+      // Generic fallback only if no managerId is associated with this call at all
+      if (call.agentId) {
+        const assigned = data.agents.find((a) => a.id === call.agentId && a.enabled);
+        if (assigned && (assigned.state === 'AVAILABLE' || assigned.currentCallId === call.id)) {
+          availableAgents = [assigned];
+        }
+      }
+      if (availableAgents.length === 0) {
+        availableAgents = data.agents.filter(
+          (a) => a.enabled && a.state === 'AVAILABLE' && !a.currentCallId
+        );
       }
     }
 

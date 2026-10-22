@@ -25,8 +25,8 @@
     {
       "id": "usr_admin_1",
       "username": "Mr-Pirate",
-      "passwordHash": "e2fa4a0e550ba5241dfa57fab635304c144fe9bea336499e679c49e8189f072ee1df2bbdc9211d58315e99b80696110cf7f68adb4ca3af3be7898b44175a0011",
-      "salt": "647456d7b8d2744da4baf55dd9c34fb6",
+      "passwordHash": "b0cfe1a26ac7dd50e9f9c3c0c07fdbb724c035611a2bc5ec4a61d438852c5df4e70149360bbcd1c49acefce86dee38a39b995a458ccbde8023039701e0b61587",
+      "salt": "0016661c1527a8ce405697ebf6ac7f1c",
       "role": "admin",
       "name": "Mr. Pirate (System Admin)",
       "email": "admin@piratesworld.tele",
@@ -447,7 +447,7 @@
       "priority": 1,
       "enabled": true,
       "healthStatus": "HEALTHY",
-      "lastHealthCheck": "2026-10-21T15:23:03.607Z",
+      "lastHealthCheck": "2026-10-21T17:20:23.282Z",
       "errorCount": 0,
       "latencyMs": 24,
       "createdAt": "2026-09-28T06:35:15.717Z"
@@ -471,7 +471,7 @@
       "priority": 2,
       "enabled": true,
       "healthStatus": "HEALTHY",
-      "lastHealthCheck": "2026-10-21T15:23:03.621Z",
+      "lastHealthCheck": "2026-10-21T17:20:23.293Z",
       "errorCount": 0,
       "latencyMs": 24,
       "createdAt": "2026-09-28T06:35:15.717Z"
@@ -496,11 +496,11 @@
       "priority": 1,
       "enabled": true,
       "healthStatus": "FAILED",
-      "lastHealthCheck": "2026-10-21T15:23:06.129Z",
-      "errorCount": 112,
-      "latencyMs": 2501,
+      "lastHealthCheck": "2026-10-21T17:20:25.807Z",
+      "errorCount": 114,
+      "latencyMs": 2507,
       "createdAt": "2026-09-30T13:02:46.251Z",
-      "lastFailure": "2026-10-21T15:23:06.129Z",
+      "lastFailure": "2026-10-21T17:20:25.807Z",
       "ipAuthWhitelist": "135.148.129.131"
     },
     {
@@ -525,9 +525,9 @@
       "priority": 1,
       "enabled": true,
       "healthStatus": "HEALTHY",
-      "lastHealthCheck": "2026-10-21T15:23:06.140Z",
+      "lastHealthCheck": "2026-10-21T17:20:25.834Z",
       "errorCount": 0,
-      "latencyMs": 4,
+      "latencyMs": 17,
       "createdAt": "2026-10-06T02:13:04.977Z"
     },
     {
@@ -552,7 +552,7 @@
       "priority": 1,
       "enabled": true,
       "healthStatus": "HEALTHY",
-      "lastHealthCheck": "2026-10-21T15:23:06.149Z",
+      "lastHealthCheck": "2026-10-21T17:20:25.843Z",
       "errorCount": 0,
       "latencyMs": 4,
       "createdAt": "2026-10-06T06:48:20.015Z"
@@ -579,9 +579,9 @@
       "priority": 1,
       "enabled": true,
       "healthStatus": "HEALTHY",
-      "lastHealthCheck": "2026-10-21T15:23:06.159Z",
+      "lastHealthCheck": "2026-10-21T17:20:25.854Z",
       "errorCount": 0,
-      "latencyMs": 3,
+      "latencyMs": 4,
       "createdAt": "2026-10-11T12:17:00.681Z"
     }
   ],
@@ -7713,6 +7713,102 @@
   ],
   "health_checks": [
     {
+      "id": "chk_1792603225854_19yvcq",
+      "sipConnectionId": "sip_1791721020681_llkypyb",
+      "timestamp": "2026-10-21T17:20:25.854Z",
+      "status": "HEALTHY",
+      "latencyMs": 4,
+      "details": "Connected successfully to pbx.zadarma.com:4443"
+    },
+    {
+      "id": "chk_1792603225843_5tl3in",
+      "sipConnectionId": "sip_1791269300015_m905bg",
+      "timestamp": "2026-10-21T17:20:25.843Z",
+      "status": "HEALTHY",
+      "latencyMs": 4,
+      "details": "Connected successfully to sip.zadarma.com:5060"
+    },
+    {
+      "id": "chk_1792603225834_49biwr",
+      "sipConnectionId": "sip_1791252784977_wuwrbk",
+      "timestamp": "2026-10-21T17:20:25.834Z",
+      "status": "HEALTHY",
+      "latencyMs": 17,
+      "details": "Connected successfully to sip.zadarma.com:5060"
+    },
+    {
+      "id": "chk_1792603225807_fqnhvs",
+      "sipConnectionId": "sip_1790773366251_yktft",
+      "timestamp": "2026-10-21T17:20:25.807Z",
+      "status": "FAILED",
+      "latencyMs": 2507,
+      "details": "Connection timed out after 2500ms to 135.148.129.131:5060"
+    },
+    {
+      "id": "chk_1792603223293_5uhhtp",
+      "sipConnectionId": "sip_conn_02",
+      "timestamp": "2026-10-21T17:20:23.293Z",
+      "status": "HEALTHY",
+      "latencyMs": 24,
+      "details": "Carrier IP route authorized & active"
+    },
+    {
+      "id": "chk_1792603223282_shfb8l",
+      "sipConnectionId": "sip_conn_01",
+      "timestamp": "2026-10-21T17:20:23.282Z",
+      "status": "HEALTHY",
+      "latencyMs": 24,
+      "details": "Carrier IP route authorized & active"
+    },
+    {
+      "id": "chk_1792603197837_vssk3",
+      "sipConnectionId": "sip_1791721020681_llkypyb",
+      "timestamp": "2026-10-21T17:19:57.837Z",
+      "status": "HEALTHY",
+      "latencyMs": 3,
+      "details": "Connected successfully to pbx.zadarma.com:4443"
+    },
+    {
+      "id": "chk_1792603197823_ihb84",
+      "sipConnectionId": "sip_1791269300015_m905bg",
+      "timestamp": "2026-10-21T17:19:57.823Z",
+      "status": "HEALTHY",
+      "latencyMs": 4,
+      "details": "Connected successfully to sip.zadarma.com:5060"
+    },
+    {
+      "id": "chk_1792603197813_y2xnv",
+      "sipConnectionId": "sip_1791252784977_wuwrbk",
+      "timestamp": "2026-10-21T17:19:57.813Z",
+      "status": "HEALTHY",
+      "latencyMs": 5,
+      "details": "Connected successfully to sip.zadarma.com:5060"
+    },
+    {
+      "id": "chk_1792603197801_ixinwe",
+      "sipConnectionId": "sip_1790773366251_yktft",
+      "timestamp": "2026-10-21T17:19:57.801Z",
+      "status": "FAILED",
+      "latencyMs": 2501,
+      "details": "Connection timed out after 2500ms to 135.148.129.131:5060"
+    },
+    {
+      "id": "chk_1792603195295_y92m9j",
+      "sipConnectionId": "sip_conn_02",
+      "timestamp": "2026-10-21T17:19:55.295Z",
+      "status": "HEALTHY",
+      "latencyMs": 24,
+      "details": "Carrier IP route authorized & active"
+    },
+    {
+      "id": "chk_1792603195283_u5a4c",
+      "sipConnectionId": "sip_conn_01",
+      "timestamp": "2026-10-21T17:19:55.283Z",
+      "status": "HEALTHY",
+      "latencyMs": 24,
+      "details": "Carrier IP route authorized & active"
+    },
+    {
       "id": "chk_1792596186159_8q2yrh",
       "sipConnectionId": "sip_1791721020681_llkypyb",
       "timestamp": "2026-10-21T15:23:06.159Z",
@@ -11612,102 +11708,6 @@
       "id": "chk_1792306930366_2n1mc",
       "sipConnectionId": "sip_conn_01",
       "timestamp": "2026-10-18T07:02:10.366Z",
-      "status": "HEALTHY",
-      "latencyMs": 24,
-      "details": "Carrier IP route authorized & active"
-    },
-    {
-      "id": "chk_1792306902917_08js6w",
-      "sipConnectionId": "sip_1791721020681_llkypyb",
-      "timestamp": "2026-10-18T07:01:42.917Z",
-      "status": "HEALTHY",
-      "latencyMs": 2,
-      "details": "Connected successfully to pbx.zadarma.com:4443"
-    },
-    {
-      "id": "chk_1792306902908_4tl6q",
-      "sipConnectionId": "sip_1791269300015_m905bg",
-      "timestamp": "2026-10-18T07:01:42.908Z",
-      "status": "HEALTHY",
-      "latencyMs": 3,
-      "details": "Connected successfully to sip.zadarma.com:5060"
-    },
-    {
-      "id": "chk_1792306902898_16zx6",
-      "sipConnectionId": "sip_1791252784977_wuwrbk",
-      "timestamp": "2026-10-18T07:01:42.898Z",
-      "status": "HEALTHY",
-      "latencyMs": 3,
-      "details": "Connected successfully to sip.zadarma.com:5060"
-    },
-    {
-      "id": "chk_1792306902887_dut97n",
-      "sipConnectionId": "sip_1790773366251_yktft",
-      "timestamp": "2026-10-18T07:01:42.887Z",
-      "status": "FAILED",
-      "latencyMs": 2501,
-      "details": "Connection timed out after 2500ms to 135.148.129.131:5060"
-    },
-    {
-      "id": "chk_1792306900376_zl07um",
-      "sipConnectionId": "sip_conn_02",
-      "timestamp": "2026-10-18T07:01:40.376Z",
-      "status": "HEALTHY",
-      "latencyMs": 24,
-      "details": "Carrier IP route authorized & active"
-    },
-    {
-      "id": "chk_1792306900356_xa5o2p",
-      "sipConnectionId": "sip_conn_01",
-      "timestamp": "2026-10-18T07:01:40.356Z",
-      "status": "HEALTHY",
-      "latencyMs": 24,
-      "details": "Carrier IP route authorized & active"
-    },
-    {
-      "id": "chk_1792306872922_uvlpban",
-      "sipConnectionId": "sip_1791721020681_llkypyb",
-      "timestamp": "2026-10-18T07:01:12.922Z",
-      "status": "HEALTHY",
-      "latencyMs": 3,
-      "details": "Connected successfully to pbx.zadarma.com:4443"
-    },
-    {
-      "id": "chk_1792306872912_4vbya",
-      "sipConnectionId": "sip_1791269300015_m905bg",
-      "timestamp": "2026-10-18T07:01:12.912Z",
-      "status": "HEALTHY",
-      "latencyMs": 4,
-      "details": "Connected successfully to sip.zadarma.com:5060"
-    },
-    {
-      "id": "chk_1792306872901_kpmsde",
-      "sipConnectionId": "sip_1791252784977_wuwrbk",
-      "timestamp": "2026-10-18T07:01:12.901Z",
-      "status": "HEALTHY",
-      "latencyMs": 4,
-      "details": "Connected successfully to sip.zadarma.com:5060"
-    },
-    {
-      "id": "chk_1792306872890_plb3u8",
-      "sipConnectionId": "sip_1790773366251_yktft",
-      "timestamp": "2026-10-18T07:01:12.890Z",
-      "status": "FAILED",
-      "latencyMs": 2500,
-      "details": "Connection timed out after 2500ms to 135.148.129.131:5060"
-    },
-    {
-      "id": "chk_1792306870380_uvdu38",
-      "sipConnectionId": "sip_conn_02",
-      "timestamp": "2026-10-18T07:01:10.380Z",
-      "status": "HEALTHY",
-      "latencyMs": 24,
-      "details": "Carrier IP route authorized & active"
-    },
-    {
-      "id": "chk_1792306870356_qu2qcp",
-      "sipConnectionId": "sip_conn_01",
-      "timestamp": "2026-10-18T07:01:10.356Z",
       "status": "HEALTHY",
       "latencyMs": 24,
       "details": "Carrier IP route authorized & active"
