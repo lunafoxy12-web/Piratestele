@@ -372,13 +372,17 @@ export class ZadarmaConnector {
       if (cleanTo.startsWith('00')) {
         cleanTo = cleanTo.slice(2);
       }
-      // Normalize UK domestic mobile (07xxx -> 447xxx)
-      if (cleanTo.startsWith('07') && cleanTo.length === 11) {
+      // Normalize UK domestic (07xxx, 01xxx, 02xxx -> 44...)
+      if (cleanTo.startsWith('0') && cleanTo.length === 11 && (cleanTo.startsWith('07') || cleanTo.startsWith('01') || cleanTo.startsWith('02'))) {
         cleanTo = `44${cleanTo.slice(1)}`;
       }
       // Normalize UK with extra leading 0 after 44 (4407xxx -> 447xxx)
       if (cleanTo.startsWith('4407') && cleanTo.length === 13) {
         cleanTo = `447${cleanTo.slice(4)}`;
+      }
+      // Normalize Pakistan domestic mobile (03xx -> 923xx)
+      if (cleanTo.startsWith('03') && cleanTo.length === 11) {
+        cleanTo = `92${cleanTo.slice(1)}`;
       }
       // Normalize North American 10-digit number (2099722359 -> 12099722359)
       if (cleanTo.length === 10 && !cleanTo.startsWith('0')) {
@@ -396,8 +400,8 @@ export class ZadarmaConnector {
         cleanFrom = cleanFrom.slice(2);
       }
 
-      // Fallback to purchased Zadarma number
-      if (!cleanFrom || cleanFrom === cleanTo || cleanFrom.length < 5) {
+      // If caller ID is a placeholder/mock number (like 8005550199) or invalid, override with confirmed Zadarma DID
+      if (!cleanFrom || cleanFrom.includes('800555') || cleanFrom === cleanTo || cleanFrom.length < 7) {
         cleanFrom = '18045930160';
       }
 

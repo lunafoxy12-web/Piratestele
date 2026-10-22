@@ -872,6 +872,9 @@ class TelephonyEngine {
       const apiKey = targetProv.apiKeyEncrypted.replace(/^KEY_/, '').trim();
       const apiSecret = (targetProv.apiSecretEncrypted || '').replace(/^SEC_/, '').trim();
       let resolvedCallerId = campaign.callerIdNumber || targetProv.defaultCallerId || '+18045930160';
+      if (!resolvedCallerId || resolvedCallerId.includes('800555') || resolvedCallerId.length < 7) {
+        resolvedCallerId = '+18045930160';
+      }
       if (!resolvedCallerId.startsWith('+')) {
         resolvedCallerId = `+${resolvedCallerId}`;
       }
