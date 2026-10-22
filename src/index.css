@@ -14,30 +14,21 @@
   z-index: -999 !important;
 }
 
-/* WebRTC Phone Widget: Kept alive in background without display:none; hidden by default */
+/* WebRTC Phone Widget: Kept alive headlessly in background without display:none so audio operates invisibly */
 #zdrmWPhI,
 .zdrm-phone,
 .zdrm-webphone-widget,
-.zdrm-webphone-icon {
+.zdrm-webphone-icon,
+iframe[src*="zadarma"] {
   display: block !important;
   position: fixed !important;
-  bottom: 24px !important;
-  right: 24px !important;
+  bottom: -9999px !important;
+  right: -9999px !important;
+  width: 1px !important;
+  height: 1px !important;
   visibility: hidden !important;
   opacity: 0 !important;
   pointer-events: none !important;
-  z-index: 99999 !important;
-  transform: scale(0.85);
-  transition: opacity 0.3s ease, transform 0.3s ease;
+  z-index: -9999 !important;
 }
 
-/* Automatically show the WebRTC Phone Widget ONLY when a call is actively bridged */
-body.call-bridged-active #zdrmWPhI,
-body.call-bridged-active .zdrm-phone,
-body.call-bridged-active .zdrm-webphone-widget,
-body.call-bridged-active .zdrm-webphone-icon {
-  visibility: visible !important;
-  opacity: 1 !important;
-  pointer-events: auto !important;
-  transform: scale(1) !important;
-}

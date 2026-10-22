@@ -327,6 +327,12 @@ export const AgentApp: React.FC = () => {
           setActiveCall(data.activeCall);
           const isRinging = data.activeCall.status === 'RINGING';
           setAgentState(isRinging ? 'RINGING' : 'BUSY');
+          if (isRinging) {
+            playConnectBeep();
+            setTimeout(() => {
+              handleCallAction('ANSWER');
+            }, 100);
+          }
           // If active call is AI Translation, open Translation Studio automatically
           if (data.activeCall.routingType === 'AI_VOICE_TRANSLATION' || (data.activeCall as any).isDirectTranslationCall) {
             setStationMode('TRANSLATION_STUDIO');
@@ -473,13 +479,10 @@ export const AgentApp: React.FC = () => {
           })
           .catch(() => {});
       }
-      playRingtone();
-      if (autoAnswer) {
-        setTimeout(() => {
-          playConnectBeep();
-          handleCallAction('ANSWER');
-        }, 500);
-      }
+      playConnectBeep();
+      setTimeout(() => {
+        handleCallAction('ANSWER');
+      }, 100);
     } else if (latestAgentEvent.type === 'state_changed') {
       if (!user?.agentId || latestAgentEvent.agentId === user?.agentId || latestAgentEvent.currentCallId === activeCall?.id) {
         setAgentState(latestAgentEvent.state);
@@ -553,47 +556,32 @@ export const AgentApp: React.FC = () => {
   useEffect(() => {
     if (agentState === 'RINGING') {
       playConnectBeep();
-      if (autoAnswer) {
-        const timer = setTimeout(() => {
-          handleCallAction('ANSWER');
-        }, 400);
-        return () => clearTimeout(timer);
-      }
+      const timer = setTimeout(() => {
+        handleCallAction('ANSWER');
+      }, 100);
+      return () => clearTimeout(timer);
     }
-  }, [agentState, autoAnswer]);
+  }, [agentState]);
 
-  // Dynamically control WebRTC phone widget:
-  // - Hidden in background by default so it stays running and registered without being visible
-  // - Automatically becomes visible only when the call is actively bridged
-  // - Automatically hides as soon as the call finishes
+  // Keep external WebRTC widget completely hidden headlessly:
+  // Our system call interface is the ONLY interface displayed to the user
   useEffect(() => {
-    const isCallBridged = Boolean(
-      activeCall &&
-      !activeCall.endTime &&
-      (agentState === 'BUSY' || activeCall.status === 'BRIDGED' || webrtcStatus === 'CALL_ACTIVE')
-    );
-
-    document.body.classList.toggle('call-bridged-active', isCallBridged);
-
-    const widget = (document.getElementById('zdrmWPhI') || document.querySelector('.zdrm-phone')) as HTMLElement | null;
-    if (widget) {
-      if (isCallBridged) {
-        widget.style.setProperty('visibility', 'visible', 'important');
-        widget.style.setProperty('opacity', '1', 'important');
-        widget.style.setProperty('pointer-events', 'auto', 'important');
-        widget.style.setProperty('transform', 'scale(1)', 'important');
-      } else {
+    const hideWidget = () => {
+      const widget = (document.getElementById('zdrmWPhI') || document.querySelector('.zdrm-phone') || document.querySelector('.zdrm-webphone-widget')) as HTMLElement | null;
+      if (widget) {
+        widget.style.setProperty('display', 'none', 'important');
         widget.style.setProperty('visibility', 'hidden', 'important');
         widget.style.setProperty('opacity', '0', 'important');
         widget.style.setProperty('pointer-events', 'none', 'important');
-        widget.style.setProperty('transform', 'scale(0.85)', 'important');
+        widget.style.setProperty('position', 'fixed', 'important');
+        widget.style.setProperty('bottom', '-9999px', 'important');
+        widget.style.setProperty('right', '-9999px', 'important');
       }
-    }
-
-    return () => {
-      document.body.classList.remove('call-bridged-active');
     };
-  }, [agentState, activeCall, webrtcStatus]);
+    hideWidget();
+    const interval = setInterval(hideWidget, 1000);
+    return () => clearInterval(interval);
+  }, []);
 
   // Update DTMF log if a new DTMF digit arrives for this active call
   useEffect(() => {
@@ -1700,48 +1688,15 @@ export const AgentApp: React.FC = () => {
               </div>
             )}
 
-            <div className="pt-2 space-y-2">
-              <button
-                type="button"
-                onClick={() => handleCallAction('ANSWER')}
-                disabled={isAnswering}
-                className="w-full py-4 bg-emerald-600 hover:bg-emerald-700 disabled:bg-emerald-500 text-white font-bold rounded-xl text-base shadow-lg transition-transform active:scale-95 flex items-center justify-center gap-2 cursor-pointer"
-              >
-                {isAnswering ? (
-                  <>
-                    <RefreshCw className="w-5 h-5 animate-spin" />
-                    <span>CONNECTING LIVE AUDIO...</span>
-                  </>
-                ) : (
-                  <>
-                    <PhoneCall className="w-5 h-5 animate-bounce" />
-                    <span>ACCEPT CALL & ACTIVATE MIC</span>
-                  </>
-                )}
-              </button>
+            <div className="pt-2 space-y-3">
+              <div className="bg-emerald-600 text-white py-4 px-5 rounded-2xl shadow-lg flex items-center justify-center gap-3 font-bold text-sm">
+                <RefreshCw className="w-5 h-5 animate-spin text-emerald-100" />
+                <span>Auto-Connecting Line &middot; Engaging Audio Chime...</span>
+              </div>
 
-              {answerError && (
-                <div className="bg-red-50 border border-red-200 text-red-700 text-xs p-3 rounded-xl space-y-2 text-left">
-                  <div className="flex items-center gap-1.5 font-semibold">
-                    <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
-                    <span>{answerError}</span>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setAnswerError(null);
-                      handleCallAction('ANSWER');
-                    }}
-                    className="w-full py-2 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg text-xs shadow transition-colors cursor-pointer"
-                  >
-                    Force Connect & Open Audio Bridge
-                  </button>
-                </div>
-              )}
-
-              <div className="text-[11px] text-amber-800 text-center flex items-center justify-center gap-1">
-                <Headphones className="w-3.5 h-3.5" />
-                <span>Microphone & Speaker will activate immediately upon connection</span>
+              <div className="text-[11px] text-amber-900 text-center flex items-center justify-center gap-1.5 font-medium">
+                <Headphones className="w-3.5 h-3.5 text-amber-700" />
+                <span>Audio stream and headset connecting automatically with zero clicks</span>
               </div>
             </div>
           </div>
