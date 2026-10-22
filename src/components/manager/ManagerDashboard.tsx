@@ -270,30 +270,39 @@ export const ManagerDashboard: React.FC = () => {
 
     // Check target phone input first
     if (campaignForm.targetPhone.trim()) {
-      const cleanTarget = campaignForm.targetPhone.trim().replace(/[^\d+]/g, '');
+      let cleanTarget = campaignForm.targetPhone.trim().replace(/[^\d+]/g, '');
       if (cleanTarget.length >= 7) {
+        if (!cleanTarget.startsWith('+')) {
+          if (cleanTarget.length === 10 && !cleanTarget.startsWith('0') && !cleanTarget.startsWith('1')) {
+            cleanTarget = `1${cleanTarget}`;
+          }
+          cleanTarget = `+${cleanTarget}`;
+        }
         targetList.push({
-          phoneNumber: cleanTarget.startsWith('+') ? cleanTarget : `+${cleanTarget}`,
+          phoneNumber: cleanTarget,
           name: 'Target Customer',
         });
       }
     }
 
-    // Check textarea input for additional numbers
+    // Check textarea / CSV input for all uploaded numbers
     if (campaignForm.csvText.trim()) {
       const rawLines = campaignForm.csvText.trim().split(/[\r\n]+/);
       for (const line of rawLines) {
         if (!line.trim() || line.toLowerCase().includes('phonenumber')) continue;
         const parts = line.split(',');
-        const phone = (parts[0] || '').trim().replace(/[^\d+]/g, '');
+        let phone = (parts[0] || '').trim().replace(/[^\d+]/g, '');
         if (phone.length >= 7) {
-          const norm = phone.startsWith('+') ? phone : `+${phone}`;
-          if (!targetList.some((t) => t.phoneNumber === norm)) {
-            targetList.push({
-              phoneNumber: norm,
-              name: parts[1]?.trim() || undefined,
-            });
+          if (!phone.startsWith('+')) {
+            if (phone.length === 10 && !phone.startsWith('0') && !phone.startsWith('1')) {
+              phone = `1${phone}`;
+            }
+            phone = `+${phone}`;
           }
+          targetList.push({
+            phoneNumber: phone,
+            name: parts[1]?.trim() || undefined,
+          });
         }
       }
     }

@@ -2917,49 +2917,35 @@ router.post('/manager/campaigns', authenticate, requireRole(['manager', 'admin']
 
   const campaignContacts: CampaignContact[] = [];
   let validCount = 0;
-  let dupCount = 0;
-  let invCount = 0;
-  const seen = new Set<string>();
-
   for (const c of contacts) {
-    const check = normalizePhoneNumber(c.phoneNumber || c);
-    if (!check.valid) {
-      invCount += 1;
-      campaignContacts.push({
-        id: `cnt_${Date.now()}_${Math.random().toString(36).substring(7)}`,
-        campaignId,
-        phoneNumber: c.phoneNumber || c,
-        status: 'FAILED',
-        attempts: 0,
-        validationStatus: 'INVALID_FORMAT',
-        validationReason: check.reason,
-      });
-      continue;
+    const rawNumber = typeof c === 'string' ? c : (c.phoneNumber || '');
+    let clean = rawNumber.trim().replace(/[\s\-\(\)\.]/g, '');
+    if (!clean) continue;
+
+    // Normalize international representation
+    if (clean.startsWith('00')) clean = clean.slice(2);
+    // If domestic 10 digits without country code (e.g. 2099722359), default to North America +1
+    if (clean.length === 10 && !clean.startsWith('0') && !clean.startsWith('+') && !clean.startsWith('1')) {
+      clean = `1${clean}`;
+    }
+    // If domestic UK 11 digits (07xxx), convert to 447xxx
+    if (clean.startsWith('07') && clean.length === 11) {
+      clean = `447${clean.slice(2)}`;
+    }
+    // If domestic Pakistan 11 digits (03xx), convert to 923xx
+    if (clean.startsWith('03') && clean.length === 11) {
+      clean = `92${clean.slice(1)}`;
     }
 
-    if (seen.has(check.normalized)) {
-      dupCount += 1;
-      campaignContacts.push({
-        id: `cnt_${Date.now()}_${Math.random().toString(36).substring(7)}`,
-        campaignId,
-        phoneNumber: check.normalized,
-        status: 'FAILED',
-        attempts: 0,
-        validationStatus: 'DUPLICATE',
-        validationReason: 'Duplicate number in batch',
-      });
-      continue;
-    }
+    const finalPhone = clean.startsWith('+') ? clean : `+${clean}`;
 
-    seen.add(check.normalized);
     validCount += 1;
-
     campaignContacts.push({
       id: `cnt_${Date.now()}_${Math.random().toString(36).substring(7)}`,
       campaignId,
-      phoneNumber: check.normalized,
-      customerName: c.name,
-      status: 'QUEUED',
+      phoneNumber: finalPhone,
+      customerName: (typeof c === 'object' && c.name) ? c.name : undefined,
+      status: 'QUEUED', // All uploaded numbers are immediately queued for direct dialing!
       attempts: 0,
       validationStatus: 'VALID',
     });
@@ -2975,8 +2961,8 @@ router.post('/manager/campaigns', authenticate, requireRole(['manager', 'admin']
     status: 'READY',
     totalContacts: contacts.length,
     validContacts: validCount,
-    duplicateContacts: dupCount,
-    invalidContacts: invCount,
+    duplicateContacts: 0,
+    invalidContacts: 0,
     answeredCount: 0,
     ivrCompletedCount: 0,
     agentConnectedCount: 0,

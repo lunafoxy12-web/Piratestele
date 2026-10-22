@@ -439,84 +439,38 @@ export class ZadarmaConnector {
       // - Direct Mode: connects recipient directly to Agent Softphone ('from' = targetExt).
       if (!res || res.status === 'error') {
         const targetExt = (params.pbxExtension || params.sip || '100').trim();
-        const isIvrMode = params.playIvr !== false;
+        console.log(`[ZADARMA DISPATCH] Calling PSTN recipient ${targetInternationalTo} first -> Connecting to Extension ${targetExt}...`);
 
-        if (isIvrMode) {
-          // '0' connects caller to Voice Menu 0 so customer hears the IVR greeting first!
-          // When customer presses key 1, Zadarma PBX triggers Scenario 1 and bridges to Ext 100.
-          const targetVoiceMenu = params.scenarioId && params.scenarioId !== '0-1' ? params.scenarioId : '0';
-          console.log(`[ZADARMA DISPATCH] Outbound IVR Campaign: Calling PSTN Recipient ${targetInternationalTo} first -> IVR Voice Menu ${targetVoiceMenu} on answer -> DTMF key 1 bridges to Agent (Ext ${targetExt})...`);
+        const callbackParams: Record<string, any> = {
+          from: targetExt,
+          to: targetInternationalTo,
+          sip: targetExt,
+          predicted: 'true',
+        };
+        if (cleanFrom) {
+          callbackParams.caller_id = cleanFrom;
+        }
 
-          const ivrCallbackParams: Record<string, any> = {
-            from: targetVoiceMenu,
+        res = await this.requestApi(
+          '/v1/request/callback/',
+          callbackParams,
+          { apiKey: params.apiKey, apiSecret: params.apiSecret },
+          'GET'
+        );
+
+        // Fallback to primary SIP login 12707 if extension returned an error
+        if (!res || res.status === 'error') {
+          console.warn(`[ZADARMA DISPATCH] from=${targetExt} returned error (${res?.message}), trying primary SIP 12707...`);
+          const fallbackParams: Record<string, any> = {
+            from: '12707',
             to: targetInternationalTo,
-            sip: targetExt,
-            menu_id: 0,
+            sip: '12707',
             predicted: 'true',
           };
-          if (cleanFrom) {
-            ivrCallbackParams.caller_id = cleanFrom;
-          }
-
+          if (cleanFrom) fallbackParams.caller_id = cleanFrom;
           res = await this.requestApi(
             '/v1/request/callback/',
-            ivrCallbackParams,
-            { apiKey: params.apiKey, apiSecret: params.apiSecret },
-            'GET'
-          );
-
-          // If '0' returned notice, fallback to '0-1'
-          if (!res || res.status === 'error') {
-            console.warn(`[ZADARMA DISPATCH] Menu ${targetVoiceMenu} returned notice (${res?.message}), trying fallback from='0-1'...`);
-            const retryParams: Record<string, any> = {
-              from: '0-1',
-              to: targetInternationalTo,
-              sip: targetExt,
-              menu_id: 0,
-              predicted: 'true',
-            };
-            if (cleanFrom) retryParams.caller_id = cleanFrom;
-            res = await this.requestApi(
-              '/v1/request/callback/',
-              retryParams,
-              { apiKey: params.apiKey, apiSecret: params.apiSecret },
-              'GET'
-            );
-          }
-
-          // Additional fallback if needed: from=targetExt, menu_id=0
-          if (!res || res.status === 'error') {
-            console.warn(`[ZADARMA DISPATCH] Fallback 1 returned notice, trying from=${targetExt} with menu_id=0...`);
-            const retryParams2: Record<string, any> = {
-              from: targetExt,
-              to: targetInternationalTo,
-              sip: targetExt,
-              menu_id: 0,
-              predicted: 'true',
-            };
-            if (cleanFrom) retryParams2.caller_id = cleanFrom;
-            res = await this.requestApi(
-              '/v1/request/callback/',
-              retryParams2,
-              { apiKey: params.apiKey, apiSecret: params.apiSecret },
-              'GET'
-            );
-          }
-        } else {
-          console.log(`[ZADARMA DISPATCH] Outbound Direct Translation Call: Calling PSTN Recipient ${targetInternationalTo} first -> Agent Softphone Ext ${targetExt}...`);
-          const directCallbackParams: Record<string, any> = {
-            from: targetExt,
-            to: targetInternationalTo,
-            sip: targetExt,
-            predicted: 'true',
-          };
-          if (cleanFrom) {
-            directCallbackParams.caller_id = cleanFrom;
-          }
-
-          res = await this.requestApi(
-            '/v1/request/callback/',
-            directCallbackParams,
+            fallbackParams,
             { apiKey: params.apiKey, apiSecret: params.apiSecret },
             'GET'
           );
