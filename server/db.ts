@@ -210,9 +210,45 @@ export interface Campaign {
   autoDetectCustomerLanguage?: boolean;
   aiBotGreeting?: string;
   aiVoicePersona?: string;
+  voicemailDropEnabled?: boolean;
+  voicemailTemplateId?: string;
+  voicemailDropCount?: number;
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
+}
+
+export interface VoicemailTemplate {
+  id: string;
+  managerId?: string | null; // null represents System Default (Admin created)
+  name: string;
+  description?: string;
+  type: 'TTS_GENERATED' | 'AUDIO_FILE' | 'AI_RECORDED';
+  ttsText?: string;
+  audioUrl?: string;
+  voiceGender?: 'FEMALE' | 'MALE';
+  voiceLanguage?: string;
+  durationSeconds: number;
+  isDefault: boolean;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface VoicemailDropLog {
+  id: string;
+  callId: string;
+  campaignId?: string;
+  managerId?: string;
+  customerNumber: string;
+  callerId: string;
+  voicemailId: string;
+  voicemailName: string;
+  status: 'PENDING' | 'DROPPING' | 'DELIVERED' | 'FAILED';
+  triggerReason: 'NO_ANSWER' | 'BUSY' | 'ANSWERING_MACHINE_DETECTED' | 'CARRIER_TIMEOUT';
+  audioDurationSeconds: number;
+  timestamp: string;
+  carrierReceipt?: string;
 }
 
 export interface DtmfEvent {
@@ -263,6 +299,8 @@ export interface Call {
   recordingUrl?: string;
   notes?: string;
   disposition?: string;
+  voicemailDropped?: boolean;
+  voicemailDropId?: string;
 }
 
 export interface AgentStateLog {
@@ -373,6 +411,8 @@ export interface DatabaseSchema {
   notifications: NotificationRecord[];
   audit_logs: AuditLog[];
   voip_api_providers: VoipApiProvider[];
+  voicemail_templates: VoicemailTemplate[];
+  voicemail_drops: VoicemailDropLog[];
   firewall_rules: FirewallWhitelistRule[];
   firewall_settings: FirewallSettings;
 }
@@ -754,6 +794,37 @@ class DatabaseService {
           createdAt: new Date().toISOString(),
         },
       ],
+      voicemail_templates: [
+        {
+          id: 'vmt_default_1',
+          managerId: null,
+          name: 'Standard Customer Callback Notice',
+          description: 'Professional voicemail dropped when customer does not answer',
+          type: 'TTS_GENERATED',
+          ttsText: 'Hello, this is Pirates World Tele Solution. We called regarding your service account. Please return our call or visit your customer portal at your earliest convenience. Thank you and have a wonderful day.',
+          voiceGender: 'FEMALE',
+          voiceLanguage: 'en-US',
+          durationSeconds: 12,
+          isDefault: true,
+          enabled: true,
+          createdAt: new Date().toISOString(),
+        },
+        {
+          id: 'vmt_default_2',
+          managerId: null,
+          name: 'Urgent Service Follow-Up (Male Voice)',
+          description: 'Urgent follow-up voicemail drop for pending inquiries',
+          type: 'TTS_GENERATED',
+          ttsText: 'Hello, this is an important message from our service department. Our representative tried to reach you earlier. Please give us a call back today to finalize your request. Thank you.',
+          voiceGender: 'MALE',
+          voiceLanguage: 'en-US',
+          durationSeconds: 10,
+          isDefault: false,
+          enabled: true,
+          createdAt: new Date().toISOString(),
+        },
+      ],
+      voicemail_drops: [],
       firewall_settings: {
         mode: 'PERMISSIVE',
         defaultSipPort: 5060,
@@ -778,6 +849,8 @@ class DatabaseService {
           ...parsed,
           voip_api_providers: parsed.voip_api_providers || this.getDefaultSchema().voip_api_providers,
           manager_voip_assignments: parsed.manager_voip_assignments || [],
+          voicemail_templates: parsed.voicemail_templates || this.getDefaultSchema().voicemail_templates,
+          voicemail_drops: parsed.voicemail_drops || [],
           firewall_rules: parsed.firewall_rules || this.getDefaultSchema().firewall_rules,
           firewall_settings: parsed.firewall_settings || this.getDefaultSchema().firewall_settings,
         };

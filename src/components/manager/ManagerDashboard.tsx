@@ -6,6 +6,8 @@ import {
   CampaignItem,
   IvrConfigItem,
   CallItem,
+  VoicemailTemplateItem,
+  VoicemailDropLogItem,
 } from '../../types.ts';
 import {
   Users,
@@ -34,13 +36,16 @@ import {
   Trash2,
   Sparkles,
   Languages,
+  Voicemail,
+  Zap,
+  ArrowRight,
 } from 'lucide-react';
 
 export const ManagerDashboard: React.FC = () => {
   const { token, user } = useAuth();
   const { triggerRefresh } = useRealtime();
 
-  const [activeTab, setActiveTab] = useState<'campaigns' | 'ivr' | 'agents' | 'calls'>('campaigns');
+  const [activeTab, setActiveTab] = useState<'campaigns' | 'ivr' | 'voicemails' | 'agents' | 'calls'>('campaigns');
 
   // Data states
   const [agents, setAgents] = useState<AgentItem[]>([]);
@@ -56,6 +61,31 @@ export const ManagerDashboard: React.FC = () => {
     failed: 0,
     avgDuration: 0,
   });
+
+  // Voicemail & Voicemail Drop states
+  const [voicemails, setVoicemails] = useState<VoicemailTemplateItem[]>([]);
+  const [voicemailDrops, setVoicemailDrops] = useState<VoicemailDropLogItem[]>([]);
+  const [showCreateVoicemailModal, setShowCreateVoicemailModal] = useState<boolean>(false);
+  const [voicemailForm, setVoicemailForm] = useState({
+    name: '',
+    description: '',
+    type: 'TTS_GENERATED' as 'TTS_GENERATED' | 'AUDIO_FILE',
+    ttsText: 'Hello, this is our customer service team following up on your request. Please call us back or check your account portal.',
+    audioUrl: '',
+    voiceGender: 'FEMALE' as 'FEMALE' | 'MALE',
+    voiceLanguage: 'en-US',
+    durationSeconds: 15,
+  });
+  const [playingVoicemailId, setPlayingVoicemailId] = useState<string | null>(null);
+  const [voicemailFilterReason, setVoicemailFilterReason] = useState<string>('ALL');
+  const [voicemailSearch, setVoicemailSearch] = useState<string>('');
+  const [showManagerInstantDropModal, setShowManagerInstantDropModal] = useState<boolean>(false);
+  const [managerInstantDropForm, setManagerInstantDropForm] = useState({
+    targetNumber: '+12099722359',
+    voicemailId: '',
+  });
+  const [isManagerDropping, setIsManagerDropping] = useState<boolean>(false);
+  const [managerInstantDropResult, setManagerInstantDropResult] = useState<any>(null);
 
   const [loading, setLoading] = useState<boolean>(true);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
@@ -77,6 +107,8 @@ export const ManagerDashboard: React.FC = () => {
     customerLanguage: 'Arabic',
     autoDetectCustomerLanguage: false,
     aiBotGreeting: 'مرحباً، جاري توصيلك بممثل الخدمة',
+    voicemailDropEnabled: true,
+    voicemailTemplateId: '',
   });
   const [managerPolicy, setManagerPolicy] = useState<{
     allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION' | 'BOTH';
@@ -133,11 +165,13 @@ export const ManagerDashboard: React.FC = () => {
     if (!token) return;
     setLoading(true);
     try {
-      const [agentsData, campData, ivrData, repData] = await Promise.all([
+      const [agentsData, campData, ivrData, repData, vmData, vmDropData] = await Promise.all([
         safeFetch('/api/manager/agents'),
         safeFetch('/api/manager/campaigns'),
         safeFetch('/api/manager/ivr-configs'),
         safeFetch('/api/manager/reports'),
+        safeFetch('/api/voicemails'),
+        safeFetch('/api/voicemail-drops'),
       ]);
 
       if (agentsData) {
@@ -151,6 +185,8 @@ export const ManagerDashboard: React.FC = () => {
         if (Array.isArray(repData.calls)) setCalls(repData.calls);
         if (repData.summary) setCallsSummary(repData.summary);
       }
+      if (Array.isArray(vmData)) setVoicemails(vmData);
+      if (Array.isArray(vmDropData)) setVoicemailDrops(vmDropData);
     } catch (err: any) {
       showNotification('error', `Failed to load dashboard data: ${err.message}`);
     } finally {
@@ -332,6 +368,8 @@ export const ManagerDashboard: React.FC = () => {
           customerLanguage: campaignForm.customerLanguage,
           autoDetectCustomerLanguage: campaignForm.autoDetectCustomerLanguage,
           aiBotGreeting: campaignForm.aiBotGreeting,
+          voicemailDropEnabled: campaignForm.voicemailDropEnabled,
+          voicemailTemplateId: campaignForm.voicemailTemplateId || undefined,
         }),
       });
 
@@ -353,6 +391,8 @@ export const ManagerDashboard: React.FC = () => {
         customerLanguage: managerPolicy.enforcedCustomerLanguage || 'Arabic',
         autoDetectCustomerLanguage: false,
         aiBotGreeting: 'مرحباً، جاري توصيلك بممثل الخدمة',
+        voicemailDropEnabled: true,
+        voicemailTemplateId: '',
       });
 
       if (autoStartCampaign && data.id) {
@@ -596,6 +636,153 @@ export const ManagerDashboard: React.FC = () => {
     }
   };
 
+  // ==========================================
+  // VOICEMAIL & VOICEMAIL DROP HANDLERS
+  // ==========================================
+  const handlePreviewVoicemailAudio = (template: VoicemailTemplateItem) => {
+    if (playingVoicemailId === template.id) {
+      if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+      setPlayingVoicemailId(null);
+      return;
+    }
+
+    if (template.type === 'TTS_GENERATED' && template.ttsText) {
+      if ('speechSynthesis' in window) {
+        window.speechSynthesis.cancel();
+        const utterance = new SpeechSynthesisUtterance(template.ttsText);
+        utterance.rate = 0.95;
+        utterance.pitch = template.voiceGender === 'MALE' ? 0.9 : 1.1;
+        utterance.lang = template.voiceLanguage || 'en-US';
+        utterance.onend = () => setPlayingVoicemailId(null);
+        utterance.onerror = () => setPlayingVoicemailId(null);
+        setPlayingVoicemailId(template.id);
+        window.speechSynthesis.speak(utterance);
+        showNotification('success', `Playing TTS audio preview: "${template.name}"`);
+      } else {
+        showNotification('error', 'Browser SpeechSynthesis is not supported on this device.');
+      }
+    } else if (template.audioUrl) {
+      try {
+        const audio = new Audio(template.audioUrl);
+        setPlayingVoicemailId(template.id);
+        audio.play();
+        audio.onended = () => setPlayingVoicemailId(null);
+        audio.onerror = () => {
+          setPlayingVoicemailId(null);
+          showNotification('error', 'Unable to play audio URL source.');
+        };
+      } catch (err: any) {
+        setPlayingVoicemailId(null);
+        showNotification('error', err.message);
+      }
+    }
+  };
+
+  const handleCreateVoicemail = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token) return;
+    if (!voicemailForm.name.trim()) {
+      showNotification('error', 'Voicemail template name is required.');
+      return;
+    }
+
+    try {
+      const res = await fetch('/api/voicemails', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          name: voicemailForm.name.trim(),
+          description: voicemailForm.description.trim() || undefined,
+          type: voicemailForm.type,
+          ttsText: voicemailForm.type === 'TTS_GENERATED' ? voicemailForm.ttsText.trim() : undefined,
+          audioUrl: voicemailForm.type === 'AUDIO_FILE' ? voicemailForm.audioUrl.trim() : undefined,
+          voiceGender: voicemailForm.voiceGender,
+          voiceLanguage: voicemailForm.voiceLanguage,
+          durationSeconds: Number(voicemailForm.durationSeconds) || 15,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        showNotification('error', data.error || 'Failed to create voicemail template.');
+        return;
+      }
+
+      showNotification('success', `Voicemail template "${data.name}" saved! Available for campaigns.`);
+      setShowCreateVoicemailModal(false);
+      setVoicemailForm({
+        name: '',
+        description: '',
+        type: 'TTS_GENERATED',
+        ttsText: 'Hello, this is our customer service team following up on your request. Please call us back or check your account portal.',
+        audioUrl: '',
+        voiceGender: 'FEMALE',
+        voiceLanguage: 'en-US',
+        durationSeconds: 15,
+      });
+      fetchData();
+    } catch (err: any) {
+      showNotification('error', err.message);
+    }
+  };
+
+  const handleDeleteVoicemail = async (id: string, name: string) => {
+    if (!token) return;
+    try {
+      const res = await fetch(`/api/voicemails/${id}`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (res.ok) {
+        showNotification('success', `Voicemail template "${name}" deleted.`);
+        fetchData();
+      } else {
+        const data = await res.json();
+        showNotification('error', data.error || 'Failed to delete template.');
+      }
+    } catch (err: any) {
+      showNotification('error', err.message);
+    }
+  };
+
+  const handleManagerInstantDrop = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token) return;
+    if (!managerInstantDropForm.targetNumber.trim()) {
+      showNotification('error', 'Destination phone number is required.');
+      return;
+    }
+
+    try {
+      setIsManagerDropping(true);
+      setManagerInstantDropResult(null);
+
+      const res = await fetch('/api/voicemail-drops/instant-drop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({
+          targetNumber: managerInstantDropForm.targetNumber.trim(),
+          voicemailId: managerInstantDropForm.voicemailId || undefined,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        showNotification('error', data.error || 'Voicemail drop dispatch failed.');
+        setIsManagerDropping(false);
+        return;
+      }
+
+      setManagerInstantDropResult(data);
+      showNotification('success', `Voicemail dropped successfully to ${data.customerNumber}!`);
+      setIsManagerDropping(false);
+      fetchData();
+    } catch (err: any) {
+      setIsManagerDropping(false);
+      showNotification('error', err.message);
+    }
+  };
+
   const formatSeconds = (sec: number) => {
     const mins = Math.floor(sec / 60);
     const rem = sec % 60;
@@ -687,6 +874,23 @@ export const ManagerDashboard: React.FC = () => {
           </button>
 
           <button
+            onClick={() => setActiveTab('voicemails')}
+            className={`py-3 px-1 border-b-2 font-medium text-sm flex items-center gap-2 transition-colors cursor-pointer ${
+              activeTab === 'voicemails'
+                ? 'border-blue-700 text-blue-800'
+                : 'border-transparent text-slate-500 hover:text-slate-700'
+            }`}
+          >
+            <Voicemail className="w-4 h-4 text-indigo-600" />
+            <span>Voicemail Drops</span>
+            {voicemailDrops.length > 0 && (
+              <span className="bg-indigo-100 text-indigo-800 font-bold text-xs px-2 py-0.5 rounded-full">
+                {voicemailDrops.length}
+              </span>
+            )}
+          </button>
+
+          <button
             onClick={() => setActiveTab('agents')}
             className={`py-3 px-1 border-b-2 font-medium text-sm flex items-center gap-2 transition-colors cursor-pointer ${
               activeTab === 'agents'
@@ -757,6 +961,8 @@ export const ManagerDashboard: React.FC = () => {
                   customerLanguage: managerPolicy.enforcedCustomerLanguage || 'Arabic',
                   autoDetectCustomerLanguage: false,
                   aiBotGreeting: 'مرحباً، جاري توصيلك بممثل الخدمة',
+                  voicemailDropEnabled: true,
+                  voicemailTemplateId: '',
                 });
                 setShowCreateCampaignModal(true);
               }}
@@ -945,7 +1151,356 @@ export const ManagerDashboard: React.FC = () => {
       )}
 
       {/* ========================================== */}
-      {/* TAB 3: AGENTS MANAGEMENT */}
+      {/* TAB 3: VOICEMAIL DROPS MANAGEMENT */}
+      {/* ========================================== */}
+      {activeTab === 'voicemails' && (
+        <div className="space-y-6">
+          {/* Header */}
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 pb-4 border-b border-slate-200">
+            <div>
+              <div className="flex items-center gap-2">
+                <div className="p-2 rounded-lg bg-indigo-100 text-indigo-700">
+                  <Voicemail className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-xl font-bold text-slate-900 tracking-tight">Voicemail Library & PSTN Drops</h3>
+                  <p className="text-xs text-slate-500">
+                    Custom & system voicemail templates delivered when customer does not pick up or line is busy
+                  </p>
+                </div>
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setManagerInstantDropResult(null);
+                  setManagerInstantDropForm({
+                    targetNumber: '+12099722359',
+                    voicemailId: voicemails[0]?.id || '',
+                  });
+                  setShowManagerInstantDropModal(true);
+                }}
+                className="inline-flex items-center gap-1.5 px-3.5 py-2 border border-indigo-300 bg-indigo-50 hover:bg-indigo-100 text-indigo-800 rounded-lg text-xs font-semibold transition-colors cursor-pointer"
+              >
+                <Zap className="w-4 h-4 text-indigo-600" />
+                <span>Test Instant Voicemail Drop</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setVoicemailForm({
+                    name: '',
+                    description: '',
+                    type: 'TTS_GENERATED',
+                    ttsText: 'Hello, this is our customer care team following up on your request. Please give us a callback or check your account.',
+                    audioUrl: '',
+                    voiceGender: 'FEMALE',
+                    voiceLanguage: 'en-US',
+                    durationSeconds: 15,
+                  });
+                  setShowCreateVoicemailModal(true);
+                }}
+                className="inline-flex items-center gap-1.5 px-4 py-2 bg-indigo-700 hover:bg-indigo-800 text-white rounded-lg text-xs font-semibold shadow-xs transition-colors cursor-pointer"
+              >
+                <Plus className="w-4 h-4" />
+                <span>New Voicemail Audio</span>
+              </button>
+            </div>
+          </div>
+
+          {/* Metric Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+            <div className="bg-white p-4 border border-slate-200 rounded-xl shadow-xs">
+              <div className="text-[11px] text-slate-500 font-medium">Available Templates</div>
+              <div className="text-2xl font-bold text-slate-900 mt-1">{voicemails.length}</div>
+              <div className="text-[10px] text-slate-400 mt-0.5">Ready to drop on campaigns</div>
+            </div>
+
+            <div className="bg-white p-4 border border-slate-200 rounded-xl shadow-xs">
+              <div className="text-[11px] text-slate-500 font-medium">Delivered to PSTN</div>
+              <div className="text-2xl font-bold text-emerald-700 mt-1">
+                {voicemailDrops.filter((d) => d.status === 'DELIVERED').length}
+              </div>
+              <div className="text-[10px] text-emerald-600 font-semibold mt-0.5">
+                {voicemailDrops.length > 0
+                  ? `${Math.round((voicemailDrops.filter((d) => d.status === 'DELIVERED').length / voicemailDrops.length) * 100)}% delivery rate`
+                  : '100% target'}
+              </div>
+            </div>
+
+            <div className="bg-white p-4 border border-slate-200 rounded-xl shadow-xs">
+              <div className="text-[11px] text-slate-500 font-medium">No-Answer Drops</div>
+              <div className="text-2xl font-bold text-amber-700 mt-1">
+                {voicemailDrops.filter((d) => d.triggerReason === 'NO_ANSWER').length}
+              </div>
+              <div className="text-[10px] text-slate-400 mt-0.5">Dropped after 45s ringing</div>
+            </div>
+
+            <div className="bg-white p-4 border border-slate-200 rounded-xl shadow-xs">
+              <div className="text-[11px] text-slate-500 font-medium">Busy Line Drops</div>
+              <div className="text-2xl font-bold text-rose-700 mt-1">
+                {voicemailDrops.filter((d) => d.triggerReason === 'BUSY').length}
+              </div>
+              <div className="text-[10px] text-slate-400 mt-0.5">Recipient busy / declined</div>
+            </div>
+          </div>
+
+          {/* Voicemail Templates Library */}
+          <div className="space-y-3">
+            <div className="flex items-center justify-between">
+              <div>
+                <h4 className="text-base font-bold text-slate-900">Voicemail Library</h4>
+                <p className="text-xs text-slate-500">Audio and TTS messages selectable in your campaigns</p>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {voicemails.map((vm) => {
+                const isPlaying = playingVoicemailId === vm.id;
+                return (
+                  <div
+                    key={vm.id}
+                    className="bg-white rounded-xl border border-slate-200 p-4 shadow-xs hover:border-indigo-300 transition-all flex flex-col justify-between space-y-3"
+                  >
+                    <div>
+                      <div className="flex items-start justify-between gap-2">
+                        <div>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <span className="font-bold text-sm text-slate-900">{vm.name}</span>
+                            {vm.isDefault && (
+                              <span className="text-[10px] bg-amber-100 text-amber-800 font-bold px-1.5 py-0.5 rounded border border-amber-200">
+                                ★ Default
+                              </span>
+                            )}
+                            <span className="text-[10px] bg-slate-100 text-slate-600 font-medium px-1.5 py-0.5 rounded">
+                              {vm.managerId ? 'My Template' : 'System Template'}
+                            </span>
+                          </div>
+                          {vm.description && (
+                            <p className="text-xs text-slate-500 mt-1">{vm.description}</p>
+                          )}
+                        </div>
+
+                        {vm.managerId && (
+                          <button
+                            type="button"
+                            title="Delete template"
+                            onClick={() => handleDeleteVoicemail(vm.id, vm.name)}
+                            className="p-1 text-slate-400 hover:text-red-700 rounded transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        )}
+                      </div>
+
+                      {/* Message preview */}
+                      <div className="mt-3 p-3 bg-slate-50 rounded-lg border border-slate-100 text-xs text-slate-700 leading-relaxed font-sans">
+                        {vm.type === 'TTS_GENERATED' ? (
+                          <span>&ldquo;{vm.ttsText || 'No text defined'}&rdquo;</span>
+                        ) : (
+                          <div className="flex items-center gap-1.5 text-indigo-700 font-mono text-[11px] truncate">
+                            <Volume2 className="w-3.5 h-3.5 shrink-0" />
+                            <span className="truncate">{vm.audioUrl || 'Custom Audio File'}</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Meta Tags */}
+                      <div className="flex items-center gap-2 mt-2.5 text-[11px] text-slate-500 flex-wrap">
+                        <span className="bg-indigo-50 text-indigo-700 px-2 py-0.5 rounded font-medium">
+                          {vm.type === 'TTS_GENERATED' ? 'TTS Generated' : 'Audio File'}
+                        </span>
+                        <span className="bg-slate-100 text-slate-700 px-2 py-0.5 rounded font-mono">
+                          {vm.durationSeconds}s duration
+                        </span>
+                        {vm.voiceLanguage && (
+                          <span className="bg-slate-100 text-slate-600 px-2 py-0.5 rounded">
+                            {vm.voiceLanguage}
+                          </span>
+                        )}
+                      </div>
+                    </div>
+
+                    {/* Actions */}
+                    <div className="flex items-center justify-between pt-2 border-t border-slate-100">
+                      <button
+                        type="button"
+                        onClick={() => handlePreviewVoicemailAudio(vm)}
+                        className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-1.5 rounded-lg transition-colors cursor-pointer ${
+                          isPlaying
+                            ? 'bg-rose-100 text-rose-800'
+                            : 'bg-indigo-50 text-indigo-700 hover:bg-indigo-100'
+                        }`}
+                      >
+                        <Volume2 className={`w-3.5 h-3.5 ${isPlaying ? 'animate-bounce' : ''}`} />
+                        <span>{isPlaying ? 'Stop Preview' : 'Listen Preview'}</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setManagerInstantDropResult(null);
+                          setManagerInstantDropForm({
+                            targetNumber: '+12099722359',
+                            voicemailId: vm.id,
+                          });
+                          setShowManagerInstantDropModal(true);
+                        }}
+                        className="inline-flex items-center gap-1 text-xs text-slate-600 hover:text-indigo-700 font-medium cursor-pointer"
+                      >
+                        <span>Test Drop</span>
+                        <ArrowRight className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Drops History Table */}
+          <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden space-y-3 p-5">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-slate-100">
+              <div>
+                <h4 className="font-bold text-slate-900 text-base flex items-center gap-2">
+                  <Voicemail className="w-4 h-4 text-indigo-600" />
+                  <span>Campaign Voicemail Drop Logs</span>
+                </h4>
+                <p className="text-xs text-slate-500">
+                  Voicemails delivered to recipients when calls went unanswered or busy
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 flex-wrap">
+                <input
+                  type="text"
+                  placeholder="Search phone number..."
+                  value={voicemailSearch}
+                  onChange={(e) => setVoicemailSearch(e.target.value)}
+                  className="text-xs border border-slate-300 rounded-lg px-2.5 py-1.5 w-44 focus:ring-2 focus:ring-indigo-500"
+                />
+
+                <select
+                  value={voicemailFilterReason}
+                  onChange={(e) => setVoicemailFilterReason(e.target.value)}
+                  className="text-xs border border-slate-300 rounded-lg px-2.5 py-1.5 bg-white font-medium text-slate-700"
+                >
+                  <option value="ALL">All Trigger Reasons</option>
+                  <option value="NO_ANSWER">No Answer (Unanswered)</option>
+                  <option value="BUSY">User Busy / Rejected</option>
+                  <option value="CARRIER_TIMEOUT">Carrier Timeout (45s)</option>
+                  <option value="ANSWERING_MACHINE_DETECTED">Answering Machine</option>
+                </select>
+
+                <button
+                  type="button"
+                  onClick={fetchData}
+                  className="p-1.5 border border-slate-300 text-slate-600 hover:bg-slate-100 rounded-lg"
+                  title="Refresh drops"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
+                </button>
+              </div>
+            </div>
+
+            <div className="overflow-x-auto">
+              <table className="w-full text-left text-xs">
+                <thead className="bg-slate-50 text-slate-600 font-semibold border-b border-slate-200">
+                  <tr>
+                    <th className="py-2.5 px-3">Timestamp</th>
+                    <th className="py-2.5 px-3">Recipient PSTN</th>
+                    <th className="py-2.5 px-3">Caller ID</th>
+                    <th className="py-2.5 px-3">Trigger Reason</th>
+                    <th className="py-2.5 px-3">Voicemail Template</th>
+                    <th className="py-2.5 px-3">Duration</th>
+                    <th className="py-2.5 px-3">Status</th>
+                    <th className="py-2.5 px-3">Carrier Token</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {voicemailDrops
+                    .filter((d) => {
+                      if (voicemailFilterReason !== 'ALL' && d.triggerReason !== voicemailFilterReason) return false;
+                      if (
+                        voicemailSearch &&
+                        !d.customerNumber.toLowerCase().includes(voicemailSearch.toLowerCase()) &&
+                        !d.voicemailName.toLowerCase().includes(voicemailSearch.toLowerCase())
+                      )
+                        return false;
+                      return true;
+                    })
+                    .map((drop) => {
+                      return (
+                        <tr key={drop.id} className="hover:bg-slate-50/60 transition-colors">
+                          <td className="py-2.5 px-3 text-slate-500 whitespace-nowrap font-mono text-[11px]">
+                            {new Date(drop.timestamp).toLocaleString()}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
+                            {drop.customerNumber}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono text-slate-600">
+                            {drop.callerId || '+18045930160'}
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <span
+                              className={`text-[11px] font-semibold px-2 py-0.5 rounded-full ${
+                                drop.triggerReason === 'NO_ANSWER'
+                                  ? 'bg-amber-100 text-amber-800 border border-amber-200'
+                                  : drop.triggerReason === 'BUSY'
+                                  ? 'bg-rose-100 text-rose-800 border border-rose-200'
+                                  : drop.triggerReason === 'CARRIER_TIMEOUT'
+                                  ? 'bg-blue-100 text-blue-800 border border-blue-200'
+                                  : 'bg-purple-100 text-purple-800 border border-purple-200'
+                              }`}
+                            >
+                              {drop.triggerReason.replace(/_/g, ' ')}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 font-medium text-slate-800">
+                            {drop.voicemailName}
+                          </td>
+                          <td className="py-2.5 px-3 font-mono text-slate-600">
+                            {drop.audioDurationSeconds}s
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <span
+                              className={`text-[11px] font-bold px-2 py-0.5 rounded-full inline-flex items-center gap-1 ${
+                                drop.status === 'DELIVERED'
+                                  ? 'bg-emerald-100 text-emerald-800'
+                                  : drop.status === 'DROPPING'
+                                  ? 'bg-blue-100 text-blue-800'
+                                  : 'bg-red-100 text-red-800'
+                              }`}
+                            >
+                              {drop.status === 'DELIVERED' && <CheckCircle2 className="w-3 h-3 text-emerald-600" />}
+                              <span>{drop.status}</span>
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 font-mono text-[10px] text-slate-400">
+                            {drop.carrierReceipt || drop.id.substring(0, 16)}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  {voicemailDrops.length === 0 && (
+                    <tr>
+                      <td colSpan={8} className="py-8 text-center text-slate-400 text-xs">
+                        No voicemail drops recorded yet. If recipient doesn&apos;t answer or is busy, a voicemail drop will appear here.
+                      </td>
+                    </tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================== */}
+      {/* TAB 4: AGENTS MANAGEMENT */}
       {/* ========================================== */}
       {activeTab === 'agents' && (
         <div className="space-y-6">
@@ -1577,6 +2132,47 @@ export const ManagerDashboard: React.FC = () => {
                 />
               </div>
 
+              {/* Voicemail Drop on No-Answer / Busy */}
+              <div className="bg-indigo-50/70 border border-indigo-200 rounded-xl p-3.5 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Voicemail className="w-4 h-4 text-indigo-700 shrink-0" />
+                    <div>
+                      <div className="text-xs font-bold text-slate-900">Enable Voicemail Drop on No-Answer / Busy</div>
+                      <div className="text-[11px] text-slate-500">
+                        Automatically drops pre-recorded voicemail audio if recipient does not pick up or line is busy
+                      </div>
+                    </div>
+                  </div>
+                  <input
+                    type="checkbox"
+                    checked={campaignForm.voicemailDropEnabled}
+                    onChange={(e) => setCampaignForm({ ...campaignForm, voicemailDropEnabled: e.target.checked })}
+                    className="w-4 h-4 text-indigo-600 rounded cursor-pointer"
+                  />
+                </div>
+
+                {campaignForm.voicemailDropEnabled && (
+                  <div>
+                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
+                      Voicemail Audio Template:
+                    </label>
+                    <select
+                      value={campaignForm.voicemailTemplateId}
+                      onChange={(e) => setCampaignForm({ ...campaignForm, voicemailTemplateId: e.target.value })}
+                      className="w-full text-xs border border-indigo-200 bg-white rounded-lg p-2 font-medium"
+                    >
+                      <option value="">-- Use Default Template (Automatic) --</option>
+                      {voicemails.map((vm) => (
+                        <option key={vm.id} value={vm.id}>
+                          {vm.name} ({vm.durationSeconds}s {vm.type === 'TTS_GENERATED' ? 'TTS' : 'Audio'}) {vm.isDefault ? '★ Default' : ''}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                )}
+              </div>
+
               {/* Auto-start Toggle */}
               <div className="bg-slate-50 border border-slate-200 rounded-lg p-3 flex items-center justify-between">
                 <div>
@@ -1807,6 +2403,261 @@ export const ManagerDashboard: React.FC = () => {
                   className="px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-lg shadow-sm cursor-pointer"
                 >
                   Save IVR Voice
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+      {/* MODAL: CREATE VOICEMAIL TEMPLATE */}
+      {showCreateVoicemailModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-white rounded-2xl shadow-xl max-w-lg w-full p-6 space-y-4 border border-slate-200 my-8">
+            <div className="flex justify-between items-start pb-2 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <Voicemail className="w-5 h-5 text-indigo-600" />
+                <h3 className="text-lg font-bold text-slate-900">Create Campaign Voicemail</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowCreateVoicemailModal(false)}
+                className="text-slate-400 hover:text-slate-600 text-lg font-bold"
+              >
+                &times;
+              </button>
+            </div>
+
+            <form onSubmit={handleCreateVoicemail} className="space-y-4 text-xs">
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Voicemail Title</label>
+                <input
+                  type="text"
+                  required
+                  placeholder="e.g. VIP Customer Notice"
+                  value={voicemailForm.name}
+                  onChange={(e) => setVoicemailForm({ ...voicemailForm, name: e.target.value })}
+                  className="w-full text-xs border border-slate-300 rounded-lg p-2.5 font-medium"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Description / Notes</label>
+                <input
+                  type="text"
+                  placeholder="e.g. Dropped to customers for special promotional follow-up"
+                  value={voicemailForm.description}
+                  onChange={(e) => setVoicemailForm({ ...voicemailForm, description: e.target.value })}
+                  className="w-full text-xs border border-slate-300 rounded-lg p-2.5 text-slate-600"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Voicemail Audio Source</label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setVoicemailForm({ ...voicemailForm, type: 'TTS_GENERATED' })}
+                    className={`p-2.5 rounded-lg border text-left transition-colors flex items-center gap-2 ${
+                      voicemailForm.type === 'TTS_GENERATED'
+                        ? 'border-indigo-600 bg-indigo-50/80 text-indigo-900 font-bold ring-1 ring-indigo-500'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span>🎙️ Text-to-Speech (TTS)</span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => setVoicemailForm({ ...voicemailForm, type: 'AUDIO_FILE' })}
+                    className={`p-2.5 rounded-lg border text-left transition-colors flex items-center gap-2 ${
+                      voicemailForm.type === 'AUDIO_FILE'
+                        ? 'border-indigo-600 bg-indigo-50/80 text-indigo-900 font-bold ring-1 ring-indigo-500'
+                        : 'border-slate-200 bg-white text-slate-700 hover:bg-slate-50'
+                    }`}
+                  >
+                    <span>📁 Audio URL / File</span>
+                  </button>
+                </div>
+              </div>
+
+              {voicemailForm.type === 'TTS_GENERATED' ? (
+                <div className="space-y-3 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                  <div>
+                    <label className="block font-semibold text-slate-700 mb-1">
+                      Voicemail Message Spoken to Customer Answering Machine:
+                    </label>
+                    <textarea
+                      rows={3}
+                      required
+                      placeholder="Enter the voice message spoken into customer voicemail..."
+                      value={voicemailForm.ttsText}
+                      onChange={(e) => setVoicemailForm({ ...voicemailForm, ttsText: e.target.value })}
+                      className="w-full text-xs border border-slate-300 rounded-lg p-2.5 bg-white"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">Voice Gender</label>
+                      <select
+                        value={voicemailForm.voiceGender}
+                        onChange={(e: any) => setVoicemailForm({ ...voicemailForm, voiceGender: e.target.value })}
+                        className="w-full text-xs border border-slate-300 rounded-lg p-2 bg-white"
+                      >
+                        <option value="FEMALE">Female Voice</option>
+                        <option value="MALE">Male Voice</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label className="block font-semibold text-slate-700 mb-1">Language</label>
+                      <select
+                        value={voicemailForm.voiceLanguage}
+                        onChange={(e) => setVoicemailForm({ ...voicemailForm, voiceLanguage: e.target.value })}
+                        className="w-full text-xs border border-slate-300 rounded-lg p-2 bg-white"
+                      >
+                        <option value="en-US">English (US)</option>
+                        <option value="en-GB">English (UK)</option>
+                        <option value="es-ES">Spanish (Español)</option>
+                        <option value="ar-SA">Arabic (العربية)</option>
+                        <option value="ur-PK">Urdu (اردو)</option>
+                        <option value="fr-FR">French (Français)</option>
+                        <option value="de-DE">German (Deutsch)</option>
+                      </select>
+                    </div>
+                  </div>
+                </div>
+              ) : (
+                <div className="space-y-2 bg-slate-50 border border-slate-200 rounded-xl p-3">
+                  <label className="block font-semibold text-slate-700 mb-1">Audio File URL (.mp3 / .wav)</label>
+                  <input
+                    type="url"
+                    required
+                    placeholder="https://example.com/audio/custom-voicemail.mp3"
+                    value={voicemailForm.audioUrl}
+                    onChange={(e) => setVoicemailForm({ ...voicemailForm, audioUrl: e.target.value })}
+                    className="w-full text-xs border border-slate-300 rounded-lg p-2.5 font-mono bg-white"
+                  />
+                </div>
+              )}
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Audio Duration (seconds)</label>
+                <input
+                  type="number"
+                  min="5"
+                  max="180"
+                  required
+                  value={voicemailForm.durationSeconds}
+                  onChange={(e) => setVoicemailForm({ ...voicemailForm, durationSeconds: parseInt(e.target.value, 10) || 15 })}
+                  className="w-full text-xs border border-slate-300 rounded-lg p-2 font-mono"
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowCreateVoicemailModal(false)}
+                  className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-medium rounded-lg cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold rounded-lg shadow-xs cursor-pointer"
+                >
+                  Save Voicemail
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: MANAGER INSTANT DROP TESTER */}
+      {showManagerInstantDropModal && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-white rounded-2xl shadow-xl max-w-lg w-full p-6 space-y-4 border border-slate-200 my-8">
+            <div className="flex justify-between items-start pb-2 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <div className="p-1.5 rounded-lg bg-indigo-100 text-indigo-700">
+                  <Zap className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-lg font-bold text-slate-900">Instant Voicemail Drop Tester</h3>
+                  <p className="text-xs text-slate-500">Dispatch voicemail directly to recipient PSTN number</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowManagerInstantDropModal(false)}
+                className="text-slate-400 hover:text-slate-600 text-lg font-bold"
+              >
+                &times;
+              </button>
+            </div>
+
+            <form onSubmit={handleManagerInstantDrop} className="space-y-4 text-xs">
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">
+                  Target Mobile Phone Number (e.g. +12099722359)
+                </label>
+                <input
+                  type="text"
+                  required
+                  placeholder="+12099722359"
+                  value={managerInstantDropForm.targetNumber}
+                  onChange={(e) => setManagerInstantDropForm({ ...managerInstantDropForm, targetNumber: e.target.value })}
+                  className="w-full text-xs border border-slate-300 rounded-lg p-2.5 font-mono focus:ring-2 focus:ring-indigo-500 font-bold"
+                />
+              </div>
+
+              <div>
+                <label className="block font-semibold text-slate-700 mb-1">Select Voicemail Template</label>
+                <select
+                  value={managerInstantDropForm.voicemailId}
+                  onChange={(e) => setManagerInstantDropForm({ ...managerInstantDropForm, voicemailId: e.target.value })}
+                  className="w-full text-xs border border-slate-300 rounded-lg p-2.5 bg-white font-medium"
+                >
+                  <option value="">-- Use Default Template --</option>
+                  {voicemails.map((vm) => (
+                    <option key={vm.id} value={vm.id}>
+                      {vm.name} ({vm.durationSeconds}s, {vm.type === 'TTS_GENERATED' ? 'TTS' : 'Audio'}) {vm.isDefault ? '★' : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {managerInstantDropResult && (
+                <div className="bg-emerald-50 border border-emerald-200 rounded-xl p-3 space-y-1.5 text-emerald-950">
+                  <div className="flex items-center gap-2 font-bold text-xs text-emerald-900">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                    <span>Voicemail Drop Dispatched to Carrier!</span>
+                  </div>
+                  <div className="text-[11px] font-mono text-emerald-800 space-y-0.5">
+                    <div>Recipient: <strong>{managerInstantDropResult.customerNumber}</strong></div>
+                    <div>Template: <strong>{managerInstantDropResult.voicemailName}</strong></div>
+                    <div>Receipt: <span className="opacity-80">{managerInstantDropResult.carrierReceipt}</span></div>
+                    <div>Status: <span className="font-bold text-emerald-700">{managerInstantDropResult.status}</span></div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setShowManagerInstantDropModal(false)}
+                  className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-medium rounded-lg"
+                >
+                  Close
+                </button>
+                <button
+                  type="submit"
+                  disabled={isManagerDropping}
+                  className="px-5 py-2.5 bg-indigo-700 hover:bg-indigo-800 text-white text-xs font-bold rounded-lg shadow-xs flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+                >
+                  <Zap className="w-3.5 h-3.5" />
+                  <span>{isManagerDropping ? 'Dropping to PSTN...' : 'Drop Voicemail Now'}</span>
                 </button>
               </div>
             </form>

@@ -140,6 +140,9 @@ export interface CampaignItem {
   autoDetectCustomerLanguage?: boolean;
   aiBotGreeting?: string;
   aiVoicePersona?: string;
+  voicemailDropEnabled?: boolean;
+  voicemailTemplateId?: string;
+  voicemailDropCount?: number;
   createdAt: string;
   startedAt?: string;
   completedAt?: string;
@@ -170,6 +173,41 @@ export interface CallItem {
   failoverFromConnectionId?: string;
   notes?: string;
   disposition?: string;
+  voicemailDropped?: boolean;
+  voicemailDropId?: string;
+}
+
+export interface VoicemailTemplateItem {
+  id: string;
+  managerId?: string | null;
+  name: string;
+  description?: string;
+  type: 'TTS_GENERATED' | 'AUDIO_FILE' | 'AI_RECORDED';
+  ttsText?: string;
+  audioUrl?: string;
+  voiceGender?: 'FEMALE' | 'MALE';
+  voiceLanguage?: string;
+  durationSeconds: number;
+  isDefault: boolean;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt?: string;
+}
+
+export interface VoicemailDropLogItem {
+  id: string;
+  callId: string;
+  campaignId?: string;
+  managerId?: string;
+  customerNumber: string;
+  callerId: string;
+  voicemailId: string;
+  voicemailName: string;
+  status: 'PENDING' | 'DROPPING' | 'DELIVERED' | 'FAILED';
+  triggerReason: 'NO_ANSWER' | 'BUSY' | 'ANSWERING_MACHINE_DETECTED' | 'CARRIER_TIMEOUT';
+  audioDurationSeconds: number;
+  timestamp: string;
+  carrierReceipt?: string;
 }
 
 export interface DtmfEventItem {

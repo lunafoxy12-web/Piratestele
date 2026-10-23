@@ -1,7 +1,7 @@
 import express, { Request, Response } from 'express';
 import crypto from 'crypto';
 import net from 'net';
-import { db, hashPassword, User, Manager, Agent, SipConnection, SipNumber, Campaign, CampaignContact, IvrConfig, VoipApiProvider } from './db.ts';
+import { db, hashPassword, User, Manager, Agent, SipConnection, SipNumber, Campaign, CampaignContact, IvrConfig, VoipApiProvider, VoicemailTemplate, VoicemailDropLog } from './db.ts';
 import { authenticate, requireRole, createSession, revokeSession, logAudit, AuthenticatedRequest, getSession } from './auth.ts';
 import { telephony, sipHealth, realtime } from './telephony.ts';
 import { verifyTwilioCredentials, verifySignalWireCredentials } from './twilio.ts';
@@ -1787,7 +1787,7 @@ router.post('/admin/voip-providers/:id/test', authenticate, requireRole(['admin'
         socket.destroy();
         resolve({ success: false, latency: Date.now() - startTime, error: 'Connection timed out (2500ms)' });
       });
-      socket.on('error', (err) => {
+      socket.on('error', (err: any) => {
         socket.destroy();
         resolve({ success: false, latency: Date.now() - startTime, error: err.message });
       });
@@ -2830,6 +2830,8 @@ router.post('/manager/campaigns', authenticate, requireRole(['manager', 'admin']
     customerLanguage,
     autoDetectCustomerLanguage,
     aiBotGreeting,
+    voicemailDropEnabled,
+    voicemailTemplateId,
   } = req.body;
   let { sipConnectionId, callerIdNumber } = req.body;
 
@@ -2972,6 +2974,9 @@ router.post('/manager/campaigns', authenticate, requireRole(['manager', 'admin']
     customerLanguage: finalCustomerLang,
     autoDetectCustomerLanguage: Boolean(autoDetectCustomerLanguage),
     aiBotGreeting: aiBotGreeting || (routingType === 'AI_VOICE_TRANSLATION' ? 'مرحباً، جاري توصيلك بممثل الخدمة' : undefined),
+    voicemailDropEnabled: Boolean(voicemailDropEnabled),
+    voicemailTemplateId: voicemailTemplateId || undefined,
+    voicemailDropCount: 0,
     createdAt: now,
   };
 
@@ -3859,6 +3864,194 @@ router.post('/twilio/dtmf', async (req: Request, res: Response) => {
     await telephony.endCall(call.id, 'COMPLETED', 'Caller ended IVR menu interaction.');
     return res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Thank you for calling Pirates World Tele Solution. Goodbye.</Say><Hangup/></Response>');
   }
+});
+
+// ==========================================
+// 12. VOICEMAIL TEMPLATES & VOICEMAIL DROPS
+// ==========================================
+
+// Get all voicemail templates (Admin sees all, Manager sees system defaults + own)
+router.get('/voicemails', authenticate, requireRole(['admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const data = db.get();
+  const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : undefined);
+  const isSuperAdmin = req.user?.role === 'admin';
+
+  let list = data.voicemail_templates || [];
+  if (!isSuperAdmin && managerId) {
+    list = list.filter((t) => t.managerId === null || t.managerId === managerId);
+  }
+
+  res.json(list);
+});
+
+// Create new voicemail template
+router.post('/voicemails', authenticate, requireRole(['admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const { name, description, type = 'TTS_GENERATED', ttsText, audioUrl, voiceGender = 'FEMALE', voiceLanguage = 'en-US', durationSeconds = 12, isDefault = false } = req.body;
+  if (!name || (!ttsText && !audioUrl)) {
+    return res.status(400).json({ error: 'Name and either TTS script or audio URL are required.' });
+  }
+
+  const isSuperAdmin = req.user?.role === 'admin';
+  const managerId = isSuperAdmin ? (req.body.managerId || null) : (req.managerId || req.user?.id || 'mgr_alpha');
+  const id = `vmt_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+
+  const newTemplate: VoicemailTemplate = {
+    id,
+    managerId,
+    name: name.trim(),
+    description: description?.trim() || undefined,
+    type,
+    ttsText: ttsText?.trim() || undefined,
+    audioUrl: audioUrl?.trim() || undefined,
+    voiceGender,
+    voiceLanguage,
+    durationSeconds: Number(durationSeconds) || 12,
+    isDefault: Boolean(isDefault),
+    enabled: true,
+    createdAt: new Date().toISOString(),
+  };
+
+  await db.update((d) => {
+    d.voicemail_templates = d.voicemail_templates || [];
+    if (newTemplate.isDefault) {
+      d.voicemail_templates.forEach((t) => {
+        if (t.managerId === managerId) t.isDefault = false;
+      });
+    }
+    d.voicemail_templates.unshift(newTemplate);
+  });
+
+  await logAudit(req.user!.username, req.user!.role, 'CREATE_VOICEMAIL', `Voicemail: ${name}`, { id }, req.ip);
+  res.status(201).json(newTemplate);
+});
+
+// Update voicemail template
+router.put('/voicemails/:id', authenticate, requireRole(['admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const { name, description, type, ttsText, audioUrl, voiceGender, voiceLanguage, durationSeconds, isDefault, enabled } = req.body;
+  const isSuperAdmin = req.user?.role === 'admin';
+  const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : undefined);
+
+  const data = db.get();
+  const existing = (data.voicemail_templates || []).find((t) => t.id === id);
+  if (!existing) return res.status(404).json({ error: 'Voicemail template not found.' });
+
+  if (!isSuperAdmin && existing.managerId !== managerId) {
+    return res.status(403).json({ error: 'Cannot modify system default or other manager voicemails.' });
+  }
+
+  await db.update((d) => {
+    const t = (d.voicemail_templates || []).find((item) => item.id === id);
+    if (t) {
+      if (name !== undefined) t.name = name.trim();
+      if (description !== undefined) t.description = description.trim();
+      if (type !== undefined) t.type = type;
+      if (ttsText !== undefined) t.ttsText = ttsText.trim();
+      if (audioUrl !== undefined) t.audioUrl = audioUrl.trim();
+      if (voiceGender !== undefined) t.voiceGender = voiceGender;
+      if (voiceLanguage !== undefined) t.voiceLanguage = voiceLanguage;
+      if (durationSeconds !== undefined) t.durationSeconds = Number(durationSeconds);
+      if (enabled !== undefined) t.enabled = Boolean(enabled);
+      if (isDefault !== undefined && Boolean(isDefault)) {
+        t.isDefault = true;
+        (d.voicemail_templates || []).forEach((other) => {
+          if (other.id !== id && other.managerId === t.managerId) other.isDefault = false;
+        });
+      }
+      t.updatedAt = new Date().toISOString();
+    }
+  });
+
+  await logAudit(req.user!.username, req.user!.role, 'UPDATE_VOICEMAIL', `Voicemail: ${id}`, { name }, req.ip);
+  res.json({ success: true, message: 'Voicemail template updated.' });
+});
+
+// Delete voicemail template
+router.delete('/voicemails/:id', authenticate, requireRole(['admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const { id } = req.params;
+  const isSuperAdmin = req.user?.role === 'admin';
+  const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : undefined);
+
+  const data = db.get();
+  const existing = (data.voicemail_templates || []).find((t) => t.id === id);
+  if (!existing) return res.status(404).json({ error: 'Voicemail template not found.' });
+
+  if (!isSuperAdmin && existing.managerId !== managerId) {
+    return res.status(403).json({ error: 'Cannot delete system default or other manager voicemails.' });
+  }
+
+  await db.update((d) => {
+    d.voicemail_templates = (d.voicemail_templates || []).filter((t) => t.id !== id);
+  });
+
+  await logAudit(req.user!.username, req.user!.role, 'DELETE_VOICEMAIL', `Voicemail: ${id}`, {}, req.ip);
+  res.json({ success: true, message: 'Voicemail template removed.' });
+});
+
+// Get voicemail drop logs (Admin & Manager)
+router.get('/voicemail-drops', authenticate, requireRole(['admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const data = db.get();
+  const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : undefined);
+  const isSuperAdmin = req.user?.role === 'admin';
+
+  let list = data.voicemail_drops || [];
+  if (!isSuperAdmin && managerId) {
+    list = list.filter((d) => d.managerId === managerId);
+  }
+
+  res.json(list.slice(0, 100));
+});
+
+// Instant Voicemail Drop Dispatch (Simulated or Direct Trigger)
+router.post('/voicemail-drops/instant-drop', authenticate, requireRole(['admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const customerNumber = (req.body.customerNumber || req.body.targetNumber || '').trim();
+  const voicemailTemplateId = req.body.voicemailTemplateId || req.body.voicemailId;
+  const callerId = req.body.callerId;
+
+  if (!customerNumber) {
+    return res.status(400).json({ error: 'Customer phone number is required.' });
+  }
+
+  const data = db.get();
+  const template = (data.voicemail_templates || []).find((t) => t.id === voicemailTemplateId) || (data.voicemail_templates || [])[0];
+  if (!template) {
+    return res.status(400).json({ error: 'No active voicemail template available.' });
+  }
+
+  const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : 'mgr_alpha');
+  const mockCallId = `call_drop_${Date.now()}`;
+  const dropId = `vmd_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+  const now = new Date().toISOString();
+
+  const dropRecord: VoicemailDropLog = {
+    id: dropId,
+    callId: mockCallId,
+    managerId,
+    customerNumber: customerNumber.trim(),
+    callerId: callerId || '+18045930160',
+    voicemailId: template.id,
+    voicemailName: template.name,
+    status: 'DELIVERED',
+    triggerReason: 'NO_ANSWER',
+    audioDurationSeconds: template.durationSeconds || 12,
+    timestamp: now,
+    carrierReceipt: `Instant carrier voicemail drop dispatched: ${template.name}`,
+  };
+
+  await db.update((d) => {
+    d.voicemail_drops = d.voicemail_drops || [];
+    d.voicemail_drops.unshift(dropRecord);
+  });
+
+  realtime.broadcast('voicemail.dropped', dropRecord, { managerId });
+  await logAudit(req.user!.username, req.user!.role, 'INSTANT_VOICEMAIL_DROP', `Dropped to: ${customerNumber}`, { template: template.name }, req.ip);
+
+  res.json({
+    success: true,
+    message: `Voicemail "${template.name}" successfully dropped to ${customerNumber}.`,
+    ...dropRecord,
+    drop: dropRecord,
+  });
 });
 
 export default router;

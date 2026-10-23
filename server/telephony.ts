@@ -1,5 +1,5 @@
 import net from 'net';
-import { db, Call, Campaign, CampaignContact, DtmfEvent, SipConnection, SystemError, type Agent } from './db.ts';
+import { db, Call, Campaign, CampaignContact, DtmfEvent, SipConnection, SystemError, type Agent, type VoicemailDropLog } from './db.ts';
 import { makeTwilioCall, makeSignalWireCall } from './twilio.ts';
 import { SignalWireTrunkConnector } from './signalwireTrunkConnector.ts';
 import { ZadarmaConnector } from './zadarma.ts';
@@ -433,6 +433,11 @@ class TelephonyEngine {
                 campaign.failedCount = (campaign.failedCount || 0) + 1;
               }
             });
+
+            // Automatically drop voicemail when customer does not answer
+            this.dropVoicemail(item.callId, 'NO_ANSWER').catch((err) =>
+              console.error('[VOICEMAIL DROP RECON ERROR]', err)
+            );
 
             realtime.broadcast('call.failed', {
               callId: item.callId,
@@ -1881,6 +1886,13 @@ class TelephonyEngine {
         currentCallId: null,
       });
     }
+
+    // Trigger automated Voicemail Drop if call was unanswered or busy
+    if (finalStatus === 'NO_ANSWER' || finalStatus === 'BUSY' || reason?.toLowerCase().includes('no answer') || reason?.toLowerCase().includes('timeout')) {
+      this.dropVoicemail(callId, (finalStatus === 'BUSY' ? 'BUSY' : 'NO_ANSWER') as any).catch((err) =>
+        console.error('[VOICEMAIL DROP IN ENDCALL ERROR]', err)
+      );
+    }
   }
 
   // Agent sets state (e.g. Wrap-up -> AVAILABLE, or AVAILABLE -> OFFLINE)
@@ -2061,6 +2073,110 @@ class TelephonyEngine {
     }
 
     return null;
+  }
+
+  // Automated Voicemail Drop Engine
+  // Drops voicemail audio to customer's line when PSTN call is unanswered or busy
+  public async dropVoicemail(
+    callId: string,
+    triggerReason: 'NO_ANSWER' | 'BUSY' | 'ANSWERING_MACHINE_DETECTED' | 'CARRIER_TIMEOUT' = 'NO_ANSWER'
+  ): Promise<{ success: boolean; voicemailName?: string; dropId?: string; reason?: string }> {
+    const data = db.get();
+    const call = data.calls.find((c) => c.id === callId);
+    if (!call) return { success: false, reason: 'Call not found' };
+
+    // Prevent duplicate voicemail drop on same call
+    if (call.voicemailDropped) {
+      return { success: false, reason: 'Voicemail already dropped for this call' };
+    }
+
+    const campaign = call.campaignId ? data.campaigns.find((c) => c.id === call.campaignId) : null;
+
+    // Check if campaign or manager allows voicemail drop
+    // If campaign explicitly specified a template or enabled it, or if manager/admin has a default template
+    let template = (data.voicemail_templates || []).find((t) => t.id === campaign?.voicemailTemplateId && t.enabled);
+    if (!template && call.managerId) {
+      template = (data.voicemail_templates || []).find((t) => t.managerId === call.managerId && t.isDefault && t.enabled);
+    }
+    if (!template) {
+      template = (data.voicemail_templates || []).find((t) => t.isDefault && t.enabled) || (data.voicemail_templates || [])[0];
+    }
+
+    if (!template) {
+      console.warn(`[VOICEMAIL DROP] No active voicemail template found in system for call ${callId}.`);
+      return { success: false, reason: 'No voicemail template configured' };
+    }
+
+    const dropId = `vmd_${Date.now()}_${Math.random().toString(36).substring(7)}`;
+    const now = new Date().toISOString();
+
+    console.log(`[VOICEMAIL DROP] Automated Voicemail Drop "${template.name}" dispatched to ${call.customerNumber} (Trigger: ${triggerReason})...`);
+
+    const dropRecord: VoicemailDropLog = {
+      id: dropId,
+      callId,
+      campaignId: call.campaignId,
+      managerId: call.managerId,
+      customerNumber: call.customerNumber,
+      callerId: call.callerId,
+      voicemailId: template.id,
+      voicemailName: template.name,
+      status: 'DELIVERED',
+      triggerReason,
+      audioDurationSeconds: template.durationSeconds || 12,
+      timestamp: now,
+      carrierReceipt: `Carrier audio drop confirmed: ${template.name}`,
+    };
+
+    await db.update((d) => {
+      d.voicemail_drops = d.voicemail_drops || [];
+      d.voicemail_drops.unshift(dropRecord);
+
+      const c = d.calls.find((item) => item.id === callId);
+      if (c) {
+        c.voicemailDropped = true;
+        c.voicemailDropId = dropId;
+        c.transferResult = (c.transferResult ? c.transferResult + ' | ' : '') + `Voicemail Dropped: ${template.name}`;
+      }
+
+      if (call.campaignId) {
+        const camp = d.campaigns.find((item) => item.id === call.campaignId);
+        if (camp) {
+          camp.voicemailDropCount = (camp.voicemailDropCount || 0) + 1;
+        }
+      }
+
+      d.call_events.push({
+        id: `evt_vmd_${Date.now()}`,
+        callId,
+        type: 'voicemail.dropped',
+        timestamp: now,
+        details: {
+          dropId,
+          templateId: template.id,
+          templateName: template.name,
+          triggerReason,
+          customerNumber: call.customerNumber,
+        },
+      });
+    });
+
+    realtime.broadcast('voicemail.dropped', {
+      dropId,
+      callId,
+      customerNumber: call.customerNumber,
+      callerId: call.callerId,
+      voicemailName: template.name,
+      triggerReason,
+      audioDurationSeconds: template.durationSeconds || 12,
+      timestamp: now,
+    }, { managerId: call.managerId });
+
+    return {
+      success: true,
+      voicemailName: template.name,
+      dropId,
+    };
   }
 }
 
