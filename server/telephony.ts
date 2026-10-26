@@ -893,6 +893,22 @@ class TelephonyEngine {
       const isAiTranslationMode = campaign.routingType === 'AI_VOICE_TRANSLATION';
       console.log(`[ZADARMA DISPATCH] Placing real PSTN call to ${contact.phoneNumber} (Mode: ${isAiTranslationMode ? 'AI Voice Translation Bot (Zero-IVR)' : 'IVR Menu -> Direct Agent'})...`);
 
+      // Ensure manager's IVR sound is linked to Zadarma Cloud PBX Scenario so the PSTN caller hears it
+      if (!isAiTranslationMode) {
+        const soundToLink = ivr?.zadarmaSoundId || '6acb652e621acf6feb0535e7';
+        try {
+          await ZadarmaConnector.requestApi(
+            '/v1/pbx/ivr/scenario/edit/',
+            { id: '6ac669ac99688ec02e009606', sound_id: soundToLink },
+            { apiKey, apiSecret },
+            'PUT'
+          );
+          console.log(`[ZADARMA PBX IVR] Linked sound '${soundToLink}' (${ivr?.name || 'Manager IVR'}) to PBX scenario 6ac669ac99688ec02e009606`);
+        } catch (linkErr) {
+          console.warn('[ZADARMA PBX IVR] Scenario sound link note:', linkErr);
+        }
+      }
+
       const zadarmaRes = await ZadarmaConnector.dispatchOutboundCall({
         apiKey,
         apiSecret,

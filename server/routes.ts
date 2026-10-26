@@ -3589,7 +3589,16 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
     });
   }
 
-  // If no existing call was matched, create an incoming call record linked to this agent
+  // If no existing call was matched, only ring agent if a DTMF digit was actually pressed or confirmed
+  if (!digit) {
+    return res.json({
+      success: true,
+      message: 'Initial media connection acknowledged. Awaiting DTMF key press from PSTN recipient.',
+      isIvrCall: true,
+      playIvrGreeting: false,
+    });
+  }
+
   const callId = `call_zd_webrtc_${Date.now()}`;
   const effectiveDigit = String(digit || '1').trim();
   await db.update((d) => {

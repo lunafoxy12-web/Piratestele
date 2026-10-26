@@ -292,24 +292,17 @@ export const AgentApp: React.FC = () => {
                       .then((r) => r.json())
                       .then((resData) => {
                         console.log('[WEBRTC INCOMING SYNC RESULT]', resData);
-                        if (resData.isIvrCall && resData.playIvrGreeting) {
-                          // This is an IVR campaign call: Connect WebRTC audio leg immediately so caller hears IVR voice!
-                          setActiveIvrConfig(resData.ivrConfig);
-                          setActiveCall({
-                            id: resData.callId,
-                            callId: resData.callId,
-                            customerNumber: incomingCaller,
-                            callerId: data?.callername || incomingCaller,
-                            sipConnectionId: 'voip_zadarma',
-                            startTime: new Date().toISOString(),
-                            durationSeconds: 0,
-                            status: 'IVR_ACTIVE' as any,
-                            dtmfSequence: '',
-                          });
-                          connectRealPstnAudio();
-                          playIvrGreeting(resData.ivrConfig);
+                        if (resData.isIvrCall) {
+                          if (resData.dtmfDigit || resData.status === 'RINGING') {
+                            // PSTN recipient confirmed DTMF key 1 -> Ring agent with 3s beep & auto-answer!
+                            start3SecondRingBeepAndAutoAnswer(resData.dtmfDigit || '1', resData.callId);
+                          } else {
+                            // IVR call is currently playing greeting on PSTN leg: wait for recipient to press DTMF
+                            console.log('[WEBRTC INCOMING] IVR call active on carrier leg. Awaiting recipient DTMF 1 before ringing agent station.');
+                            if (resData.ivrConfig) setActiveIvrConfig(resData.ivrConfig);
+                          }
                         } else {
-                          // Non-IVR or direct call: Ring agent station with 3s ring beep & auto-connect
+                          // Direct human call (Zero-IVR): Ring agent station with 3s ring beep & auto-connect
                           start3SecondRingBeepAndAutoAnswer('1', resData.callId);
                         }
                       })
@@ -396,17 +389,19 @@ export const AgentApp: React.FC = () => {
         if (data.activeCall && !data.activeCall.endTime) {
           setActiveCall(data.activeCall);
           const isIvr = data.activeCall.status === 'IVR_ACTIVE';
-          const isRinging = data.activeCall.status === 'RINGING';
+          // The agent station should ONLY ring if the call has been bridged to the agent via DTMF or direct transfer
+          const isAgentRinging = (data.agent?.state === 'RINGING' || Boolean(data.activeCall.dtmfSequence)) && data.activeCall.status === 'RINGING';
+
           if (isIvr) {
-            if (!isIvrGreetingPlayingRef.current) {
-              playIvrGreeting(data.ivrConfig);
-            }
-          } else if (isRinging) {
+            setAgentState('AVAILABLE');
+          } else if (isAgentRinging) {
             if (!isAutoAnsweringRef.current) {
               start3SecondRingBeepAndAutoAnswer(data.activeCall.dtmfSequence || '1', data.activeCall.id);
             }
+          } else if (data.activeCall.status === 'BRIDGED') {
+            setAgentState('BUSY');
           } else {
-            setAgentState(data.activeCall.status === 'BRIDGED' ? 'BUSY' : data.agent?.state || 'BUSY');
+            setAgentState(data.agent?.state || 'AVAILABLE');
           }
           // If active call is AI Translation, open Translation Studio automatically
           if (data.activeCall.routingType === 'AI_VOICE_TRANSLATION' || (data.activeCall as any).isDirectTranslationCall) {
@@ -1601,9 +1596,8 @@ export const AgentApp: React.FC = () => {
   const [selectedDisposition, setSelectedDisposition] = useState<string>('Resolved');
 
   const handleCallAction = async (action: 'ANSWER' | 'MUTE' | 'HOLD' | 'SPEAKER' | 'END') => {
-  handleCallActionRef.current = handleCallAction;
     if (!token) return;
-    const currentCall = activeCall || {
+    const currentCall = activeCall || activeCallRef.current || {
       id: latestAgentEvent?.callId || `call_in_${Date.now()}`,
       callId: latestAgentEvent?.callId || `call_in_${Date.now()}`,
       customerNumber: latestAgentEvent?.customerNumber || 'Inbound Caller',
@@ -1853,6 +1847,7 @@ export const AgentApp: React.FC = () => {
       setTimeout(() => setStatusMessage(null), 2500);
     }
   };
+  handleCallActionRef.current = handleCallAction;
 
   const handleCompleteWrapUp = async () => {
     if (activeCall && token) {

@@ -433,18 +433,21 @@ export class ZadarmaConnector {
 
       // 2. Outbound Dispatch: Call PSTN Recipient FIRST (to = targetInternationalTo)
       // When predicted='true', Zadarma dials 'to' (PSTN recipient) FIRST.
-      // Once the PSTN recipient answers:
-      // - IVR Campaign: plays PBX IVR Voice Menu 0 ('from' = '0-1' or menu_id = 0) so the customer hears the IVR greeting.
-      //                 When they press DTMF key 1, Zadarma PBX bridges them to Agent Softphone (Ext 100).
-      // - Direct Mode: connects recipient directly to Agent Softphone ('from' = targetExt).
+      // - IVR Campaign (playIvr: true): 'from' = '0' (Zadarma PBX IVR Voice Menu 0).
+      //   The PSTN recipient answers and hears the manager's configured IVR voice prompt over their physical phone.
+      //   The Agent station DOES NOT ring until the recipient presses DTMF Key 1!
+      //   Upon DTMF Key 1, Zadarma PBX routes to Extension 100 and sends NOTIFY_INTERNAL / NOTIFY_IVR.
+      // - Direct Mode (playIvr: false): 'from' = targetExt (Extension 100).
       if (!res || res.status === 'error') {
         const targetExt = (params.pbxExtension || params.sip || '100').trim();
-        console.log(`[ZADARMA DISPATCH] Calling PSTN recipient ${targetInternationalTo} first -> Connecting to Extension ${targetExt}...`);
+        const shouldPlayIvr = params.playIvr !== false;
+        const originFrom = shouldPlayIvr ? (params.scenarioId || '0').trim() : targetExt;
+
+        console.log(`[ZADARMA DISPATCH] Calling PSTN recipient ${targetInternationalTo} first (Mode: ${shouldPlayIvr ? 'PBX IVR Menu ' + originFrom + ' -> DTMF 1 -> Ext ' + targetExt : 'Direct Ext ' + targetExt})...`);
 
         const callbackParams: Record<string, any> = {
-          from: targetExt,
+          from: originFrom,
           to: targetInternationalTo,
-          sip: targetExt,
           predicted: 'true',
         };
         if (cleanFrom) {
@@ -458,13 +461,12 @@ export class ZadarmaConnector {
           'GET'
         );
 
-        // Fallback to primary SIP login 12707 if extension returned an error
+        // Fallback to primary SIP login 12707 if origin returned an error
         if (!res || res.status === 'error') {
-          console.warn(`[ZADARMA DISPATCH] from=${targetExt} returned error (${res?.message}), trying primary SIP 12707...`);
+          console.warn(`[ZADARMA DISPATCH] from=${originFrom} returned error (${res?.message}), trying secondary routing...`);
           const fallbackParams: Record<string, any> = {
-            from: '12707',
+            from: shouldPlayIvr ? '0-1' : '12707',
             to: targetInternationalTo,
-            sip: '12707',
             predicted: 'true',
           };
           if (cleanFrom) fallbackParams.caller_id = cleanFrom;
