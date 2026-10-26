@@ -3228,16 +3228,51 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
     }
   }
 
-  const currentManager = data.managers.find((m) => m.id === agent?.managerId || m.userId === agent?.userId);
-  const managerPolicy = {
-    allowedRoutingMode: currentManager?.allowedRoutingMode || 'IVR_THEN_DIRECT_AGENT',
-    enforcedAgentLanguage: currentManager?.enforcedAgentLanguage || 'Urdu',
-    enforcedCustomerLanguage: currentManager?.enforcedCustomerLanguage || 'Arabic',
-    allowManagerOverrideLanguages: currentManager?.allowManagerOverrideLanguages !== false,
-    aiTranslationBotVoice: currentManager?.aiTranslationBotVoice || 'Aoede',
-  };
+  let ivrConfig = null;
+  if (activeCall) {
+    const camp = activeCall.campaignId ? data.campaigns.find((c) => c.id === activeCall.campaignId) : null;
+    const ivr = camp?.ivrConfigId
+      ? data.ivr_configs.find((i) => i.id === camp.ivrConfigId)
+      : (data.ivr_configs.find((i) => i.managerId === activeCall.managerId) || data.ivr_configs[0]);
+    if (ivr) {
+      ivrConfig = {
+        id: ivr.id,
+        name: ivr.name,
+        greetingText: ivr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.',
+        audioUrl: ivr.audioUrl || null,
+        audioFileName: ivr.audioFileName || null,
+        timeoutSeconds: ivr.timeoutSeconds || 8,
+        dtmfAgentKey: ivr.options.find((o) => o.action === 'TRANSFER_TO_AGENT')?.key || '1',
+        options: ivr.options || [],
+      };
+    }
+  } else {
+    // Provide manager's default IVR config for pre-buffering
+    const defaultIvr = data.ivr_configs.find((i) => i.managerId === (agent?.managerId || 'mgr_alpha')) || data.ivr_configs[0];
+    if (defaultIvr) {
+      ivrConfig = {
+        id: defaultIvr.id,
+        name: defaultIvr.name,
+        greetingText: defaultIvr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.',
+        audioUrl: defaultIvr.audioUrl || null,
+        audioFileName: defaultIvr.audioFileName || null,
+        timeoutSeconds: defaultIvr.timeoutSeconds || 8,
+        dtmfAgentKey: defaultIvr.options.find((o) => o.action === 'TRANSFER_TO_AGENT')?.key || '1',
+        options: defaultIvr.options || [],
+      };
+    }
+  }
 
-  res.json({ agent, activeCall, activeCallDtmf, managerPolicy });
+  const manager = data.managers.find((m) => m.id === (agent?.managerId || 'mgr_alpha')) || data.managers[0];
+  const managerPolicy = manager ? {
+    allowedRoutingMode: manager.allowedRoutingMode || 'BOTH',
+    enforcedAgentLanguage: manager.enforcedAgentLanguage || 'Urdu',
+    enforcedCustomerLanguage: manager.enforcedCustomerLanguage || 'Arabic',
+    allowManagerOverrideLanguages: Boolean(manager.allowManagerOverrideLanguages),
+    aiTranslationBotVoice: manager.aiTranslationBotVoice || 'Aoede',
+  } : null;
+
+  res.json({ agent, activeCall, activeCallDtmf, managerPolicy, ivrConfig });
 });
 
 // Update Agent Direct PSTN Phone Number for hardware / mobile phone bridging
@@ -3392,10 +3427,10 @@ router.post('/agent/call-notes', authenticate, requireRole(['agent', 'admin', 'm
   res.json({ success: true, message: 'Call notes saved successfully.' });
 });
 
-// Record incoming WebRTC call triggered when Zadarma PBX transfers call to extension 100 after DTMF keypress
+// Record incoming WebRTC call triggered when Zadarma PBX connects to extension 100
 router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const agentId = req.agentId || 'agt_01';
-  const { caller, digit = '1' } = req.body;
+  const { caller, digit } = req.body;
   const data = db.get();
 
   const cleanDigits = (s?: string) => (s ? String(s).replace(/\D/g, '').slice(-10) : '');
@@ -3420,8 +3455,58 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
   const now = new Date().toISOString();
 
   if (call) {
+    const camp = call.campaignId ? data.campaigns.find((c) => c.id === call!.campaignId) : null;
+    const ivr = camp?.ivrConfigId
+      ? data.ivr_configs.find((i) => i.id === camp.ivrConfigId)
+      : (data.ivr_configs.find((i) => i.managerId === call!.managerId) || data.ivr_configs[0]);
+    const isIvrCall = Boolean(call.campaignId && (call as any).routingType !== 'AI_VOICE_TRANSLATION');
+
+    const ivrConfigPayload = ivr ? {
+      id: ivr.id,
+      name: ivr.name,
+      greetingText: ivr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.',
+      audioUrl: ivr.audioUrl || null,
+      audioFileName: ivr.audioFileName || null,
+      timeoutSeconds: ivr.timeoutSeconds || 8,
+      dtmfAgentKey: ivr.options.find((o) => o.action === 'TRANSFER_TO_AGENT')?.key || '1',
+      options: ivr.options || [],
+    } : null;
+
+    // Case A: Initial media connection (NO DTMF digit yet) on an IVR campaign call
+    if (!digit && isIvrCall) {
+      console.log(`[WEBRTC INCOMING] Initial media leg connected for IVR call ${call.id}. Setting status to IVR_ACTIVE to stream manager IVR prompt.`);
+      await db.update((d) => {
+        const c = d.calls.find((item) => item.id === call!.id);
+        if (c) {
+          c.status = 'IVR_ACTIVE';
+          c.answerTime = c.answerTime || now;
+          c.sipResponseCode = 200;
+          c.sipResponseText = '200 OK (PSTN Recipient Answered - Streaming Manager IVR Voice)';
+        }
+      });
+
+      realtime.broadcast('call.ivr_active', {
+        callId: call.id,
+        status: 'IVR_ACTIVE',
+        customerNumber: call.customerNumber,
+        ivrGreetingText: ivrConfigPayload?.greetingText,
+      }, { managerId: call.managerId });
+
+      return res.json({
+        success: true,
+        callId: call.id,
+        status: 'IVR_ACTIVE',
+        isIvrCall: true,
+        playIvrGreeting: true,
+        ivrConfig: ivrConfigPayload,
+        agentId,
+      });
+    }
+
+    // Case B: Real DTMF pressed (or direct zero-IVR call)
+    const effectiveDigit = String(digit || '1').trim();
     const existingSeq = call.dtmfSequence || '';
-    const newSeq = existingSeq ? `${existingSeq}${digit}` : String(digit);
+    const newSeq = existingSeq ? `${existingSeq}${effectiveDigit}` : effectiveDigit;
 
     await db.update((d) => {
       const c = d.calls.find((item) => item.id === call!.id);
@@ -3429,8 +3514,8 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
         c.status = 'RINGING';
         c.agentId = agentId;
         c.dtmfSequence = newSeq;
-        c.transferResult = `DTMF Key ${digit} Pressed: Transferred to Agent Station`;
-        c.ivrResult = `Option ${digit} selected (TRANSFER_TO_AGENT)`;
+        c.transferResult = `DTMF Key ${effectiveDigit} Pressed: Transferred to Agent Station`;
+        c.ivrResult = `Option ${effectiveDigit} selected (TRANSFER_TO_AGENT)`;
       }
 
       const agt = d.agents.find((a) => a.id === agentId);
@@ -3444,7 +3529,7 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
         id: `dtmf_${Date.now()}`,
         callId: call!.id,
         customerPhone: call!.customerNumber || caller || 'PSTN Caller',
-        digit: String(digit),
+        digit: effectiveDigit,
         timestamp: now,
         timeOffsetMs: 0,
         resultingAction: 'TRANSFER_TO_AGENT',
@@ -3456,7 +3541,7 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
         callId: call!.id,
         type: 'dtmf.received',
         timestamp: now,
-        details: { digit: String(digit), target: 'HUMAN_AGENT' },
+        details: { digit: effectiveDigit, target: 'HUMAN_AGENT' },
       });
     });
 
@@ -3467,14 +3552,26 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
       callerId: call.callerId,
       startTime: call.startTime,
       directHumanCall: true,
+      dtmfDigit: effectiveDigit,
+      isTransferredFromIvr: true,
+      transferReason: `Customer pressed DTMF ${effectiveDigit} in IVR menu`,
       dtmfSequence: newSeq,
     });
 
-    return res.json({ success: true, callId: call.id, agentId });
+    return res.json({
+      success: true,
+      callId: call.id,
+      status: 'RINGING',
+      isIvrCall,
+      dtmfDigit: effectiveDigit,
+      ivrConfig: ivrConfigPayload,
+      agentId,
+    });
   }
 
   // If no existing call was matched, create an incoming call record linked to this agent
   const callId = `call_zd_webrtc_${Date.now()}`;
+  const effectiveDigit = String(digit || '1').trim();
   await db.update((d) => {
     d.calls.unshift({
       id: callId,
@@ -3487,9 +3584,9 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
       sipConnectionId: 'voip_zadarma',
       startTime: now,
       durationSeconds: 0,
-      dtmfSequence: String(digit),
-      ivrResult: `Option ${digit} selected (TRANSFER_TO_AGENT)`,
-      transferResult: `DTMF ${digit} Pressed: Transferred to Agent Station`,
+      dtmfSequence: effectiveDigit,
+      ivrResult: `Option ${effectiveDigit} selected (TRANSFER_TO_AGENT)`,
+      transferResult: `DTMF ${effectiveDigit} Pressed: Transferred to Agent Station`,
     });
 
     const agt = d.agents.find((a) => a.id === agentId);
@@ -3503,7 +3600,7 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
       id: `dtmf_${Date.now()}`,
       callId,
       customerPhone: caller || 'PSTN Caller',
-      digit: String(digit),
+      digit: effectiveDigit,
       timestamp: now,
       timeOffsetMs: 0,
       resultingAction: 'TRANSFER_TO_AGENT',
@@ -3518,10 +3615,13 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
     callerId: '+18045930160',
     startTime: now,
     directHumanCall: true,
-    dtmfSequence: String(digit),
+    dtmfDigit: effectiveDigit,
+    isTransferredFromIvr: true,
+    transferReason: `Customer pressed DTMF ${effectiveDigit}`,
+    dtmfSequence: effectiveDigit,
   });
 
-  res.json({ success: true, callId, agentId });
+  res.json({ success: true, callId, agentId, dtmfDigit: effectiveDigit });
 });
 
 // Simulate incoming IVR call transferred to agent after DTMF pressed

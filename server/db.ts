@@ -518,7 +518,7 @@ class DatabaseService {
       maxAgents: 10,
       enabled: true,
       notes: 'Tier-1 outbound campaign team',
-      allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT',
+      allowedRoutingMode: 'BOTH',
       enforcedAgentLanguage: 'Urdu',
       enforcedCustomerLanguage: 'Arabic',
       allowManagerOverrideLanguages: true,

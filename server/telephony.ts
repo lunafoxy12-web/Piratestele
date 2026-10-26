@@ -1449,6 +1449,9 @@ class TelephonyEngine {
       callerId: call.callerId,
       startTime: call.startTime,
       directHumanCall: true,
+      dtmfDigit: call.dtmfSequence || '1',
+      isTransferredFromIvr: true,
+      transferReason: 'PSTN caller pressed DTMF 1 in IVR menu',
     });
 
     realtime.broadcast('agent.state_changed', {

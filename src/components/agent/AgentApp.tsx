@@ -93,6 +93,33 @@ export const AgentApp: React.FC = () => {
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
 
+  // Web Audio Mixer Engine for Zadarma WebRTC Stream
+  const mixerAudioContextRef = useRef<AudioContext | null>(null);
+  const mixerMicGainRef = useRef<GainNode | null>(null);
+  const mixerIvrGainRef = useRef<GainNode | null>(null);
+  const mixerDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
+  const ivrAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const ivrMelodyTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const originalGetUserMediaRef = useRef<((constraints?: MediaStreamConstraints) => Promise<MediaStream>) | null>(null);
+
+  const [isIvrGreetingPlaying, setIsIvrGreetingPlaying] = useState<boolean>(false);
+  const isIvrGreetingPlayingRef = useRef<boolean>(false);
+  isIvrGreetingPlayingRef.current = isIvrGreetingPlaying;
+
+  const [activeIvrConfig, setActiveIvrConfig] = useState<{
+    id?: string;
+    name?: string;
+    greetingText?: string;
+    audioUrl?: string | null;
+    audioFileName?: string | null;
+    dtmfAgentKey?: string;
+    options?: any[];
+  } | null>(null);
+  const activeIvrConfigRef = useRef<any>(null);
+  activeIvrConfigRef.current = activeIvrConfig;
+
+  const handleCallActionRef = useRef<any>(null);
+
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied' | 'requesting'>('prompt');
   const [micAudioLevel, setMicAudioLevel] = useState<number>(0);
   const [micFrequencies, setMicFrequencies] = useState<number[]>([15, 25, 40, 30, 50, 40, 25, 20, 35, 55, 45, 30, 20, 35, 20]);
@@ -132,6 +159,29 @@ export const AgentApp: React.FC = () => {
   activeCallRef.current = activeCall;
   const tokenRef = useRef<string | null>(token);
   tokenRef.current = token;
+
+  // Intercept navigator.mediaDevices.getUserMedia so Zadarma WebRTC engine streams from our Audio Mixer
+  useEffect(() => {
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
+      if (!originalGetUserMediaRef.current) {
+        originalGetUserMediaRef.current = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
+      }
+      navigator.mediaDevices.getUserMedia = async (constraints?: MediaStreamConstraints) => {
+        if (constraints?.audio && !constraints.video) {
+          try {
+            const mixedStream = await initOrGetMixerStream();
+            if (mixedStream) {
+              console.log('[WEBRTC AUDIO MIXER] Successfully routed Web Audio mixed stream into Zadarma WebRTC');
+              return mixedStream;
+            }
+          } catch (e) {
+            console.warn('Mixer stream init note, falling back to standard getUserMedia:', e);
+          }
+        }
+        return originalGetUserMediaRef.current!(constraints);
+      };
+    }
+  }, []);
 
   useEffect(() => {
     let isMounted = true;
@@ -213,22 +263,13 @@ export const AgentApp: React.FC = () => {
                 console.log('[ZADARMA WEBRTC EVENT]', status, data);
 
                 if (status === 'incoming') {
-                  setAgentState('RINGING');
-                  playRingtone();
                   const incomingCaller = data?.caller || 'PSTN Customer';
-                  setActiveCall((prev) => ({
-                    id: prev?.id || `call_zd_${Date.now()}`,
-                    callId: prev?.callId || `call_zd_${Date.now()}`,
-                    customerNumber: incomingCaller,
-                    callerId: data?.callername || incomingCaller,
-                    sipConnectionId: 'voip_zadarma',
-                    startTime: new Date().toISOString(),
-                    durationSeconds: 0,
-                    status: 'RINGING',
-                    dtmfSequence: prev?.dtmfSequence || '1',
-                  }));
+                  console.log('[ZADARMA WEBRTC] Inbound media connection from caller:', incomingCaller);
 
-                  // Sync immediately with backend so DB records DTMF '1' & assigns call to agent
+                  // Connect audio leg so media stream flows between browser and Zadarma PBX
+                  connectRealPstnAudio();
+
+                  // Query backend WITHOUT sending fake DTMF digit to verify if this is an IVR call
                   if (token) {
                     fetch('/api/agent/webrtc-incoming', {
                       method: 'POST',
@@ -239,15 +280,53 @@ export const AgentApp: React.FC = () => {
                       body: JSON.stringify({
                         caller: data?.caller,
                         callerName: data?.callername,
-                        digit: '1',
                       }),
-                    }).catch((err) => console.warn('[SYNC WEBRTC INCOMING NOTE]', err));
+                    })
+                      .then((r) => r.json())
+                      .then((resData) => {
+                        console.log('[WEBRTC INCOMING SYNC RESULT]', resData);
+                        if (resData.isIvrCall && resData.playIvrGreeting) {
+                          // This is an IVR campaign call: Stream manager IVR voice to caller!
+                          setActiveIvrConfig(resData.ivrConfig);
+                          setActiveCall({
+                            id: resData.callId,
+                            callId: resData.callId,
+                            customerNumber: incomingCaller,
+                            callerId: data?.callername || incomingCaller,
+                            sipConnectionId: 'voip_zadarma',
+                            startTime: new Date().toISOString(),
+                            durationSeconds: 0,
+                            status: 'IVR_ACTIVE' as any,
+                            dtmfSequence: '',
+                          });
+                          playIvrGreeting(resData.ivrConfig);
+                        } else {
+                          // Non-IVR or direct call: Ring agent station & auto-answer with chime
+                          setAgentState('RINGING');
+                          setActiveCall({
+                            id: resData.callId || `call_zd_${Date.now()}`,
+                            callId: resData.callId || `call_zd_${Date.now()}`,
+                            customerNumber: incomingCaller,
+                            callerId: data?.callername || incomingCaller,
+                            sipConnectionId: 'voip_zadarma',
+                            startTime: new Date().toISOString(),
+                            durationSeconds: 0,
+                            status: 'RINGING',
+                            dtmfSequence: '1',
+                          });
+                          playConnectBeep();
+                          setTimeout(() => {
+                            handleCallActionRef.current?.('ANSWER');
+                          }, 100);
+                        }
+                      })
+                      .catch((err) => console.warn('[SYNC WEBRTC INCOMING NOTE]', err));
                   }
-
-                  if (autoAnswer) {
-                    setTimeout(() => {
-                      connectRealPstnAudio();
-                    }, 600);
+                } else if (status === 'dtmf' || data?.key || data?.dtmf) {
+                  const digit = String(data?.key || data?.dtmf || data?.digit || '1').trim();
+                  console.log('[ZADARMA WEBRTC DTMF DETECTED]', digit);
+                  if (digit === '1') {
+                    handleDtmfOnePressed('1');
                   }
                 } else if (status === 'confirmed' || status === 'talking') {
                   if (isMounted) setWebrtcStatus('CALL_ACTIVE');
@@ -325,13 +404,20 @@ export const AgentApp: React.FC = () => {
         const data = await res.json();
         if (data.activeCall && !data.activeCall.endTime) {
           setActiveCall(data.activeCall);
+          const isIvr = data.activeCall.status === 'IVR_ACTIVE';
           const isRinging = data.activeCall.status === 'RINGING';
-          setAgentState(isRinging ? 'RINGING' : 'BUSY');
-          if (isRinging) {
+          if (isIvr) {
+            if (!isIvrGreetingPlayingRef.current) {
+              playIvrGreeting(data.ivrConfig);
+            }
+          } else if (isRinging) {
+            setAgentState('RINGING');
             playConnectBeep();
             setTimeout(() => {
-              handleCallAction('ANSWER');
+              handleCallActionRef.current?.('ANSWER');
             }, 100);
+          } else {
+            setAgentState(data.activeCall.status === 'BRIDGED' ? 'BUSY' : data.agent?.state || 'BUSY');
           }
           // If active call is AI Translation, open Translation Studio automatically
           if (data.activeCall.routingType === 'AI_VOICE_TRANSLATION' || (data.activeCall as any).isDirectTranslationCall) {
@@ -342,6 +428,9 @@ export const AgentApp: React.FC = () => {
         } else {
           setActiveCall(null);
           setAgentState(data.agent?.state || 'AVAILABLE');
+        }
+        if (data.ivrConfig) {
+          setActiveIvrConfig(data.ivrConfig);
         }
         if (data.activeCallDtmf) {
           setActiveCallDtmf(data.activeCallDtmf);
@@ -411,6 +500,220 @@ export const AgentApp: React.FC = () => {
     }
   };
 
+  // Initialize or get Web Audio Mixed Stream (isolates mic during IVR; streams manager voice)
+  const initOrGetMixerStream = async (): Promise<MediaStream | null> => {
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return null;
+      if (!mixerAudioContextRef.current) {
+        mixerAudioContextRef.current = new AudioCtx({ sampleRate: 48000 });
+      }
+      const ctx = mixerAudioContextRef.current;
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
+      if (!mixerDestinationRef.current) {
+        mixerDestinationRef.current = ctx.createMediaStreamDestination();
+      }
+      if (!mixerMicGainRef.current) {
+        mixerMicGainRef.current = ctx.createGain();
+        mixerMicGainRef.current.gain.setValueAtTime(isIvrGreetingPlayingRef.current ? 0 : 1.0, ctx.currentTime);
+        mixerMicGainRef.current.connect(mixerDestinationRef.current);
+      }
+      if (!mixerIvrGainRef.current) {
+        mixerIvrGainRef.current = ctx.createGain();
+        mixerIvrGainRef.current.gain.setValueAtTime(isIvrGreetingPlayingRef.current ? 1.0 : 0.0, ctx.currentTime);
+        mixerIvrGainRef.current.connect(mixerDestinationRef.current);
+      }
+
+      // If physical mic not yet connected into mixerMicGainRef, connect it now using native getUserMedia
+      if (!localStreamRef.current && originalGetUserMediaRef.current) {
+        try {
+          const micStream = await originalGetUserMediaRef.current({
+            audio: {
+              echoCancellation: true,
+              noiseSuppression: true,
+              autoGainControl: true,
+            },
+          });
+          localStreamRef.current = micStream;
+          const micSource = ctx.createMediaStreamSource(micStream);
+          micSource.connect(mixerMicGainRef.current);
+        } catch (e) {
+          console.warn('Physical mic capture for mixer note:', e);
+        }
+      }
+      return mixerDestinationRef.current.stream;
+    } catch (e) {
+      console.warn('initOrGetMixerStream error:', e);
+      return null;
+    }
+  };
+
+  const stopIvrGreetingAudioOnly = () => {
+    if (ivrAudioSourceRef.current) {
+      try {
+        ivrAudioSourceRef.current.stop();
+        ivrAudioSourceRef.current.disconnect();
+      } catch {}
+      ivrAudioSourceRef.current = null;
+    }
+    if (ivrMelodyTimerRef.current) {
+      clearInterval(ivrMelodyTimerRef.current);
+      ivrMelodyTimerRef.current = null;
+    }
+    if ('speechSynthesis' in window) {
+      try {
+        window.speechSynthesis.cancel();
+      } catch {}
+    }
+  };
+
+  const stopIvrGreeting = () => {
+    setIsIvrGreetingPlaying(false);
+    stopIvrGreetingAudioOnly();
+
+    // Re-enable agent microphone into WebRTC channel immediately
+    if (mixerMicGainRef.current && mixerAudioContextRef.current) {
+      mixerMicGainRef.current.gain.setValueAtTime(isMuted ? 0 : 1.0, mixerAudioContextRef.current.currentTime);
+    }
+    if (mixerIvrGainRef.current && mixerAudioContextRef.current) {
+      mixerIvrGainRef.current.gain.setValueAtTime(0, mixerAudioContextRef.current.currentTime);
+    }
+  };
+
+  const playIvrTonePrompt = (text: string, ctx: AudioContext) => {
+    try {
+      if ('speechSynthesis' in window && text) {
+        window.speechSynthesis.cancel();
+        const utt = new SpeechSynthesisUtterance(text);
+        utt.rate = 1.0;
+        utt.pitch = 1.0;
+        window.speechSynthesis.speak(utt);
+      }
+
+      const playMelodyCycle = () => {
+        if (!mixerIvrGainRef.current || !mixerAudioContextRef.current) return;
+        const c = mixerAudioContextRef.current;
+        const now = c.currentTime;
+        const notes = [523.25, 659.25, 783.99, 1046.5]; // C5, E5, G5, C6
+        notes.forEach((freq, idx) => {
+          const osc = c.createOscillator();
+          const g = c.createGain();
+          osc.type = 'sine';
+          osc.frequency.setValueAtTime(freq, now + idx * 0.18);
+          g.gain.setValueAtTime(0.2, now + idx * 0.18);
+          g.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.18 + 0.35);
+          osc.connect(g);
+          g.connect(mixerIvrGainRef.current!);
+          osc.start(now + idx * 0.18);
+          osc.stop(now + idx * 0.18 + 0.35);
+        });
+      };
+
+      playMelodyCycle();
+      ivrMelodyTimerRef.current = setInterval(playMelodyCycle, 6000);
+    } catch (e) {
+      console.warn('IVR tone prompt note:', e);
+    }
+  };
+
+  // Play manager's configured IVR voice prompt into WebRTC audio leg towards PSTN receiver
+  const playIvrGreeting = async (config?: any) => {
+    try {
+      setIsIvrGreetingPlaying(true);
+      if (config) setActiveIvrConfig(config);
+
+      const ctx = mixerAudioContextRef.current || new (window.AudioContext || (window as any).webkitAudioContext)();
+      mixerAudioContextRef.current = ctx;
+      if (ctx.state === 'suspended') await ctx.resume().catch(() => {});
+
+      if (!mixerDestinationRef.current) {
+        mixerDestinationRef.current = ctx.createMediaStreamDestination();
+      }
+      if (!mixerMicGainRef.current) {
+        mixerMicGainRef.current = ctx.createGain();
+        mixerMicGainRef.current.connect(mixerDestinationRef.current);
+      }
+      if (!mixerIvrGainRef.current) {
+        mixerIvrGainRef.current = ctx.createGain();
+        mixerIvrGainRef.current.connect(mixerDestinationRef.current);
+      }
+
+      // 1. Isolate agent mic so caller only hears manager's IVR greeting
+      mixerMicGainRef.current.gain.setValueAtTime(0, ctx.currentTime);
+      // 2. Open IVR channel
+      mixerIvrGainRef.current.gain.setValueAtTime(1.0, ctx.currentTime);
+
+      // 3. Stop previous sources
+      stopIvrGreetingAudioOnly();
+
+      const audioUrl = config?.audioUrl;
+      const greetingText = config?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+
+      console.log('[IVR AUDIO ENGINE] Streaming manager IVR voice to PSTN caller:', { audioUrl, greetingText });
+
+      // Path A: Manager uploaded an audio recording
+      if (audioUrl) {
+        try {
+          const res = await fetch(audioUrl);
+          if (res.ok) {
+            const buf = await res.arrayBuffer();
+            const decoded = await ctx.decodeAudioData(buf);
+            const source = ctx.createBufferSource();
+            source.buffer = decoded;
+            source.loop = true;
+            source.connect(mixerIvrGainRef.current);
+            source.start(ctx.currentTime);
+            ivrAudioSourceRef.current = source;
+            return;
+          }
+        } catch (audioErr) {
+          console.warn('Audio URL playback failed, falling back to TTS synthesis:', audioErr);
+        }
+      }
+
+      // Path B: Synthesize manager greeting text via backend TTS (Google AI voice)
+      try {
+        const ttsRes = await fetch('/api/translation/synthesize', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            text: greetingText,
+            language: 'English',
+            voice: 'Aoede',
+          }),
+        });
+        if (ttsRes.ok) {
+          const data = await ttsRes.json();
+          if (data.audioBase64) {
+            const binaryString = window.atob(data.audioBase64);
+            const bytes = new Uint8Array(binaryString.length);
+            for (let i = 0; i < binaryString.length; i++) {
+              bytes[i] = binaryString.charCodeAt(i);
+            }
+            const decoded = await ctx.decodeAudioData(bytes.buffer.slice(0));
+            const source = ctx.createBufferSource();
+            source.buffer = decoded;
+            source.loop = true;
+            source.connect(mixerIvrGainRef.current);
+            source.start(ctx.currentTime);
+            ivrAudioSourceRef.current = source;
+            return;
+          }
+        }
+      } catch (ttsErr) {
+        console.warn('TTS API synthesis note:', ttsErr);
+      }
+
+      // Path C: Audio melody prompt fallback into WebRTC channel
+      playIvrTonePrompt(greetingText, ctx);
+    } catch (err) {
+      console.warn('playIvrGreeting error:', err);
+    }
+  };
+
+  // Dual-Tone Harmonic Connect Chime Beep (Fired upon DTMF keypress for instant auto-answer confirmation)
   const playConnectBeep = () => {
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
@@ -418,24 +721,93 @@ export const AgentApp: React.FC = () => {
       const ctx = new AudioCtx();
       if (ctx.state === 'suspended') ctx.resume();
 
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
+      const now = ctx.currentTime;
 
-      osc.type = 'sine';
-      osc.frequency.setValueAtTime(880, ctx.currentTime);
-      osc.frequency.setValueAtTime(1174.66, ctx.currentTime + 0.1);
+      // Tone 1: 880 Hz (A5) -> 1318.5 Hz (E6)
+      const osc1 = ctx.createOscillator();
+      const gain1 = ctx.createGain();
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(880, now);
+      osc1.frequency.exponentialRampToValueAtTime(1318.5, now + 0.18);
+      gain1.gain.setValueAtTime(0.45, now);
+      gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.38);
+      osc1.connect(gain1);
+      gain1.connect(ctx.destination);
 
-      gain.gain.setValueAtTime(0.35, ctx.currentTime);
-      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+      // Tone 2: 1318.5 Hz -> 1760 Hz (A6 shimmer)
+      const osc2 = ctx.createOscillator();
+      const gain2 = ctx.createGain();
+      osc2.type = 'triangle';
+      osc2.frequency.setValueAtTime(1318.5, now + 0.08);
+      osc2.frequency.setValueAtTime(1760, now + 0.22);
+      gain2.gain.setValueAtTime(0.25, now + 0.08);
+      gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.42);
+      osc2.connect(gain2);
+      gain2.connect(ctx.destination);
 
-      osc.connect(gain);
-      gain.connect(ctx.destination);
-
-      osc.start(ctx.currentTime);
-      osc.stop(ctx.currentTime + 0.4);
+      osc1.start(now);
+      osc1.stop(now + 0.38);
+      osc2.start(now + 0.08);
+      osc2.stop(now + 0.42);
+      console.log('[AGENT DASHBOARD] Played DTMF auto-answer connect chime beep!');
     } catch (e) {
       console.warn('[CONNECT BEEP NOTE]', e);
     }
+  };
+
+  // PSTN Receiver pressed DTMF Key 1 -> Auto Answer immediately with beep sound (Zero clicks required)
+  const handleDtmfOnePressed = (digit: string = '1') => {
+    console.log(`[AGENT AUTO-ANSWER] PSTN Receiver pressed DTMF [${digit}]! Auto-answering call immediately with beep sound...`);
+    stopIvrGreeting();
+    playConnectBeep();
+
+    setAgentState('BUSY');
+    setActiveCall((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        status: 'BRIDGED',
+        dtmfSequence: prev.dtmfSequence ? `${prev.dtmfSequence}${digit}` : digit,
+      };
+    });
+
+    setActiveCallDtmf((prev) => [
+      ...prev,
+      {
+        id: `dtmf_${Date.now()}`,
+        callId: activeCallRef.current?.id || '',
+        customerPhone: activeCallRef.current?.customerNumber || 'PSTN Receiver',
+        digit,
+        timestamp: new Date().toISOString(),
+        timeOffsetMs: 0,
+        resultingAction: 'TRANSFER_TO_AGENT',
+        sequenceNumber: prev.length + 1,
+      },
+    ]);
+
+    // Send DTMF 1 event to backend to sync call state & transfer
+    if (token && activeCallRef.current?.id) {
+      fetch('/api/agent/webrtc-incoming', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          caller: activeCallRef.current.customerNumber,
+          digit,
+        }),
+      }).catch(() => {});
+    }
+
+    // Auto-answer line without requiring user to click any button
+    connectRealPstnAudio();
+    if (handleCallActionRef.current) {
+      handleCallActionRef.current('ANSWER');
+    }
+
+    setStatusMessage(`PSTN receiver pressed DTMF [${digit}]! Call auto-answered.`);
+    setTimeout(() => setStatusMessage(null), 5000);
   };
 
   const stopRingtone = () => {
@@ -456,33 +828,38 @@ export const AgentApp: React.FC = () => {
     if (!latestAgentEvent) return;
 
     if (latestAgentEvent.type === 'incoming') {
-      setAgentState('RINGING');
-      setActiveCall({
-        id: latestAgentEvent.callId,
-        callId: latestAgentEvent.callId,
-        customerNumber: latestAgentEvent.customerNumber,
-        callerId: latestAgentEvent.callerId,
-        sipConnectionId: '',
-        startTime: latestAgentEvent.startTime,
-        durationSeconds: 0,
-        status: 'RINGING',
-        dtmfSequence: '',
-      });
-      // Fetch DTMF sequence for this incoming call
-      if (token && latestAgentEvent.callId) {
-        fetch(`/api/agent/active-call-dtmf/${latestAgentEvent.callId}`, {
-          headers: { Authorization: `Bearer ${token}` },
-        })
-          .then((r) => r.json())
-          .then((events) => {
-            if (Array.isArray(events)) setActiveCallDtmf(events);
+      if (latestAgentEvent.isTransferredFromIvr || latestAgentEvent.dtmfDigit === '1') {
+        console.log('[SSE EVENT] DTMF 1 pressed by PSTN caller via IVR transfer. Auto-answering...');
+        handleDtmfOnePressed(latestAgentEvent.dtmfDigit || '1');
+      } else {
+        setAgentState('RINGING');
+        setActiveCall({
+          id: latestAgentEvent.callId,
+          callId: latestAgentEvent.callId,
+          customerNumber: latestAgentEvent.customerNumber,
+          callerId: latestAgentEvent.callerId,
+          sipConnectionId: '',
+          startTime: latestAgentEvent.startTime,
+          durationSeconds: 0,
+          status: 'RINGING',
+          dtmfSequence: '',
+        });
+        // Fetch DTMF sequence for this incoming call
+        if (token && latestAgentEvent.callId) {
+          fetch(`/api/agent/active-call-dtmf/${latestAgentEvent.callId}`, {
+            headers: { Authorization: `Bearer ${token}` },
           })
-          .catch(() => {});
+            .then((r) => r.json())
+            .then((events) => {
+              if (Array.isArray(events)) setActiveCallDtmf(events);
+            })
+            .catch(() => {});
+        }
+        playConnectBeep();
+        setTimeout(() => {
+          handleCallActionRef.current?.('ANSWER');
+        }, 100);
       }
-      playConnectBeep();
-      setTimeout(() => {
-        handleCallAction('ANSWER');
-      }, 100);
     } else if (latestAgentEvent.type === 'state_changed') {
       if (!user?.agentId || latestAgentEvent.agentId === user?.agentId || latestAgentEvent.currentCallId === activeCall?.id) {
         setAgentState(latestAgentEvent.state);
@@ -592,6 +969,11 @@ export const AgentApp: React.FC = () => {
         if (prev.some((e) => e.id === latestForCall.id)) return prev;
         return [...prev, latestForCall].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
       });
+
+      // Auto-answer line if customer pressed DTMF 1 while in IVR or waiting
+      if (latestForCall.digit === '1') {
+        handleDtmfOnePressed('1');
+      }
     }
   }, [liveDtmfEvents, activeCall]);
 
@@ -1127,6 +1509,7 @@ export const AgentApp: React.FC = () => {
   const [selectedDisposition, setSelectedDisposition] = useState<string>('Resolved');
 
   const handleCallAction = async (action: 'ANSWER' | 'MUTE' | 'HOLD' | 'SPEAKER' | 'END') => {
+  handleCallActionRef.current = handleCallAction;
     if (!token) return;
     const currentCall = activeCall || {
       id: latestAgentEvent?.callId || `call_in_${Date.now()}`,
@@ -1644,6 +2027,63 @@ export const AgentApp: React.FC = () => {
             <span>AGENT STATUS: {agentState}</span>
           </div>
         </div>
+
+        {/* STATE: IVR_ACTIVE (MANAGER'S IVR VOICE PROMPT PLAYING TO PSTN CALLER) */}
+        {(activeCall?.status === 'IVR_ACTIVE' || isIvrGreetingPlaying) && activeCall?.status !== 'BRIDGED' && agentState !== 'BUSY' && (
+          <div className="bg-gradient-to-br from-indigo-50 to-purple-50 border-2 border-indigo-400 rounded-2xl p-6 sm:p-8 space-y-5 max-w-lg mx-auto shadow-lg text-center animate-fade-in">
+            <div className="w-16 h-16 bg-indigo-600 text-white rounded-full flex items-center justify-center mx-auto shadow-md animate-pulse">
+              <Headphones className="w-8 h-8" />
+            </div>
+
+            <div>
+              <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-100 text-indigo-900 text-xs font-bold uppercase tracking-wider mb-2 border border-indigo-200">
+                <Radio className="w-3.5 h-3.5 text-indigo-600 animate-ping" />
+                <span>IVR Voice Prompt Streaming to Customer</span>
+              </div>
+              <div className="text-2xl font-black text-slate-900 font-mono">
+                {activeCall?.customerNumber || 'PSTN Recipient'}
+              </div>
+              <div className="text-xs text-slate-600 mt-1">
+                Line Connected &middot; Agent microphone isolated so customer only hears manager IVR greeting
+              </div>
+            </div>
+
+            <div className="bg-white/90 border border-indigo-200 rounded-xl p-4 text-left space-y-2 shadow-xs">
+              <div className="flex items-center justify-between text-xs">
+                <span className="font-bold text-indigo-950 flex items-center gap-1.5">
+                  <Volume2 className="w-4 h-4 text-indigo-600" />
+                  Manager IVR Greeting Voice
+                </span>
+                <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full">
+                  STREAMING LIVE
+                </span>
+              </div>
+              <p className="text-xs text-slate-700 italic border-l-2 border-indigo-400 pl-2.5 py-1">
+                "{activeIvrConfig?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.'}"
+              </p>
+              <div className="text-[11px] text-slate-500 flex items-center gap-1.5 pt-1">
+                <Sparkles className="w-3.5 h-3.5 text-amber-500" />
+                <span>Customer is listening to voice prompt. Waiting for DTMF key [1] press...</span>
+              </div>
+            </div>
+
+            <div className="pt-2 space-y-3">
+              <button
+                type="button"
+                onClick={() => handleDtmfOnePressed('1')}
+                className="w-full bg-gradient-to-r from-emerald-600 to-teal-600 hover:from-emerald-700 hover:to-teal-700 text-white font-bold py-3.5 px-4 rounded-xl shadow-md transition-all flex items-center justify-center gap-2 cursor-pointer text-sm"
+              >
+                <PhoneCall className="w-4 h-4" />
+                <span>Simulate PSTN Receiver Pressing [1] &rarr; Auto-Answer Line</span>
+              </button>
+
+              <div className="text-[11px] text-slate-500 flex items-center justify-center gap-1.5">
+                <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
+                <span>Auto-answers with chime beep instantly upon DTMF 1 keypress (zero clicks needed)</span>
+              </div>
+            </div>
+          </div>
+        )}
 
         {/* STATE 1: RINGING (INCOMING BRIDGED CALL) */}
         {(agentState === 'RINGING' || (activeCall && !activeCall.endTime && activeCall.status === 'RINGING')) && activeCall?.status !== 'BRIDGED' && (
