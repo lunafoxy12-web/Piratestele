@@ -415,6 +415,17 @@ export interface DatabaseSchema {
   voicemail_drops: VoicemailDropLog[];
   firewall_rules: FirewallWhitelistRule[];
   firewall_settings: FirewallSettings;
+  sessions?: SessionRecord[];
+}
+
+export interface SessionRecord {
+  token: string;
+  userId: string;
+  role: 'admin' | 'manager' | 'agent' | 'customer';
+  managerId?: string;
+  agentId?: string;
+  createdAt: number;
+  expiresAt: number;
 }
 
 // Password hashing utility using native crypto
@@ -831,6 +842,7 @@ class DatabaseService {
         rtpPortRange: '10000-20000',
         lastUpdated: new Date().toISOString(),
       },
+      sessions: [],
     };
   }
 
@@ -853,6 +865,7 @@ class DatabaseService {
           voicemail_drops: parsed.voicemail_drops || [],
           firewall_rules: parsed.firewall_rules || this.getDefaultSchema().firewall_rules,
           firewall_settings: parsed.firewall_settings || this.getDefaultSchema().firewall_settings,
+          sessions: Array.isArray(parsed.sessions) ? parsed.sessions.filter((s: any) => s.expiresAt > Date.now()) : [],
         };
 
         // Ensure Mr-Pirate admin user always exists and credentials match requirement
@@ -924,31 +937,34 @@ class DatabaseService {
     }
   }
 
-  // Atomic write to prevent file corruption
-  public async save(): Promise<void> {
-    if (this.saveLock) {
-      this.pendingSave = true;
-      return;
-    }
+  private savePromise: Promise<void> = Promise.resolve();
 
-    this.saveLock = true;
-    try {
-      if (!fs.existsSync(DATA_DIR)) {
-        await fs.promises.mkdir(DATA_DIR, { recursive: true });
-      }
-      const tempFile = `${DB_FILE}.${Date.now()}.${Math.random().toString(36).substring(7)}.tmp`;
-      const payload = JSON.stringify(this.data, null, 2);
-      await fs.promises.writeFile(tempFile, payload, 'utf-8');
-      await fs.promises.rename(tempFile, DB_FILE);
-    } catch (err) {
-      console.error('Error persisting database:', err);
-    } finally {
-      this.saveLock = false;
-      if (this.pendingSave) {
-        this.pendingSave = false;
-        await this.save();
-      }
-    }
+  // Sequential atomic queue write ensuring every save is fully committed to disk without data loss
+  public save(): Promise<void> {
+    this.savePromise = this.savePromise
+      .catch(() => {})
+      .then(async () => {
+        try {
+          if (!fs.existsSync(DATA_DIR)) {
+            await fs.promises.mkdir(DATA_DIR, { recursive: true });
+          }
+          const payload = JSON.stringify(this.data, null, 2);
+          const tempFile = `${DB_FILE}.${Date.now()}.${Math.random().toString(36).substring(7)}.tmp`;
+          try {
+            await fs.promises.writeFile(tempFile, payload, 'utf-8');
+            await fs.promises.rename(tempFile, DB_FILE);
+          } catch (renameErr) {
+            // Direct write fallback if atomic rename encounters EXDEV or virtual file lock
+            await fs.promises.writeFile(DB_FILE, payload, 'utf-8');
+            try {
+              if (fs.existsSync(tempFile)) await fs.promises.unlink(tempFile);
+            } catch {}
+          }
+        } catch (err) {
+          console.error('Error persisting database:', err);
+        }
+      });
+    return this.savePromise;
   }
 
   private saveSync(): void {

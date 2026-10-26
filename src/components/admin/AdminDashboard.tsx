@@ -122,6 +122,9 @@ export const AdminDashboard: React.FC = () => {
 
   // Modals
   const [showCreateManagerModal, setShowCreateManagerModal] = useState<boolean>(false);
+  const [managerToReset, setManagerToReset] = useState<ManagerItem | null>(null);
+  const [newPasswordInput, setNewPasswordInput] = useState<string>('');
+  const [isResettingPassword, setIsResettingPassword] = useState<boolean>(false);
   const [showManagerPolicyModal, setShowManagerPolicyModal] = useState<boolean>(false);
   const [selectedManagerForPolicy, setSelectedManagerForPolicy] = useState<ManagerItem | null>(null);
   const [policyForm, setPolicyForm] = useState({
@@ -380,12 +383,38 @@ export const AdminDashboard: React.FC = () => {
         return;
       }
 
-      showNotification('success', `Manager '${managerForm.name}' created with limit of ${managerForm.maxAgents} agents.`);
+      showNotification('success', `Manager '${managerForm.name}' created! Username: @${managerForm.username} | Password: ${managerForm.password}`);
       setShowCreateManagerModal(false);
       setManagerForm({ name: '', username: '', password: '', email: '', maxAgents: 10, notes: '', assignedVoipIds: [], assignedSipIds: [] });
       fetchData();
     } catch (err: any) {
       showNotification('error', err.message);
+    }
+  };
+
+  const handleResetManagerPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!managerToReset || !token || !newPasswordInput.trim()) return;
+    setIsResettingPassword(true);
+    try {
+      const res = await fetch(`/api/admin/managers/${managerToReset.id}/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ newPassword: newPasswordInput.trim() }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showNotification('success', data.message || `Password for ${managerToReset.name} reset successfully.`);
+        setManagerToReset(null);
+        setNewPasswordInput('');
+        fetchData();
+      } else {
+        showNotification('error', data.error || 'Failed to reset password.');
+      }
+    } catch (err: any) {
+      showNotification('error', err.message);
+    } finally {
+      setIsResettingPassword(false);
     }
   };
 
@@ -1410,24 +1439,35 @@ export const AdminDashboard: React.FC = () => {
                           {mgr.enabled ? 'Enabled' : 'Disabled'}
                         </span>
                       </td>
-                    <td className="py-3 px-4 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        <button
-                          onClick={() => handleToggleManager(mgr)}
-                          className="text-xs p-1.5 rounded hover:bg-slate-200 text-slate-700 transition-colors"
-                          title={mgr.enabled ? 'Disable Manager' : 'Enable Manager'}
-                        >
-                          {mgr.enabled ? <UserX className="w-4 h-4 text-amber-700" /> : <UserCheck className="w-4 h-4 text-emerald-700" />}
-                        </button>
-                        <button
-                          onClick={() => handleDeleteManager(mgr.id, mgr.name)}
-                          className="text-xs p-1.5 rounded hover:bg-red-100 text-red-600 transition-colors"
-                          title="Delete Manager"
-                        >
-                          <Trash2 className="w-4 h-4" />
-                        </button>
-                      </div>
-                    </td>
+                      <td className="py-3 px-4 text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setManagerToReset(mgr);
+                              setNewPasswordInput('');
+                            }}
+                            className="text-xs p-1.5 rounded hover:bg-blue-100 text-blue-700 transition-colors"
+                            title="Reset Manager Password"
+                          >
+                            <Key className="w-4 h-4" />
+                          </button>
+                          <button
+                            onClick={() => handleToggleManager(mgr)}
+                            className="text-xs p-1.5 rounded hover:bg-slate-200 text-slate-700 transition-colors"
+                            title={mgr.enabled ? 'Disable Manager' : 'Enable Manager'}
+                          >
+                            {mgr.enabled ? <UserX className="w-4 h-4 text-amber-700" /> : <UserCheck className="w-4 h-4 text-emerald-700" />}
+                          </button>
+                          <button
+                            onClick={() => handleDeleteManager(mgr.id, mgr.name)}
+                            className="text-xs p-1.5 rounded hover:bg-red-100 text-red-600 transition-colors"
+                            title="Delete Manager"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </td>
                   </tr>
                 );
               })}
@@ -3420,6 +3460,63 @@ export const AdminDashboard: React.FC = () => {
                   className="px-4 py-2 bg-blue-700 hover:bg-blue-800 text-white text-xs font-semibold rounded-lg shadow-sm"
                 >
                   Create Manager
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: RESET MANAGER PASSWORD */}
+      {managerToReset && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-6 space-y-4 border border-slate-200 my-8">
+            <div className="flex items-center justify-between pb-2 border-b border-slate-100">
+              <div className="flex items-center gap-2">
+                <Key className="w-5 h-5 text-blue-700" />
+                <h3 className="text-lg font-bold text-slate-900">Reset Manager Password</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setManagerToReset(null)}
+                className="text-slate-400 hover:text-slate-600 text-sm font-bold"
+              >
+                &times;
+              </button>
+            </div>
+
+            <p className="text-xs text-slate-600">
+              Set a new login password for manager <strong>{managerToReset.name}</strong> (@{managerToReset.username}). Account will automatically be enabled.
+            </p>
+
+            <form onSubmit={handleResetManagerPassword} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">New Password</label>
+                <input
+                  type="password"
+                  required
+                  placeholder="Min 6 characters (e.g. ManagerPass123!)"
+                  value={newPasswordInput}
+                  onChange={(e) => setNewPasswordInput(e.target.value)}
+                  className="w-full text-sm border border-slate-300 rounded-lg p-2.5 font-mono"
+                  autoFocus
+                />
+              </div>
+
+              <div className="flex justify-end gap-2 pt-2">
+                <button
+                  type="button"
+                  onClick={() => setManagerToReset(null)}
+                  className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-medium rounded-lg hover:bg-slate-50 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  disabled={isResettingPassword || newPasswordInput.trim().length < 6}
+                  className="px-4 py-2 bg-blue-700 hover:bg-blue-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-sm cursor-pointer"
+                >
+                  {isResettingPassword ? 'Updating...' : 'Set Password'}
                 </button>
               </div>
             </form>

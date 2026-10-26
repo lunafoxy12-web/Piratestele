@@ -2,8 +2,9 @@ import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { db, verifyPassword, User } from './db.ts';
 
-// In-memory active session token store (token -> { userId, role, expiresAt })
-interface Session {
+// Persistent & In-memory active session token store (token -> { token, userId, role, expiresAt })
+export interface Session {
+  token: string;
   userId: string;
   role: 'admin' | 'manager' | 'agent' | 'customer';
   managerId?: string;
@@ -14,6 +15,27 @@ interface Session {
 
 const sessions = new Map<string, Session>();
 const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+
+// Hydrate sessions from persistent database on startup
+function hydrateSessions() {
+  try {
+    const data = db.get();
+    if (Array.isArray(data.sessions)) {
+      const now = Date.now();
+      for (const s of data.sessions) {
+        if (s.expiresAt > now && s.token) {
+          sessions.set(s.token, s);
+        }
+      }
+      if (sessions.size > 0) {
+        console.log(`[AUTH] Hydrated ${sessions.size} active sessions from database`);
+      }
+    }
+  } catch (err) {
+    console.warn('[AUTH] Session hydration note:', err);
+  }
+}
+hydrateSessions();
 
 export function createSession(user: User): { token: string; session: Session } {
   const token = crypto.randomBytes(32).toString('hex');
@@ -43,6 +65,7 @@ export function createSession(user: User): { token: string; session: Session } {
   }
 
   const session: Session = {
+    token,
     userId: user.id,
     role: user.role,
     managerId,
@@ -52,15 +75,31 @@ export function createSession(user: User): { token: string; session: Session } {
   };
 
   sessions.set(token, session);
+
+  // Persist session into database so server restarts or recompiles never kick user out
+  db.update((d) => {
+    d.sessions = [...(d.sessions || []).filter((s) => s.expiresAt > now), session];
+  }).catch(() => {});
+
   return { token, session };
 }
 
 export function getSession(token: string): Session | undefined {
-  return sessions.get(token);
+  if (sessions.has(token)) return sessions.get(token);
+  // Check persistent DB in case server recently restarted
+  const dbSession = (db.get().sessions || []).find((s) => s.token === token && s.expiresAt > Date.now());
+  if (dbSession) {
+    sessions.set(token, dbSession);
+    return dbSession;
+  }
+  return undefined;
 }
 
 export function revokeSession(token: string): void {
   sessions.delete(token);
+  db.update((d) => {
+    d.sessions = (d.sessions || []).filter((s) => s.token !== token);
+  }).catch(() => {});
 }
 
 export interface AuthenticatedRequest extends Request {
@@ -78,10 +117,10 @@ export function authenticate(req: AuthenticatedRequest, res: Response, next: Nex
   }
 
   const token = authHeader.substring(7).trim();
-  const session = sessions.get(token);
+  const session = getSession(token);
 
   if (!session || Date.now() > session.expiresAt) {
-    if (session) sessions.delete(token);
+    if (session) revokeSession(token);
     return res.status(401).json({ error: 'Session expired or invalid. Please log in again.' });
   }
 
@@ -89,7 +128,7 @@ export function authenticate(req: AuthenticatedRequest, res: Response, next: Nex
   const user = data.users.find((u) => u.id === session.userId);
 
   if (!user || !user.enabled) {
-    sessions.delete(token);
+    revokeSession(token);
     return res.status(403).json({ error: 'User account is disabled or does not exist.' });
   }
 

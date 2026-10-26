@@ -490,27 +490,35 @@ router.get('/admin/managers', authenticate, requireRole(['admin']), (req: Authen
 router.post('/admin/managers', authenticate, requireRole(['admin']), async (req: AuthenticatedRequest, res: Response) => {
   const { username, password, name, email, maxAgents = 10, notes, assignedVoipIds = [], assignedSipIds = [] } = req.body;
 
-  if (!username || !password || !name) {
+  const cleanUsername = username ? String(username).trim() : '';
+  const cleanPassword = password ? String(password).trim() : '';
+  const cleanName = name ? String(name).trim() : '';
+
+  if (!cleanUsername || !cleanPassword || !cleanName) {
     return res.status(400).json({ error: 'Username, password, and manager name are required.' });
   }
 
+  if (cleanPassword.length < 6) {
+    return res.status(400).json({ error: 'Password must be at least 6 characters.' });
+  }
+
   const data = db.get();
-  if (data.users.some((u) => u.username.toLowerCase() === username.trim().toLowerCase())) {
+  if (data.users.some((u) => u.username.toLowerCase() === cleanUsername.toLowerCase())) {
     return res.status(400).json({ error: 'A user with this username already exists.' });
   }
 
-  const auth = hashPassword(password);
+  const auth = hashPassword(cleanPassword);
   const userId = `usr_mgr_${Date.now()}`;
   const managerId = `mgr_${Date.now()}`;
 
   const newUser: User = {
     id: userId,
-    username: username.trim(),
+    username: cleanUsername,
     passwordHash: auth.hash,
     salt: auth.salt,
     role: 'manager',
-    name: name.trim(),
-    email: email?.trim(),
+    name: cleanName,
+    email: email ? String(email).trim() : '',
     enabled: true,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
@@ -519,10 +527,15 @@ router.post('/admin/managers', authenticate, requireRole(['admin']), async (req:
   const newManager: Manager = {
     id: managerId,
     userId,
-    name: name.trim(),
+    name: cleanName,
     maxAgents: Math.max(1, parseInt(maxAgents, 10) || 10),
     enabled: true,
-    notes,
+    notes: notes || '',
+    allowedRoutingMode: 'BOTH',
+    enforcedAgentLanguage: 'Urdu',
+    enforcedCustomerLanguage: 'Arabic',
+    allowManagerOverrideLanguages: true,
+    aiTranslationBotVoice: 'Aoede',
     createdAt: new Date().toISOString(),
   };
 
@@ -530,7 +543,7 @@ router.post('/admin/managers', authenticate, requireRole(['admin']), async (req:
   const newIvr: IvrConfig = {
     id: `ivr_${Date.now()}`,
     managerId,
-    name: `${name} Standard IVR`,
+    name: `${cleanName} Standard IVR`,
     greetingText: `Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to end this call.`,
     timeoutSeconds: 8,
     maxRetries: 3,
@@ -803,7 +816,9 @@ router.post('/admin/managers/:id/reset-password', authenticate, requireRole(['ad
   const { id } = req.params;
   const { newPassword } = req.body;
 
-  if (!newPassword || newPassword.length < 6) {
+  const cleanPass = newPassword ? String(newPassword).trim() : '';
+
+  if (!cleanPass || cleanPass.length < 6) {
     return res.status(400).json({ error: 'Password must be at least 6 characters.' });
   }
 
@@ -811,20 +826,25 @@ router.post('/admin/managers/:id/reset-password', authenticate, requireRole(['ad
   const manager = data.managers.find((m) => m.id === id);
   if (!manager) return res.status(404).json({ error: 'Manager not found.' });
 
-  const auth = hashPassword(newPassword);
+  const auth = hashPassword(cleanPass);
 
   await db.update((d) => {
     const user = d.users.find((u) => u.id === manager.userId);
     if (user) {
       user.passwordHash = auth.hash;
       user.salt = auth.salt;
+      user.enabled = true;
       user.updatedAt = new Date().toISOString();
+    }
+    const mgr = d.managers.find((m) => m.id === id);
+    if (mgr) {
+      mgr.enabled = true;
     }
   });
 
   await logAudit(req.user!.username, 'admin', 'RESET_MANAGER_PASSWORD', `Manager: ${id}`, {}, req.ip);
 
-  res.json({ success: true, message: 'Password reset successfully.' });
+  res.json({ success: true, message: `Password for manager '${manager.name}' successfully reset to '${cleanPass}'.` });
 });
 
 // SIP Connections Management (100+ Connections)
