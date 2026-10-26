@@ -27,7 +27,8 @@ twilioRouter.all('/call-twiml', (req: Request, res: Response) => {
   const call = callId ? data.calls.find((c) => c.id === callId || c.callSid === callId) : null;
   const campaign = call?.campaignId ? data.campaigns.find((c) => c.id === call.campaignId) : null;
   const ivr = campaign ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId) : data.ivr_configs[0];
-  const greeting = ivr?.greetingText || 'Hello from Pirates World Tele Solution. Press 1 to connect with an agent, or 2 to hear this greeting again.';
+  const rawGreeting = ivr?.greetingText || 'Hello from Pirates World Tele Solution. Press 1 to connect with an agent, or 2 to hear this greeting again.';
+  const greeting = rawGreeting.replace(/^["']|["']$/g, '').trim();
 
   const appUrl = process.env.APP_URL || '';
   const dtmfUrl = `${appUrl}/api/twilio/dtmf${callId ? `?callId=${encodeURIComponent(callId)}` : ''}`;
@@ -36,7 +37,7 @@ twilioRouter.all('/call-twiml', (req: Request, res: Response) => {
 <Response>
   <Pause length="1"/>
   <Gather numDigits="1" timeout="10" action="${escapeXml(dtmfUrl)}" method="POST">
-    <Say voice="alice">${escapeXml(greeting)}</Say>
+    ${ivr?.audioUrl ? `<Play>${escapeXml(ivr.audioUrl)}</Play>` : `<Say voice="alice">${escapeXml(greeting)}</Say>`}
     <Say voice="alice">Press 1 to speak with an agent, or 2 to repeat.</Say>
   </Gather>
   <Say voice="alice">No key was detected. Thank you for calling Pirates World Tele Solution. Goodbye.</Say>

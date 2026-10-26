@@ -3763,23 +3763,40 @@ router.get('/customer/active-call', (req: Request, res: Response) => {
   const data = db.get();
   // Find any active call for test recipient line, including calls waiting in QUEUED
   const activeCall = data.calls.find((c) =>
-    ['DIALING', 'RINGING', 'ANSWERED', 'IVR_ACTIVE', 'BRIDGED', 'QUEUED'].includes(c.status)
+    ['DIALING', 'RINGING', 'ANSWERED', 'IVR_ACTIVE', 'BRIDGED', 'QUEUED'].includes(c.status) && !c.endTime
   );
   if (!activeCall) return res.json({ activeCall: null });
 
-  const ivr = activeCall.campaignId
-    ? data.ivr_configs.find((i) => i.id === data.campaigns.find((c) => c.id === activeCall.campaignId)?.ivrConfigId)
-    : data.ivr_configs.find((i) => i.managerId === activeCall.managerId) || data.ivr_configs[0];
+  const campaign = activeCall.campaignId ? data.campaigns.find((c) => c.id === activeCall.campaignId) : null;
+  let ivr = campaign?.ivrConfigId
+    ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId)
+    : (data.ivr_configs.find((i) => i.managerId === activeCall.managerId) || data.ivr_configs[0]);
+
+  if (ivr && ivr.greetingText) {
+    ivr = {
+      ...ivr,
+      greetingText: ivr.greetingText.replace(/^["']|["']$/g, '').trim(),
+    };
+  }
 
   const agent = activeCall.agentId ? data.agents.find((a) => a.id === activeCall.agentId) : null;
   const manager = activeCall.managerId ? data.managers.find((m) => m.id === activeCall.managerId) : null;
 
-  res.json({ activeCall, ivr, agent, manager });
+  res.json({ activeCall, ivr, campaign, agent, manager });
 });
 
 router.post('/customer/answer', async (req: Request, res: Response) => {
   const { callId } = req.body;
   if (!callId) return res.status(400).json({ error: 'Call ID required.' });
+
+  const data = db.get();
+  const targetCall = data.calls.find((c) => c.id === callId);
+  const campaign = targetCall?.campaignId ? data.campaigns.find((c) => c.id === targetCall.campaignId) : null;
+  const ivr = campaign?.ivrConfigId
+    ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId)
+    : (data.ivr_configs.find((i) => i.managerId === targetCall?.managerId) || data.ivr_configs[0]);
+
+  const cleanGreeting = (ivr?.greetingText || '').replace(/^["']|["']$/g, '').trim();
 
   await db.update((d) => {
     const call = d.calls.find((c) => c.id === callId);
@@ -3787,12 +3804,20 @@ router.post('/customer/answer', async (req: Request, res: Response) => {
       call.status = 'IVR_ACTIVE';
       call.answerTime = new Date().toISOString();
       call.sipResponseCode = 200;
-      call.sipResponseText = '200 OK';
+      call.sipResponseText = '200 OK (PSTN Recipient Answered)';
     }
   });
 
   realtime.broadcast('call.answered', { callId, answerTime: new Date().toISOString() });
-  res.json({ success: true, message: 'Handset answered.' });
+  realtime.broadcast('call.ivr_active', {
+    callId,
+    status: 'IVR_ACTIVE',
+    customerNumber: targetCall?.customerNumber,
+    ivrGreetingText: cleanGreeting,
+    audioUrl: ivr?.audioUrl,
+  });
+
+  res.json({ success: true, message: 'Handset answered.', ivr, greetingText: cleanGreeting });
 });
 
 router.post('/customer/dtmf', async (req: Request, res: Response) => {

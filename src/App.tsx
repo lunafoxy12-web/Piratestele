@@ -11,6 +11,7 @@ import { LoginView } from './components/LoginView.tsx';
 import { ManagerDashboard } from './components/manager/ManagerDashboard.tsx';
 import { AgentApp } from './components/agent/AgentApp.tsx';
 import { AdminDashboard } from './components/admin/AdminDashboard.tsx';
+import { PstnReceiverSoftphone } from './components/common/PstnReceiverSoftphone.tsx';
 function MainAppContent() {
   const { user, isAuthenticated, isLoading } = useAuth();
   const [currentHash, setCurrentHash] = React.useState<string>(() => window.location.hash || '');
@@ -76,6 +77,9 @@ function MainAppContent() {
           <AgentApp />
         )}
       </main>
+
+      {/* Real-time audible PSTN Receiver handset for testing manager IVR voice & DTMF transfer */}
+      <PstnReceiverSoftphone />
     </div>
   );
 }

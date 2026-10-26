@@ -1725,7 +1725,7 @@ export const ManagerDashboard: React.FC = () => {
                                       body: JSON.stringify({ callId: call.id, digit: '1' }),
                                     });
                                     if (res.ok) {
-                                      showNotification('success', 'DTMF Key 1 processed! Call bridged with agent station.');
+                                      showNotification('success', 'DTMF Key 1 confirmed! Agent station ring beep sounding for 3 seconds -> Auto-connecting call with zero clicks.');
                                       fetchData();
                                     }
                                   } catch (err: any) {
@@ -2095,9 +2095,53 @@ export const ManagerDashboard: React.FC = () => {
                       </option>
                     ))}
                   </select>
-                  <p className="text-[11px] text-slate-500 mt-1">
-                    Recipient hears this exact recorded voice when answering. When they press 1, they connect to the live agent.
-                  </p>
+
+                  {/* Selected IVR Voice Live Preview */}
+                  {(() => {
+                    const selectedIvr = ivrs.find((i) => i.id === campaignForm.ivrConfigId) || ivrs[0];
+                    if (!selectedIvr) return null;
+                    return (
+                      <div className="mt-2 p-2.5 bg-indigo-50/80 border border-indigo-200 rounded-xl text-xs space-y-1.5 shadow-2xs">
+                        <div className="flex items-center justify-between">
+                          <span className="font-bold text-indigo-950 flex items-center gap-1.5">
+                            <Volume2 className="w-3.5 h-3.5 text-indigo-600" />
+                            <span>PSTN Receiver Prompt Voice: {selectedIvr.name}</span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (selectedIvr.audioUrl) {
+                                try {
+                                  const a = new Audio(selectedIvr.audioUrl);
+                                  a.play();
+                                  showNotification('success', `Playing recorded audio: "${selectedIvr.name}"`);
+                                  return;
+                                } catch {}
+                              }
+                              if ('speechSynthesis' in window && selectedIvr.greetingText) {
+                                window.speechSynthesis.cancel();
+                                const clean = selectedIvr.greetingText.replace(/^["']|["']$/g, '').trim();
+                                const utt = new SpeechSynthesisUtterance(clean);
+                                utt.rate = 1.0;
+                                window.speechSynthesis.speak(utt);
+                                showNotification('success', `Playing voice preview: "${clean}"`);
+                              }
+                            }}
+                            className="text-[10px] bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-2 py-0.5 rounded shadow-xs transition-colors flex items-center gap-1 cursor-pointer"
+                          >
+                            <Volume2 className="w-3 h-3" />
+                            <span>Audition Voice</span>
+                          </button>
+                        </div>
+                        <p className="italic text-slate-700 border-l-2 border-indigo-400 pl-2 text-[11px]">
+                          "{selectedIvr.greetingText?.replace(/^["']|["']$/g, '').trim()}"
+                        </p>
+                        <p className="text-[10px] text-slate-500">
+                          PSTN recipient will hear this exact voice when they answer their phone.
+                        </p>
+                      </div>
+                    );
+                  })()}
                 </div>
               )}
 

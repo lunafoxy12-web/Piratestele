@@ -120,6 +120,13 @@ export const AgentApp: React.FC = () => {
 
   const handleCallActionRef = useRef<any>(null);
 
+  // 3-Second Ring Beep & Auto-Answer Engine
+  const ringBeepIntervalRef = useRef<NodeJS.Timeout | null>(null);
+  const ringBeepTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const countdownTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const isAutoAnsweringRef = useRef<boolean>(false);
+  const [autoAnswerSecondsLeft, setAutoAnswerSecondsLeft] = useState<number | null>(null);
+
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied' | 'requesting'>('prompt');
   const [micAudioLevel, setMicAudioLevel] = useState<number>(0);
   const [micFrequencies, setMicFrequencies] = useState<number[]>([15, 25, 40, 30, 50, 40, 25, 20, 35, 55, 45, 30, 20, 35, 20]);
@@ -286,7 +293,7 @@ export const AgentApp: React.FC = () => {
                       .then((resData) => {
                         console.log('[WEBRTC INCOMING SYNC RESULT]', resData);
                         if (resData.isIvrCall && resData.playIvrGreeting) {
-                          // This is an IVR campaign call: Stream manager IVR voice to caller!
+                          // This is an IVR campaign call: Connect WebRTC audio leg immediately so caller hears IVR voice!
                           setActiveIvrConfig(resData.ivrConfig);
                           setActiveCall({
                             id: resData.callId,
@@ -299,25 +306,11 @@ export const AgentApp: React.FC = () => {
                             status: 'IVR_ACTIVE' as any,
                             dtmfSequence: '',
                           });
+                          connectRealPstnAudio();
                           playIvrGreeting(resData.ivrConfig);
                         } else {
-                          // Non-IVR or direct call: Ring agent station & auto-answer with chime
-                          setAgentState('RINGING');
-                          setActiveCall({
-                            id: resData.callId || `call_zd_${Date.now()}`,
-                            callId: resData.callId || `call_zd_${Date.now()}`,
-                            customerNumber: incomingCaller,
-                            callerId: data?.callername || incomingCaller,
-                            sipConnectionId: 'voip_zadarma',
-                            startTime: new Date().toISOString(),
-                            durationSeconds: 0,
-                            status: 'RINGING',
-                            dtmfSequence: '1',
-                          });
-                          playConnectBeep();
-                          setTimeout(() => {
-                            handleCallActionRef.current?.('ANSWER');
-                          }, 100);
+                          // Non-IVR or direct call: Ring agent station with 3s ring beep & auto-connect
+                          start3SecondRingBeepAndAutoAnswer('1', resData.callId);
                         }
                       })
                       .catch((err) => console.warn('[SYNC WEBRTC INCOMING NOTE]', err));
@@ -325,9 +318,7 @@ export const AgentApp: React.FC = () => {
                 } else if (status === 'dtmf' || data?.key || data?.dtmf) {
                   const digit = String(data?.key || data?.dtmf || data?.digit || '1').trim();
                   console.log('[ZADARMA WEBRTC DTMF DETECTED]', digit);
-                  if (digit === '1') {
-                    handleDtmfOnePressed('1');
-                  }
+                  start3SecondRingBeepAndAutoAnswer(digit, activeCallRef.current?.id);
                 } else if (status === 'confirmed' || status === 'talking') {
                   if (isMounted) setWebrtcStatus('CALL_ACTIVE');
                   setAgentState('BUSY');
@@ -411,11 +402,9 @@ export const AgentApp: React.FC = () => {
               playIvrGreeting(data.ivrConfig);
             }
           } else if (isRinging) {
-            setAgentState('RINGING');
-            playConnectBeep();
-            setTimeout(() => {
-              handleCallActionRef.current?.('ANSWER');
-            }, 100);
+            if (!isAutoAnsweringRef.current) {
+              start3SecondRingBeepAndAutoAnswer(data.activeCall.dtmfSequence || '1', data.activeCall.id);
+            }
           } else {
             setAgentState(data.activeCall.status === 'BRIDGED' ? 'BUSY' : data.agent?.state || 'BUSY');
           }
@@ -755,19 +744,95 @@ export const AgentApp: React.FC = () => {
     }
   };
 
-  // PSTN Receiver pressed DTMF Key 1 -> Auto Answer immediately with beep sound (Zero clicks required)
-  const handleDtmfOnePressed = (digit: string = '1') => {
-    console.log(`[AGENT AUTO-ANSWER] PSTN Receiver pressed DTMF [${digit}]! Auto-answering call immediately with beep sound...`);
-    stopIvrGreeting();
-    playConnectBeep();
+  // Ring beep audio tone generator (pulsed dual tone 880Hz + 1200Hz)
+  const playRingBeepPulse = (ctx: AudioContext) => {
+    try {
+      if (ctx.state === 'suspended') ctx.resume();
+      const now = ctx.currentTime;
 
-    setAgentState('BUSY');
+      const osc1 = ctx.createOscillator();
+      const osc2 = ctx.createOscillator();
+      const gain = ctx.createGain();
+
+      osc1.type = 'sine';
+      osc1.frequency.setValueAtTime(880, now);
+      osc2.type = 'sine';
+      osc2.frequency.setValueAtTime(1200, now);
+
+      gain.gain.setValueAtTime(0.001, now);
+      gain.gain.linearRampToValueAtTime(0.35, now + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+
+      osc1.connect(gain);
+      osc2.connect(gain);
+      gain.connect(ctx.destination);
+
+      osc1.start(now);
+      osc1.stop(now + 0.23);
+      osc2.start(now);
+      osc2.stop(now + 0.23);
+    } catch (e) {
+      console.warn('Ring beep pulse note:', e);
+    }
+  };
+
+  const stopRingBeepAudio = () => {
+    if (ringBeepIntervalRef.current) {
+      clearInterval(ringBeepIntervalRef.current);
+      ringBeepIntervalRef.current = null;
+    }
+    if (ringBeepTimeoutRef.current) {
+      clearTimeout(ringBeepTimeoutRef.current);
+      ringBeepTimeoutRef.current = null;
+    }
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+  };
+
+  // Auto-connect with 3-second ring beep sound upon DTMF confirmation (Zero clicks required by agent)
+  const start3SecondRingBeepAndAutoAnswer = (digit: string = '1', incomingCallId?: string) => {
+    if (isAutoAnsweringRef.current) return;
+    isAutoAnsweringRef.current = true;
+
+    console.log(`[AGENT AUTO-ANSWER] PSTN Receiver confirmed DTMF [${digit}]. Starting 3-second ring beep, then auto-connecting...`);
+
+    stopIvrGreeting();
+    stopRingBeepAudio();
+
+    setAgentState('RINGING');
+    setAutoAnswerSecondsLeft(3);
+
+    const targetCallId = incomingCallId || activeCallRef.current?.id || `call_${Date.now()}`;
+
     setActiveCall((prev) => {
-      if (!prev) return prev;
+      const callObj = prev || (latestAgentEvent ? {
+        id: latestAgentEvent.callId || targetCallId,
+        callId: latestAgentEvent.callId || targetCallId,
+        customerNumber: latestAgentEvent.customerNumber || 'PSTN Receiver',
+        callerId: latestAgentEvent.callerId || '+18045930160',
+        sipConnectionId: '',
+        startTime: latestAgentEvent.startTime || new Date().toISOString(),
+        durationSeconds: 0,
+        status: 'RINGING' as const,
+        dtmfSequence: digit,
+      } : {
+        id: targetCallId,
+        callId: targetCallId,
+        customerNumber: 'PSTN Receiver',
+        callerId: '+18045930160',
+        sipConnectionId: '',
+        startTime: new Date().toISOString(),
+        durationSeconds: 0,
+        status: 'RINGING' as const,
+        dtmfSequence: digit,
+      });
+
       return {
-        ...prev,
-        status: 'BRIDGED',
-        dtmfSequence: prev.dtmfSequence ? `${prev.dtmfSequence}${digit}` : digit,
+        ...callObj,
+        status: 'RINGING',
+        dtmfSequence: callObj.dtmfSequence ? `${callObj.dtmfSequence}${digit}` : digit,
       };
     });
 
@@ -775,7 +840,7 @@ export const AgentApp: React.FC = () => {
       ...prev,
       {
         id: `dtmf_${Date.now()}`,
-        callId: activeCallRef.current?.id || '',
+        callId: targetCallId,
         customerPhone: activeCallRef.current?.customerNumber || 'PSTN Receiver',
         digit,
         timestamp: new Date().toISOString(),
@@ -785,8 +850,8 @@ export const AgentApp: React.FC = () => {
       },
     ]);
 
-    // Send DTMF 1 event to backend to sync call state & transfer
-    if (token && activeCallRef.current?.id) {
+    // Send DTMF sync to backend
+    if (token && targetCallId) {
       fetch('/api/agent/webrtc-incoming', {
         method: 'POST',
         headers: {
@@ -794,24 +859,82 @@ export const AgentApp: React.FC = () => {
           Authorization: `Bearer ${token}`,
         },
         body: JSON.stringify({
-          caller: activeCallRef.current.customerNumber,
+          caller: activeCallRef.current?.customerNumber,
           digit,
         }),
       }).catch(() => {});
     }
 
-    // Auto-answer line without requiring user to click any button
-    connectRealPstnAudio();
-    if (handleCallActionRef.current) {
-      handleCallActionRef.current('ANSWER');
+    // Play Ring Beep sound pattern for exactly 3 seconds
+    try {
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (AudioCtx) {
+        const ctx = new AudioCtx();
+        playRingBeepPulse(ctx);
+        const beepSchedule = [400, 1000, 1400, 2000, 2400];
+        beepSchedule.forEach((delay) => {
+          setTimeout(() => {
+            if (isAutoAnsweringRef.current) {
+              playRingBeepPulse(ctx);
+            }
+          }, delay);
+        });
+      }
+    } catch (e) {
+      console.warn('AudioContext ring beep note:', e);
     }
 
-    setStatusMessage(`PSTN receiver pressed DTMF [${digit}]! Call auto-answered.`);
-    setTimeout(() => setStatusMessage(null), 5000);
+    // 1-second countdown ticker (3s -> 2s -> 1s -> 0s)
+    let secondsLeft = 3;
+    countdownTimerRef.current = setInterval(() => {
+      secondsLeft -= 1;
+      if (secondsLeft > 0) {
+        setAutoAnswerSecondsLeft(secondsLeft);
+      } else {
+        setAutoAnswerSecondsLeft(0);
+        if (countdownTimerRef.current) {
+          clearInterval(countdownTimerRef.current);
+          countdownTimerRef.current = null;
+        }
+      }
+    }, 1000);
+
+    // EXACT 3-SECOND TIMER: Automatically answers call with zero agent clicks
+    ringBeepTimeoutRef.current = setTimeout(() => {
+      stopRingBeepAudio();
+      setAutoAnswerSecondsLeft(null);
+      isAutoAnsweringRef.current = false;
+
+      console.log(`[AGENT AUTO-ANSWER] 3 seconds ring beep completed! Auto-answering call now...`);
+      playConnectBeep();
+
+      setAgentState('BUSY');
+      setActiveCall((prev) => {
+        if (!prev) return prev;
+        return {
+          ...prev,
+          status: 'BRIDGED',
+        };
+      });
+
+      // Auto-answer line and connect 2-way WebRTC audio
+      connectRealPstnAudio();
+      if (handleCallActionRef.current) {
+        handleCallActionRef.current('ANSWER');
+      }
+
+      setStatusMessage(`PSTN receiver pressed DTMF [${digit}]. Call auto-connected after 3s ring beep (zero clicks).`);
+      setTimeout(() => setStatusMessage(null), 6000);
+    }, 3000);
+  };
+
+  // PSTN Receiver pressed DTMF Key 1 -> Auto Answer after 3 seconds ring beep
+  const handleDtmfOnePressed = (digit: string = '1') => {
+    start3SecondRingBeepAndAutoAnswer(digit, activeCallRef.current?.id);
   };
 
   const stopRingtone = () => {
-    // Ringtone oscillator automatically stops after duration
+    stopRingBeepAudio();
   };
 
   // Continuous 2s polling to ensure agent station synchronizes real-time state with telephony engine
@@ -828,38 +951,11 @@ export const AgentApp: React.FC = () => {
     if (!latestAgentEvent) return;
 
     if (latestAgentEvent.type === 'incoming') {
-      if (latestAgentEvent.isTransferredFromIvr || latestAgentEvent.dtmfDigit === '1') {
-        console.log('[SSE EVENT] DTMF 1 pressed by PSTN caller via IVR transfer. Auto-answering...');
-        handleDtmfOnePressed(latestAgentEvent.dtmfDigit || '1');
-      } else {
-        setAgentState('RINGING');
-        setActiveCall({
-          id: latestAgentEvent.callId,
-          callId: latestAgentEvent.callId,
-          customerNumber: latestAgentEvent.customerNumber,
-          callerId: latestAgentEvent.callerId,
-          sipConnectionId: '',
-          startTime: latestAgentEvent.startTime,
-          durationSeconds: 0,
-          status: 'RINGING',
-          dtmfSequence: '',
-        });
-        // Fetch DTMF sequence for this incoming call
-        if (token && latestAgentEvent.callId) {
-          fetch(`/api/agent/active-call-dtmf/${latestAgentEvent.callId}`, {
-            headers: { Authorization: `Bearer ${token}` },
-          })
-            .then((r) => r.json())
-            .then((events) => {
-              if (Array.isArray(events)) setActiveCallDtmf(events);
-            })
-            .catch(() => {});
-        }
-        playConnectBeep();
-        setTimeout(() => {
-          handleCallActionRef.current?.('ANSWER');
-        }, 100);
-      }
+      console.log('[SSE EVENT] Incoming call to agent station. Starting 3s ring beep and auto-answer...', latestAgentEvent);
+      start3SecondRingBeepAndAutoAnswer(latestAgentEvent.dtmfDigit || '1', latestAgentEvent.callId);
+    } else if ((latestAgentEvent as any).type === 'dtmf.received') {
+      console.log('[SSE EVENT] DTMF received event. Starting 3s ring beep and auto-answer...', latestAgentEvent);
+      start3SecondRingBeepAndAutoAnswer((latestAgentEvent as any).digit || '1', (latestAgentEvent as any).callId);
     } else if (latestAgentEvent.type === 'state_changed') {
       if (!user?.agentId || latestAgentEvent.agentId === user?.agentId || latestAgentEvent.currentCallId === activeCall?.id) {
         setAgentState(latestAgentEvent.state);
@@ -929,14 +1025,10 @@ export const AgentApp: React.FC = () => {
     }
   }, [agentState, activeCall]);
 
-  // Auto-connect with chime beep sound whenever station enters RINGING state
+  // Auto-connect with ring beep sound whenever station enters RINGING state
   useEffect(() => {
-    if (agentState === 'RINGING') {
-      playConnectBeep();
-      const timer = setTimeout(() => {
-        handleCallAction('ANSWER');
-      }, 100);
-      return () => clearTimeout(timer);
+    if (agentState === 'RINGING' && !isAutoAnsweringRef.current) {
+      start3SecondRingBeepAndAutoAnswer(activeCall?.dtmfSequence || '1', activeCall?.id);
     }
   }, [agentState]);
 
@@ -2079,65 +2171,93 @@ export const AgentApp: React.FC = () => {
 
               <div className="text-[11px] text-slate-500 flex items-center justify-center gap-1.5">
                 <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
-                <span>Auto-answers with chime beep instantly upon DTMF 1 keypress (zero clicks needed)</span>
+                <span>Plays ring beep for 3 seconds then auto-connects line (zero clicks needed)</span>
               </div>
             </div>
           </div>
         )}
 
-        {/* STATE 1: RINGING (INCOMING BRIDGED CALL) */}
-        {(agentState === 'RINGING' || (activeCall && !activeCall.endTime && activeCall.status === 'RINGING')) && activeCall?.status !== 'BRIDGED' && (
-          <div className="bg-amber-50 border-2 border-amber-400 rounded-2xl p-6 space-y-4 max-w-md mx-auto shadow-md">
-            <div className="w-16 h-16 bg-amber-500 text-white rounded-full flex items-center justify-center mx-auto animate-pulse">
-              <PhoneCall className="w-8 h-8" />
+        {/* STATE 1: RINGING / 3-SECOND RING BEEP AUTO-ANSWER (INCOMING BRIDGED CALL) */}
+        {(agentState === 'RINGING' || autoAnswerSecondsLeft !== null || (activeCall && !activeCall.endTime && activeCall.status === 'RINGING')) && activeCall?.status !== 'BRIDGED' && (
+          <div className="bg-gradient-to-br from-amber-50 to-orange-50 border-2 border-amber-400 rounded-3xl p-6 sm:p-8 space-y-5 max-w-lg mx-auto shadow-2xl text-center animate-fade-in ring-4 ring-amber-200/50">
+            {/* Pulsing Ring Icon with Animated Wave */}
+            <div className="relative w-20 h-20 mx-auto flex items-center justify-center">
+              <span className="absolute inset-0 rounded-full bg-amber-400 opacity-75 animate-ping" />
+              <div className="w-20 h-20 bg-gradient-to-br from-amber-500 to-orange-600 text-white rounded-full flex items-center justify-center shadow-xl z-10 animate-bounce">
+                <PhoneCall className="w-10 h-10" />
+              </div>
             </div>
 
             <div>
-              <div className="text-xs font-bold text-amber-800 uppercase tracking-wider">
-                Incoming Bridged Call
+              <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-100 text-amber-900 text-xs font-black uppercase tracking-wider mb-2 border border-amber-300">
+                <Volume2 className="w-3.5 h-3.5 text-amber-700 animate-pulse" />
+                <span>3-Second Ring Beep Active &middot; Auto-Connecting Line</span>
               </div>
-              <div className="text-2xl font-black text-slate-900 mt-1 font-mono">
+              <div className="text-3xl font-black text-slate-900 font-mono tracking-tight">
                 {activeCall?.customerNumber || latestAgentEvent?.customerNumber || 'Inbound PSTN Caller'}
               </div>
-              <div className="text-xs text-slate-600 mt-0.5">
-                Outbound Caller ID: <span className="font-mono">{activeCall?.callerId || latestAgentEvent?.callerId || 'Carrier Line'}</span>
+              <div className="text-xs text-slate-600 mt-1">
+                Caller ID: <span className="font-mono font-bold text-slate-800">{activeCall?.callerId || latestAgentEvent?.callerId || '+18045930160'}</span>
               </div>
             </div>
 
-            {/* Quick preview of customer DTMF path if available */}
+            {/* Quick preview of customer DTMF path */}
             {((activeCallDtmf && activeCallDtmf.length > 0) || Boolean(activeCall?.dtmfSequence)) && (
-              <div className="bg-white/80 p-2.5 rounded-lg border border-amber-200 text-xs text-amber-900 text-left">
-                <span className="font-semibold block mb-0.5">Customer IVR Navigation:</span>
-                <div className="flex items-center gap-1.5 flex-wrap">
-                  {activeCallDtmf && activeCallDtmf.length > 0 ? (
-                    activeCallDtmf.map((d, i) => (
-                      <span key={d.id ? `dtmf_badge_${d.id}` : `dtmf_badge_${d.digit}_${d.sequenceNumber ?? i}_${i}`} className="inline-flex items-center gap-1">
-                        <span className="font-mono font-bold bg-amber-200 px-1.5 py-0.5 rounded text-[11px]">
-                          [{d.digit}]
-                        </span>
-                        {i < activeCallDtmf.length - 1 && <span className="text-amber-500">&rarr;</span>}
-                      </span>
-                    ))
-                  ) : (
-                    <span className="font-mono font-bold bg-amber-200 px-1.5 py-0.5 rounded text-[11px]">
-                      [{activeCall?.dtmfSequence || '1'}]
-                    </span>
-                  )}
-                  <span className="text-emerald-700 font-semibold text-[11px]">&rarr; Agent Bridge Requested</span>
+              <div className="bg-white/90 p-3 rounded-xl border border-amber-200 text-xs text-amber-950 text-left shadow-xs">
+                <div className="flex items-center justify-between mb-1.5">
+                  <span className="font-bold flex items-center gap-1.5 text-amber-900">
+                    <CheckCircle className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Customer Confirmed DTMF Key:</span>
+                  </span>
+                  <span className="text-[10px] bg-emerald-100 text-emerald-800 font-bold px-2 py-0.5 rounded-full">
+                    TRANSFERRED
+                  </span>
+                </div>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="font-mono font-black bg-amber-200 text-amber-950 px-2 py-1 rounded-lg text-sm border border-amber-300">
+                    [{activeCall?.dtmfSequence || (activeCallDtmf && activeCallDtmf[0]?.digit) || '1'}]
+                  </span>
+                  <span className="text-emerald-700 font-bold text-xs">&rarr; Live Agent Bridge Requested</span>
                 </div>
               </div>
             )}
 
-            <div className="pt-2 space-y-3">
-              <div className="bg-emerald-600 text-white py-4 px-5 rounded-2xl shadow-lg flex items-center justify-center gap-3 font-bold text-sm">
-                <RefreshCw className="w-5 h-5 animate-spin text-emerald-100" />
-                <span>Auto-Connecting Line &middot; Engaging Audio Chime...</span>
+            {/* Countdown Badge & Ring Beep Audio Waveform */}
+            <div className="bg-white/90 border border-amber-300 rounded-2xl p-4 space-y-3 shadow-xs">
+              <div className="flex items-center justify-between text-xs font-bold text-slate-800">
+                <span className="flex items-center gap-1.5 text-amber-800">
+                  <Radio className="w-4 h-4 text-amber-600 animate-pulse" />
+                  <span>Ring Beep Playing...</span>
+                </span>
+                <span className="font-mono text-sm bg-amber-500 text-white px-2.5 py-0.5 rounded-full font-black animate-pulse">
+                  {autoAnswerSecondsLeft !== null ? `${autoAnswerSecondsLeft}s` : '3s'}
+                </span>
               </div>
 
-              <div className="text-[11px] text-amber-900 text-center flex items-center justify-center gap-1.5 font-medium">
-                <Headphones className="w-3.5 h-3.5 text-amber-700" />
-                <span>Audio stream and headset connecting automatically with zero clicks</span>
+              {/* Progress Bar for 3 Seconds */}
+              <div className="w-full bg-slate-200 h-2.5 rounded-full overflow-hidden">
+                <div
+                  className="bg-gradient-to-r from-amber-500 to-emerald-600 h-full transition-all duration-1000 ease-linear"
+                  style={{
+                    width: `${
+                      autoAnswerSecondsLeft === null || autoAnswerSecondsLeft === 3
+                        ? '33%'
+                        : autoAnswerSecondsLeft === 2
+                        ? '66%'
+                        : '100%'
+                    }`,
+                  }}
+                />
               </div>
+
+              <div className="text-xs font-bold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-xl p-2.5 flex items-center justify-center gap-2">
+                <Headphones className="w-4 h-4 text-emerald-600 shrink-0" />
+                <span>Agent has NO NEED to accept call — Auto-answers in {autoAnswerSecondsLeft ?? 3} seconds!</span>
+              </div>
+            </div>
+
+            <div className="text-[11px] text-slate-500 text-center">
+              Headset, microphone, and 2-way PSTN audio bridge will engage automatically with zero clicks.
             </div>
           </div>
         )}
