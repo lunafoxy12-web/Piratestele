@@ -119,6 +119,7 @@ export const AgentApp: React.FC = () => {
   activeIvrConfigRef.current = activeIvrConfig;
 
   const handleCallActionRef = useRef<any>(null);
+  const remoteAudioBridgeRef = useRef<{ bridgeCtx: AudioContext; sourceNode: MediaStreamAudioSourceNode; gainNode: GainNode } | null>(null);
 
   // 3-Second Ring Beep & Auto-Answer Engine
   const ringBeepIntervalRef = useRef<NodeJS.Timeout | null>(null);
@@ -1291,67 +1292,110 @@ export const AgentApp: React.FC = () => {
   // Real WebRTC PSTN Audio Bridge & Hardware Speaker Controls
   const connectRealPstnAudio = () => {
     try {
-      console.log('[REAL PSTN AUDIO BRIDGE] Answering Zadarma WebRTC leg...');
-      // 1. Answer via Zadarma WebRTC API
+      console.log('[REAL PSTN AUDIO BRIDGE] Connecting 2-way PSTN audio bridge...');
       const webPhone = (window as any).zdrmWebPhone;
       const webrtcPhone = (window as any).zdrmWebrtcPhone;
       const widgetInstance = (window as any).zdrmWPhI;
 
+      let answered = false;
+
+      // 1. If active JsSIP call session already exists, answer it directly
       if (typeof webPhone?.webCallSession?.answer === 'function') {
         try {
           webPhone.webCallSession.answer({ mediaConstraints: { audio: true, video: false } });
-          console.log('[REAL PSTN AUDIO BRIDGE] webCallSession.answer called successfully');
+          answered = true;
+          console.log('[REAL PSTN AUDIO BRIDGE] webCallSession.answer answered active session');
         } catch (e) {
           console.warn('[ZADARMA CALLSESSION ANSWER NOTE]', e);
         }
       }
 
-      if (typeof widgetInstance?.apiWidget?.answer === 'function') {
-        try {
-          widgetInstance.apiWidget.answer();
-        } catch (e) {
-          console.warn('[ZADARMA APIWIDGET ANSWER NOTE]', e);
+      // 2. If session not directly answered, trigger widget answer ONCE (never repeatedly to avoid socket drops)
+      if (!answered) {
+        if (typeof widgetInstance?.answer === 'function') {
+          try {
+            widgetInstance.hideCancelBtn?.();
+            widgetInstance.answer();
+            answered = true;
+          } catch (e) {
+            console.warn('[ZADARMA WIDGET ANSWER NOTE]', e);
+          }
+        } else if (typeof webPhone?.answer === 'function') {
+          try {
+            webPhone.answer();
+            answered = true;
+          } catch {}
+        } else if (typeof webrtcPhone?.answer === 'function') {
+          try {
+            webrtcPhone.answer();
+            answered = true;
+          } catch {}
+        } else {
+          const answerBtn = (
+            document.querySelector('.zdrm-webphone-call-btn') ||
+            document.querySelector('.zdrm-webphone-call-ico') ||
+            document.querySelector('[data-zadarma-action="answer"]')
+          ) as HTMLElement;
+          if (answerBtn) {
+            try { answerBtn.click(); answered = true; } catch {}
+          }
         }
       }
 
-      if (typeof widgetInstance?.answer === 'function') {
-        try {
-          widgetInstance.hideCancelBtn?.();
-          widgetInstance.answer();
-        } catch (e) {
-          console.warn('[ZADARMA WIDGET ANSWER NOTE]', e);
+      // 3. Robust Remote Audio Setup & Web Audio speaker routing (Downlink: PSTN Caller -> Agent)
+      const setupRemoteAudio = () => {
+        const remoteMedia = (
+          document.getElementById('zdrm-webRTCRemoteView') ||
+          document.querySelector('video[id*="zdrm"]') ||
+          document.querySelector('audio[id*="zdrm"]')
+        ) as HTMLMediaElement;
+
+        if (remoteMedia) {
+          // Never allow display:none or visibility:hidden to silence audio in Chromium/WebKit
+          remoteMedia.style.setProperty('display', 'block', 'important');
+          remoteMedia.style.setProperty('visibility', 'visible', 'important');
+          remoteMedia.style.setProperty('position', 'fixed', 'important');
+          remoteMedia.style.setProperty('bottom', '0px', 'important');
+          remoteMedia.style.setProperty('right', '0px', 'important');
+          remoteMedia.style.setProperty('width', '2px', 'important');
+          remoteMedia.style.setProperty('height', '2px', 'important');
+          remoteMedia.style.setProperty('opacity', '0.01', 'important');
+          remoteMedia.style.setProperty('pointer-events', 'none', 'important');
+
+          remoteMedia.muted = !isSpeakerOn;
+          remoteMedia.volume = Math.max(0.2, Math.min(1, (speakerVolume ?? 85) / 100));
+
+          remoteMedia.play().catch((e) => {
+            console.warn('[PSTN AUDIO PLAY NOTE]', e);
+          });
+
+          // Pipe remote media stream directly to Web Audio destination as an unmuted fallback
+          try {
+            const rawStream = (remoteMedia as any).srcObject || (webPhone?.webCallSession?.connection?.getReceivers?.()?.[0]?.track ? new MediaStream([webPhone.webCallSession.connection.getReceivers()[0].track]) : null);
+            if (rawStream && rawStream.getAudioTracks().length > 0 && !(remoteMedia as any)._audioBridgeConnected) {
+              const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+              const bridgeCtx = new AudioCtx();
+              if (bridgeCtx.state === 'suspended') bridgeCtx.resume();
+              const sourceNode = bridgeCtx.createMediaStreamSource(rawStream);
+              const gainNode = bridgeCtx.createGain();
+              gainNode.gain.setValueAtTime((speakerVolume ?? 85) / 100, bridgeCtx.currentTime);
+              sourceNode.connect(gainNode);
+              gainNode.connect(bridgeCtx.destination);
+              remoteAudioBridgeRef.current = { bridgeCtx, sourceNode, gainNode };
+              (remoteMedia as any)._audioBridgeConnected = true;
+              console.log('[REAL PSTN AUDIO BRIDGE] Web Audio pipe active: routing PSTN caller stream directly to agent speakers!');
+            }
+          } catch (pipeErr) {
+            console.warn('[REMOTE AUDIO PIPE NOTE]', pipeErr);
+          }
         }
-      } else if (typeof webrtcPhone?.answer === 'function') {
-        try { webrtcPhone.answer(); } catch {}
-      } else if (typeof webPhone?.answer === 'function') {
-        try { webPhone.answer(); } catch {}
-      } else if (typeof webrtcPhone?.regToAnswer === 'function') {
-        try { webrtcPhone.regToAnswer(); } catch {}
-      } else if (typeof webPhone?.regToAnswer === 'function') {
-        try { webPhone.regToAnswer(); } catch {}
-      }
+      };
 
-      // Also trigger widget DOM answer buttons if rendered
-      const answerBtn = (
-        document.querySelector('.zdrm-webphone-call-btn') ||
-        document.querySelector('.zdrm-webphone-call-ico') ||
-        document.querySelector('[data-zadarma-action="answer"]')
-      ) as HTMLElement;
-      if (answerBtn) {
-        try { answerBtn.click(); } catch {}
-      }
-
-      // 2. Ensure remote audio element from Zadarma WebRTC gateway is unmuted and routed directly to speakers
-      const remoteMedia = (
-        document.getElementById('zdrm-webRTCRemoteView') ||
-        document.querySelector('video[id*="zdrm"]') ||
-        document.querySelector('audio[id*="zdrm"]')
-      ) as HTMLMediaElement;
-      if (remoteMedia) {
-        remoteMedia.muted = !isSpeakerOn;
-        remoteMedia.volume = Math.max(0.1, Math.min(1, (speakerVolume ?? 80) / 100));
-        remoteMedia.play().catch((e) => console.warn('[PSTN AUDIO PLAY NOTE]', e));
-      }
+      setupRemoteAudio();
+      setTimeout(setupRemoteAudio, 300);
+      setTimeout(setupRemoteAudio, 800);
+      setTimeout(setupRemoteAudio, 1600);
+      setTimeout(setupRemoteAudio, 2500);
 
       // Resume hardware audio context if suspended
       if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
@@ -1395,6 +1439,14 @@ export const AgentApp: React.FC = () => {
       if (remoteMedia) {
         remoteMedia.pause();
         remoteMedia.srcObject = null;
+        (remoteMedia as any)._audioBridgeConnected = false;
+      }
+
+      if (remoteAudioBridgeRef.current) {
+        try {
+          remoteAudioBridgeRef.current.bridgeCtx.close();
+        } catch {}
+        remoteAudioBridgeRef.current = null;
       }
     } catch (err) {
       console.warn('[DISCONNECT REAL PSTN CALL NOTE]', err);
@@ -1640,6 +1692,40 @@ export const AgentApp: React.FC = () => {
         } catch (srErr) {
           console.warn('Speech recognition start note:', srErr);
         }
+
+        // Bridge live agent microphone track directly into Zadarma WebRTC audio sender (Uplink: Agent -> PSTN Recipient)
+        const webPhone = (window as any).zdrmWebPhone;
+        const bridgeAgentMic = () => {
+          if (localStreamRef.current) {
+            const micTrack = localStreamRef.current.getAudioTracks()[0];
+            if (micTrack) {
+              micTrack.enabled = true;
+              try {
+                if (webPhone?.webCallSession?.connection) {
+                  const senders = webPhone.webCallSession.connection.getSenders?.() || [];
+                  const audioSender = senders.find((s: any) => s.track?.kind === 'audio');
+                  if (audioSender && typeof audioSender.replaceTrack === 'function') {
+                    audioSender.replaceTrack(micTrack).then(() => {
+                      console.log('[ZADARMA AUDIO BRIDGE] Successfully linked agent mic track to PSTN uplink!');
+                    }).catch((e: any) => console.warn('[REPLACE TRACK NOTE]', e));
+                  }
+                  if (typeof webPhone.webCallSession.connection.unmute === 'function') {
+                    webPhone.webCallSession.connection.unmute({ audio: true, video: false });
+                  }
+                }
+                if (typeof webPhone?.webCallSession?.unmute === 'function') {
+                  webPhone.webCallSession.unmute({ audio: true });
+                }
+              } catch (unmuteErr) {
+                console.warn('[ZADARMA MIC UNMUTE NOTE]', unmuteErr);
+              }
+            }
+          }
+        };
+        bridgeAgentMic();
+        setTimeout(bridgeAgentMic, 400);
+        setTimeout(bridgeAgentMic, 1200);
+        setTimeout(bridgeAgentMic, 2400);
 
         // 2. Initialize RTCPeerConnection for real WebRTC SDP offer/answer
         let localSdpOfferSummary = 'a=rtpmap:111 opus/48000/2 (sendrecv)';
