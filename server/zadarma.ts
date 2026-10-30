@@ -4,6 +4,7 @@
  */
 
 import crypto from 'crypto';
+import { convertTo8kMonoWav } from './services/audioUtils.ts';
 
 export interface ZadarmaConfig {
   apiKey: string;
@@ -561,9 +562,20 @@ export class ZadarmaConnector {
       const cleanSecret = params.apiSecret.trim().replace(/^SEC_/, '');
       const cleanName = params.name.trim().replace(/[^a-zA-Z0-9_\-]/g, '_') || 'ivr_greeting';
       const cleanFileName = params.fileName || `${cleanName}.wav`;
+
+      // Convert audio buffer to strict Zadarma PBX requirement: 16-bit Mono 8000 Hz WAV
+      let finalBuffer = params.audioBuffer;
+      if (!cleanFileName.endsWith('.mp3')) {
+        try {
+          finalBuffer = convertTo8kMonoWav(params.audioBuffer);
+        } catch (resampleErr: any) {
+          console.warn('[Zadarma uploadIvrSound] Resampling failed, using original buffer:', resampleErr.message);
+        }
+      }
+
       const mimeType = cleanFileName.endsWith('.mp3') ? 'audio/mpeg' : 'audio/wav';
 
-      const fileBlob = new Blob([new Uint8Array(params.audioBuffer)], { type: mimeType });
+      const fileBlob = new Blob([new Uint8Array(finalBuffer)], { type: mimeType });
       const form = new FormData();
       form.append('name', cleanName);
       form.append('format', 'json');
@@ -605,6 +617,84 @@ export class ZadarmaConnector {
   }
 
   /**
+   * Retrieves PBX IVR scenarios
+   */
+  public static async getIvrScenarios(config: { apiKey: string; apiSecret: string }): Promise<{
+    success: boolean;
+    scenarios?: any[];
+    message?: string;
+  }> {
+    try {
+      const res = await this.requestApi('/v1/pbx/ivr/scenario/', {}, config, 'GET');
+      if (res && res.status === 'success') {
+        return {
+          success: true,
+          scenarios: Array.isArray(res.scenarios) ? res.scenarios : (res.scenario ? [res.scenario] : []),
+        };
+      }
+      return {
+        success: false,
+        message: res?.message || 'Could not fetch IVR scenarios.',
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: err.message,
+      };
+    }
+  }
+
+  /**
+   * Updates an existing IVR scenario sound file & greeting sound in Zadarma PBX
+   */
+  public static async updateIvrScenario(params: {
+    apiKey: string;
+    apiSecret: string;
+    scenarioId: string;
+    soundId: string;
+    greetingSoundId?: string;
+  }): Promise<{
+    success: boolean;
+    message?: string;
+    raw?: any;
+  }> {
+    try {
+      const editParams: Record<string, any> = {
+        id: params.scenarioId,
+        sound_id: params.soundId,
+        greeting_sound_id: params.greetingSoundId || params.soundId,
+      };
+
+      const res = await this.requestApi(
+        '/v1/pbx/ivr/scenario/edit/',
+        editParams,
+        { apiKey: params.apiKey, apiSecret: params.apiSecret },
+        'PUT'
+      );
+
+      if (res && (res.status === 'success' || res.status === 'ok')) {
+        console.log(`[ZADARMA PBX] Successfully attached sound ${params.soundId} to IVR scenario ${params.scenarioId}`);
+        return {
+          success: true,
+          message: `IVR scenario updated with sound ${params.soundId}`,
+          raw: res,
+        };
+      }
+
+      return {
+        success: false,
+        message: res?.message || 'Failed to update Zadarma PBX IVR scenario',
+        raw: res,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        message: `Error updating Zadarma IVR scenario: ${err.message}`,
+      };
+    }
+  }
+
+  /**
    * Retrieves all uploaded IVR sound files currently stored in Zadarma PBX
    */
   public static async listIvrSounds(config: { apiKey: string; apiSecret: string }): Promise<{
@@ -636,3 +726,4 @@ export class ZadarmaConnector {
     }
   }
 }
+

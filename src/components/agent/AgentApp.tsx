@@ -411,8 +411,10 @@ export const AgentApp: React.FC = () => {
             setStationMode('CLASSIC_SOFTPHONE');
           }
         } else {
-          setActiveCall(null);
-          setAgentState(data.agent?.state || 'AVAILABLE');
+          if (!isAutoAnsweringRef.current) {
+            setActiveCall(null);
+            setAgentState(data.agent?.state || 'AVAILABLE');
+          }
         }
         if (data.ivrConfig) {
           setActiveIvrConfig(data.ivrConfig);
@@ -700,6 +702,8 @@ export const AgentApp: React.FC = () => {
 
   // Dual-Tone Harmonic Connect Chime Beep (Fired upon DTMF keypress for instant auto-answer confirmation)
   const playConnectBeep = () => {
+    // Ring beep and connect chimes are STRICTLY for agent role, never manager or admin
+    if (user?.role !== 'agent') return;
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioCtx) return;
@@ -742,6 +746,8 @@ export const AgentApp: React.FC = () => {
 
   // Ring beep audio tone generator (pulsed dual tone 880Hz + 1200Hz)
   const playRingBeepPulse = (ctx: AudioContext) => {
+    // Ring beep sound must ONLY ever play on the agent dashboard, never on the manager dashboard
+    if (user?.role !== 'agent') return;
     try {
       if (ctx.state === 'suspended') ctx.resume();
       const now = ctx.currentTime;
@@ -788,11 +794,26 @@ export const AgentApp: React.FC = () => {
   };
 
   // Auto-connect with 3-second ring beep sound upon DTMF confirmation (Zero clicks required by agent)
-  const start3SecondRingBeepAndAutoAnswer = (digit: string = '1', incomingCallId?: string) => {
+  const start3SecondRingBeepAndAutoAnswer = (digit: string = '1', incomingCallId?: string, managerIdOfCall?: string) => {
+    // 1. Role Check: Strictly agent role only, NEVER manager
+    if (user?.role !== 'agent') return;
+
+    // 2. Manager Isolation: Call must belong to this agent's manager
+    if (managerIdOfCall && user?.managerId && managerIdOfCall !== user.managerId) {
+      console.log(`[AGENT AUTO-ANSWER] Ignored: call manager ${managerIdOfCall} does not match agent manager ${user.managerId}`);
+      return;
+    }
+
+    // 3. Availability Check: Agent MUST be in AVAILABLE or RINGING state, not BUSY, OFFLINE, or WRAP-UP
+    if (agentState !== 'AVAILABLE' && agentState !== 'RINGING' && !isAutoAnsweringRef.current) {
+      console.log(`[AGENT AUTO-ANSWER] Ignored: agent is ${agentState}, not AVAILABLE.`);
+      return;
+    }
+
     if (isAutoAnsweringRef.current) return;
     isAutoAnsweringRef.current = true;
 
-    console.log(`[AGENT AUTO-ANSWER] PSTN Receiver confirmed DTMF [${digit}]. Starting 3-second ring beep, then auto-connecting...`);
+    console.log(`[AGENT AUTO-ANSWER] PSTN Receiver confirmed DTMF [${digit}]. Starting 3-second ring beep for available agent, then auto-connecting...`);
 
     stopIvrGreeting();
     stopRingBeepAudio();
@@ -942,16 +963,40 @@ export const AgentApp: React.FC = () => {
     return () => clearInterval(interval);
   }, [token, triggerRefresh]);
 
-  // Handle incoming real-time SSE agent events
+  // Handle incoming real-time SSE agent events (strictly isolated by manager and agent availability)
   useEffect(() => {
     if (!latestAgentEvent) return;
 
+    // 1. Strict Role Guard: Only agents ring, NEVER managers or admins
+    if (user?.role !== 'agent') return;
+
+    // 2. Strict Manager Isolation: Event must belong to the manager of this agent
+    if (latestAgentEvent.managerId && user?.managerId && latestAgentEvent.managerId !== user.managerId) {
+      return;
+    }
+
+    // 3. Strict Agent ID Check: If addressed to a specific agent, only that agent rings
+    if (latestAgentEvent.agentId && user?.agentId && latestAgentEvent.agentId !== user.agentId) {
+      return;
+    }
+
     if (latestAgentEvent.type === 'incoming') {
-      console.log('[SSE EVENT] Incoming call to agent station. Starting 3s ring beep and auto-answer...', latestAgentEvent);
-      start3SecondRingBeepAndAutoAnswer(latestAgentEvent.dtmfDigit || '1', latestAgentEvent.callId);
+      // Must be currently AVAILABLE to take an incoming call (not BUSY, OFFLINE, WRAP-UP)
+      if (agentState !== 'AVAILABLE' && !isAutoAnsweringRef.current) {
+        console.log(`[AGENT APP] Ignored incoming call: agent is currently ${agentState}, not AVAILABLE.`);
+        return;
+      }
+      console.log('[SSE EVENT] Incoming call to available agent station. Starting 3s ring beep and auto-answer...', latestAgentEvent);
+      start3SecondRingBeepAndAutoAnswer(latestAgentEvent.dtmfDigit || '1', latestAgentEvent.callId, latestAgentEvent.managerId);
     } else if ((latestAgentEvent as any).type === 'dtmf.received') {
-      console.log('[SSE EVENT] DTMF received event. Starting 3s ring beep and auto-answer...', latestAgentEvent);
-      start3SecondRingBeepAndAutoAnswer((latestAgentEvent as any).digit || '1', (latestAgentEvent as any).callId);
+      if ((latestAgentEvent as any).managerId && user?.managerId && (latestAgentEvent as any).managerId !== user.managerId) {
+        return;
+      }
+      if (agentState !== 'AVAILABLE' && !isAutoAnsweringRef.current) {
+        return;
+      }
+      console.log('[SSE EVENT] DTMF received event for available agent. Starting 3s ring beep and auto-answer...', latestAgentEvent);
+      start3SecondRingBeepAndAutoAnswer((latestAgentEvent as any).digit || '1', (latestAgentEvent as any).callId, (latestAgentEvent as any).managerId);
     } else if (latestAgentEvent.type === 'state_changed') {
       if (!user?.agentId || latestAgentEvent.agentId === user?.agentId || latestAgentEvent.currentCallId === activeCall?.id) {
         setAgentState(latestAgentEvent.state);
@@ -1012,7 +1057,7 @@ export const AgentApp: React.FC = () => {
       }
       fetchAgentStatus();
     }
-  }, [latestAgentEvent, user, token]);
+  }, [latestAgentEvent, user, token, agentState]);
 
   // Automatically retrieve active call if agent state is BUSY or RINGING but activeCall is missing
   useEffect(() => {
@@ -1021,12 +1066,14 @@ export const AgentApp: React.FC = () => {
     }
   }, [agentState, activeCall]);
 
-  // Auto-connect with ring beep sound whenever station enters RINGING state
+  // Auto-connect with ring beep sound whenever station enters RINGING state (only if agent belongs to call manager)
   useEffect(() => {
-    if (agentState === 'RINGING' && !isAutoAnsweringRef.current) {
-      start3SecondRingBeepAndAutoAnswer(activeCall?.dtmfSequence || '1', activeCall?.id);
+    if (user?.role === 'agent' && agentState === 'RINGING' && !isAutoAnsweringRef.current) {
+      if (!activeCall?.managerId || !user?.managerId || activeCall.managerId === user.managerId) {
+        start3SecondRingBeepAndAutoAnswer(activeCall?.dtmfSequence || '1', activeCall?.id, activeCall?.managerId);
+      }
     }
-  }, [agentState]);
+  }, [agentState, user, activeCall]);
 
   // Keep external WebRTC widget completely hidden headlessly:
   // Our system call interface is the ONLY interface displayed to the user
@@ -1050,7 +1097,9 @@ export const AgentApp: React.FC = () => {
 
   // Update DTMF log if a new DTMF digit arrives for this active call
   useEffect(() => {
-    if (!activeCall) return;
+    if (!activeCall || user?.role !== 'agent') return;
+    if (activeCall.managerId && user?.managerId && activeCall.managerId !== user.managerId) return;
+
     const latestForCall = liveDtmfEvents.find((evt) => evt.callId === activeCall.id);
     if (latestForCall) {
       setActiveCallDtmf((prev) => {
@@ -1058,12 +1107,12 @@ export const AgentApp: React.FC = () => {
         return [...prev, latestForCall].sort((a, b) => a.sequenceNumber - b.sequenceNumber);
       });
 
-      // Auto-answer line if customer pressed DTMF 1 while in IVR or waiting
-      if (latestForCall.digit === '1') {
+      // Auto-answer line if customer pressed DTMF 1 while in IVR or waiting, and agent is AVAILABLE
+      if (latestForCall.digit === '1' && (agentState === 'AVAILABLE' || agentState === 'RINGING')) {
         handleDtmfOnePressed('1');
       }
     }
-  }, [liveDtmfEvents, activeCall]);
+  }, [liveDtmfEvents, activeCall, user, agentState]);
 
   // Live duration timer
   useEffect(() => {
@@ -1407,6 +1456,10 @@ export const AgentApp: React.FC = () => {
   };
 
   const disconnectRealPstnAudio = () => {
+    if (isAutoAnsweringRef.current) {
+      console.log('[REAL PSTN AUDIO BRIDGE] Preserving call connection during auto-answer countdown...');
+      return;
+    }
     try {
       console.log('[REAL PSTN AUDIO BRIDGE] Disconnecting Zadarma WebRTC leg...');
       const webPhone = (window as any).zdrmWebPhone;

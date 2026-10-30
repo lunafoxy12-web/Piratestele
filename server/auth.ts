@@ -14,7 +14,7 @@ export interface Session {
 }
 
 const sessions = new Map<string, Session>();
-const SESSION_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days persistent cache
 
 // Hydrate sessions from persistent database on startup
 function hydrateSessions() {

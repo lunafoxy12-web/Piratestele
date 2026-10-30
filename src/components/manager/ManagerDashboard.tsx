@@ -39,7 +39,94 @@ import {
   Voicemail,
   Zap,
   ArrowRight,
+  RotateCcw,
+  Edit,
+  Globe,
+  FileSpreadsheet,
+  FileCheck,
 } from 'lucide-react';
+
+export interface RegionOption {
+  code: string;
+  name: string;
+  dialCode: string;
+  flag: string;
+  example: string;
+}
+
+export const REGIONS: RegionOption[] = [
+  { code: 'US', name: 'United States & Canada', dialCode: '1', flag: '🇺🇸/🇨🇦', example: '2099722359 or +12099722359' },
+  { code: 'UK', name: 'United Kingdom', dialCode: '44', flag: '🇬🇧', example: '07577309348 or +447577309348' },
+  { code: 'TH', name: 'Thailand', dialCode: '66', flag: '🇹🇭', example: '0968967715 or +66968967715' },
+  { code: 'PK', name: 'Pakistan', dialCode: '92', flag: '🇵🇰', example: '03001234567 or +923001234567' },
+  { code: 'AE', name: 'United Arab Emirates', dialCode: '971', flag: '🇦🇪', example: '0501234567 or +971501234567' },
+  { code: 'SA', name: 'Saudi Arabia', dialCode: '966', flag: '🇸🇦', example: '0501234567 or +966501234567' },
+  { code: 'IN', name: 'India', dialCode: '91', flag: '🇮🇳', example: '09876543210 or +919876543210' },
+  { code: 'AU', name: 'Australia', dialCode: '61', flag: '🇦🇺', example: '0412345678 or +61412345678' },
+  { code: 'DE', name: 'Germany', dialCode: '49', flag: '🇩🇪', example: '015123456789 or +4915123456789' },
+  { code: 'FR', name: 'France', dialCode: '33', flag: '🇫🇷', example: '0612345678 or +33612345678' },
+  { code: 'CUSTOM', name: 'Other / International (Keep Prefix)', dialCode: '', flag: '🌐', example: '+[country_code][number]' },
+];
+
+export function normalizePhoneNumberForRegion(raw: string, regionCode: string): { normalized: string; valid: boolean; reason: string } {
+  if (!raw || !raw.trim()) {
+    return { normalized: '', valid: false, reason: 'Empty phone number' };
+  }
+  const clean = raw.trim();
+  const region = REGIONS.find((r) => r.code === regionCode) || REGIONS[0];
+
+  // If already starts with '+', validate digits
+  if (clean.startsWith('+')) {
+    const digits = clean.slice(1).replace(/\D/g, '');
+    if (digits.length >= 7 && digits.length <= 15) {
+      return { normalized: `+${digits}`, valid: true, reason: 'International E.164 verified' };
+    }
+    return { normalized: clean, valid: false, reason: 'Length must be 7-15 digits' };
+  }
+
+  // Strip all non-digits
+  let digits = clean.replace(/\D/g, '');
+  if (!digits) {
+    return { normalized: '', valid: false, reason: 'No numeric digits found' };
+  }
+
+  // Handle leading 00 international prefix
+  if (digits.startsWith('00')) {
+    const after00 = digits.slice(2);
+    if (after00.length >= 7 && after00.length <= 15) {
+      return { normalized: `+${after00}`, valid: true, reason: 'Converted 00 prefix to +' };
+    }
+  }
+
+  // Region specific rules
+  if (region.code === 'US') {
+    if (digits.length === 10) {
+      return { normalized: `+1${digits}`, valid: true, reason: 'Added USA +1 country code' };
+    }
+    if (digits.length === 11 && digits.startsWith('1')) {
+      return { normalized: `+${digits}`, valid: true, reason: 'Valid North American 11-digit' };
+    }
+  } else if (region.dialCode) {
+    // If number starts with leading '0', replace '0' with country dial code (e.g. 07577309348 -> 447577309348)
+    if (digits.startsWith('0')) {
+      digits = `${region.dialCode}${digits.slice(1)}`;
+      return { normalized: `+${digits}`, valid: true, reason: `Replaced domestic 0 with +${region.dialCode}` };
+    }
+    // If number doesn't have dial code yet, prepend it
+    if (!digits.startsWith(region.dialCode)) {
+      digits = `${region.dialCode}${digits}`;
+      return { normalized: `+${digits}`, valid: true, reason: `Auto-prepended +${region.dialCode}` };
+    }
+  }
+
+  const finalStr = digits.startsWith('+') ? digits : `+${digits}`;
+  const valid = digits.length >= 7 && digits.length <= 15;
+  return {
+    normalized: finalStr,
+    valid,
+    reason: valid ? `Valid with +${region.dialCode || ''}` : 'Length must be 7-15 digits',
+  };
+}
 
 export const ManagerDashboard: React.FC = () => {
   const { token, user } = useAuth();
@@ -100,6 +187,7 @@ export const ManagerDashboard: React.FC = () => {
   const [campaignForm, setCampaignForm] = useState({
     name: '',
     ivrConfigId: '',
+    targetRegion: 'US',
     targetPhone: '',
     csvText: '',
     routingType: 'IVR_THEN_DIRECT_AGENT' as 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION',
@@ -110,6 +198,12 @@ export const ManagerDashboard: React.FC = () => {
     voicemailDropEnabled: true,
     voicemailTemplateId: '',
   });
+
+  // Edit IVR for remaining numbers state
+  const [showEditIvrModal, setShowEditIvrModal] = useState<boolean>(false);
+  const [editingCampaign, setEditingCampaign] = useState<CampaignItem | null>(null);
+  const [newIvrConfigId, setNewIvrConfigId] = useState<string>('');
+
   const [managerPolicy, setManagerPolicy] = useState<{
     allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION' | 'BOTH';
     enforcedAgentLanguage: string;
@@ -197,6 +291,13 @@ export const ManagerDashboard: React.FC = () => {
   useEffect(() => {
     fetchData();
   }, [token, triggerRefresh]);
+
+  // Manager Dashboard: Ring beep sounds are strictly reserved for Agent Station only
+  useEffect(() => {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+    }
+  }, []);
 
   // Periodic polling for live calls
   useEffect(() => {
@@ -303,48 +404,41 @@ export const ManagerDashboard: React.FC = () => {
     if (!token) return;
 
     const targetList: Array<{ phoneNumber: string; name?: string }> = [];
+    const regionCode = campaignForm.targetRegion || 'US';
 
-    // Check target phone input first
+    // 1. Process single target phone input with region normalization
     if (campaignForm.targetPhone.trim()) {
-      let cleanTarget = campaignForm.targetPhone.trim().replace(/[^\d+]/g, '');
-      if (cleanTarget.length >= 7) {
-        if (!cleanTarget.startsWith('+')) {
-          if (cleanTarget.length === 10 && !cleanTarget.startsWith('0') && !cleanTarget.startsWith('1')) {
-            cleanTarget = `1${cleanTarget}`;
-          }
-          cleanTarget = `+${cleanTarget}`;
-        }
+      const norm = normalizePhoneNumberForRegion(campaignForm.targetPhone.trim(), regionCode);
+      if (norm.valid) {
         targetList.push({
-          phoneNumber: cleanTarget,
+          phoneNumber: norm.normalized,
           name: 'Target Customer',
         });
       }
     }
 
-    // Check textarea / CSV input for all uploaded numbers
+    // 2. Process batch/CSV numbers with region normalization
     if (campaignForm.csvText.trim()) {
       const rawLines = campaignForm.csvText.trim().split(/[\r\n]+/);
       for (const line of rawLines) {
-        if (!line.trim() || line.toLowerCase().includes('phonenumber')) continue;
-        const parts = line.split(',');
-        let phone = (parts[0] || '').trim().replace(/[^\d+]/g, '');
-        if (phone.length >= 7) {
-          if (!phone.startsWith('+')) {
-            if (phone.length === 10 && !phone.startsWith('0') && !phone.startsWith('1')) {
-              phone = `1${phone}`;
-            }
-            phone = `+${phone}`;
+        if (!line.trim() || line.toLowerCase().includes('phone') || line.toLowerCase().includes('number')) continue;
+        const parts = line.split(/[,\t;]/);
+        const rawPhone = parts[0]?.trim();
+        const contactName = parts[1]?.trim();
+        if (rawPhone) {
+          const norm = normalizePhoneNumberForRegion(rawPhone, regionCode);
+          if (norm.valid) {
+            targetList.push({
+              phoneNumber: norm.normalized,
+              name: contactName || undefined,
+            });
           }
-          targetList.push({
-            phoneNumber: phone,
-            name: parts[1]?.trim() || undefined,
-          });
         }
       }
     }
 
     if (targetList.length === 0) {
-      showNotification('error', 'Please enter a valid target PSTN mobile number to call (e.g. +12099722359).');
+      showNotification('error', `Please provide at least one valid phone number matching ${REGIONS.find(r => r.code === regionCode)?.name || 'selected region'}.`);
       return;
     }
 
@@ -379,11 +473,12 @@ export const ManagerDashboard: React.FC = () => {
         return;
       }
 
-      showNotification('success', `Campaign '${data.name}' (${campaignForm.routingType === 'AI_VOICE_TRANSLATION' ? 'AI Translation Bot' : 'IVR Menu'}) created! Calling ${targetList[0].phoneNumber} immediately.`);
+      showNotification('success', `Campaign '${data.name}' created with ${targetList.length} verified PSTN numbers! Initial dial dispatched.`);
       setShowCreateCampaignModal(false);
       setCampaignForm({
         name: '',
         ivrConfigId: '',
+        targetRegion: 'US',
         targetPhone: '',
         csvText: '',
         routingType: managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION' ? 'AI_VOICE_TRANSLATION' : 'IVR_THEN_DIRECT_AGENT',
@@ -400,6 +495,82 @@ export const ManagerDashboard: React.FC = () => {
       } else {
         await fetchData();
       }
+    } catch (err: any) {
+      showNotification('error', err.message);
+    }
+  };
+
+  const handleCampaignFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      const content = event.target?.result as string;
+      if (content) {
+        const lines = content.split(/[\r\n]+/).filter((l) => l.trim().length > 0);
+        const extracted: string[] = [];
+        for (const line of lines) {
+          if (line.toLowerCase().includes('phone') || line.toLowerCase().includes('number') || line.toLowerCase().includes('mobile')) continue;
+          const parts = line.split(/[,\t;]/);
+          const rawNum = parts[0]?.trim();
+          const name = parts[1]?.trim();
+          if (rawNum) {
+            extracted.push(name ? `${rawNum}, ${name}` : rawNum);
+          }
+        }
+        if (extracted.length > 0) {
+          setCampaignForm((prev) => ({
+            ...prev,
+            csvText: prev.csvText ? `${prev.csvText}\n${extracted.join('\n')}` : extracted.join('\n'),
+          }));
+          showNotification('success', `Imported ${extracted.length} records from ${file.name}. Formatted with selected region country code.`);
+        } else {
+          showNotification('error', 'No numbers detected in file.');
+        }
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  const handleRunRemainingCampaign = async (campaignId: string) => {
+    if (!token) return;
+    try {
+      const res = await fetch(`/api/manager/campaigns/${campaignId}/run-remaining`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showNotification('error', data.error || 'Failed to run remaining campaign.');
+        return;
+      }
+      showNotification('success', data.message || `Dispatched remaining numbers that did not press DTMF keys!`);
+      setActiveTab('calls');
+      fetchData();
+    } catch (err: any) {
+      showNotification('error', err.message);
+    }
+  };
+
+  const handleUpdateCampaignIvr = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!token || !editingCampaign || !newIvrConfigId) return;
+    try {
+      const res = await fetch(`/api/manager/campaigns/${editingCampaign.id}/ivr`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ ivrConfigId: newIvrConfigId }),
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        showNotification('error', data.error || 'Failed to update campaign IVR.');
+        return;
+      }
+      showNotification('success', data.message || `Campaign IVR updated successfully.`);
+      setShowEditIvrModal(false);
+      setEditingCampaign(null);
+      fetchData();
     } catch (err: any) {
       showNotification('error', err.message);
     }
@@ -954,6 +1125,7 @@ export const ManagerDashboard: React.FC = () => {
                 setCampaignForm({
                   name: `Campaign ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`,
                   ivrConfigId: ivrs[0]?.id || '',
+                  targetRegion: 'US',
                   targetPhone: '',
                   csvText: '',
                   routingType: defaultRouting,
@@ -1018,7 +1190,7 @@ export const ManagerDashboard: React.FC = () => {
                       </p>
                     </div>
 
-                    <div className="flex items-center gap-2">
+                    <div className="flex items-center gap-2 flex-wrap">
                       {camp.status === 'RUNNING' ? (
                         <button
                           onClick={() => handlePauseCampaign(camp.id)}
@@ -1036,6 +1208,30 @@ export const ManagerDashboard: React.FC = () => {
                           <span>Dial / Run Now</span>
                         </button>
                       )}
+
+                      <button
+                        type="button"
+                        onClick={() => handleRunRemainingCampaign(camp.id)}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-semibold rounded-lg shadow-xs transition-colors cursor-pointer"
+                        title="Redial only contacts who did not press DTMF keys in this campaign"
+                      >
+                        <RotateCcw className="w-3.5 h-3.5" />
+                        <span>Run Remaining (No DTMF)</span>
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setEditingCampaign(camp);
+                          setNewIvrConfigId(camp.ivrConfigId || ivrs[0]?.id || '');
+                          setShowEditIvrModal(true);
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 text-xs font-semibold rounded-lg transition-colors cursor-pointer"
+                        title="Change IVR voice prompt for remaining contacts in this campaign"
+                      >
+                        <Edit className="w-3.5 h-3.5" />
+                        <span>Edit IVR</span>
+                      </button>
                     </div>
                   </div>
 
@@ -1663,6 +1859,7 @@ export const ManagerDashboard: React.FC = () => {
                   <th className="py-3 px-4 text-left">Duration</th>
                   <th className="py-3 px-4 text-left">DTMF Key Pressed</th>
                   <th className="py-3 px-4 text-left">Connected Agent</th>
+                  <th className="py-3 px-4 text-left">Wrap-Up / Disposition</th>
                   <th className="py-3 px-4 text-left">Caller ID</th>
                   <th className="py-3 px-4 text-left">Timestamp / Note</th>
                 </tr>
@@ -1670,7 +1867,7 @@ export const ManagerDashboard: React.FC = () => {
               <tbody className="divide-y divide-slate-200">
                 {calls.length === 0 ? (
                   <tr>
-                    <td colSpan={7} className="py-8 text-center text-slate-400 text-xs">
+                    <td colSpan={8} className="py-8 text-center text-slate-400 text-xs">
                       No calls placed yet. Launch a campaign to see live call progress.
                     </td>
                   </tr>
@@ -1745,6 +1942,41 @@ export const ManagerDashboard: React.FC = () => {
                         <td className="py-3 px-4 text-xs font-semibold text-slate-800">
                           {agentName}
                         </td>
+                        <td className="py-3 px-4">
+                          {(call.disposition || (call as any).wrapUpNotes || call.notes) ? (
+                            <div className="space-y-1">
+                              {call.disposition && (
+                                <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full inline-block border ${
+                                  call.disposition === 'Resolved' || call.disposition === 'Sale Closed'
+                                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                                    : call.disposition === 'Follow-Up Needed'
+                                    ? 'bg-blue-50 text-blue-800 border-blue-300'
+                                    : call.disposition === 'Not Interested'
+                                    ? 'bg-slate-100 text-slate-700 border-slate-300'
+                                    : 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                                }`}>
+                                  {call.disposition}
+                                </span>
+                              )}
+                              {((call as any).wrapUpNotes || call.notes) && (
+                                <p className="text-[11px] text-slate-700 italic max-w-xs truncate" title={(call as any).wrapUpNotes || call.notes}>
+                                  📝 {(call as any).wrapUpNotes || call.notes}
+                                </p>
+                              )}
+                              {Array.isArray((call as any).wrapUpTags) && (call as any).wrapUpTags.length > 0 && (
+                                <div className="flex gap-1 flex-wrap">
+                                  {(call as any).wrapUpTags.map((tag: string, i: number) => (
+                                    <span key={i} className="text-[9px] bg-slate-100 text-slate-600 px-1.5 py-0.2 rounded font-medium">
+                                      #{tag}
+                                    </span>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
+                          ) : (
+                            <span className="text-slate-400 text-xs italic">Pending Wrap-Up</span>
+                          )}
+                        </td>
                         <td className="py-3 px-4 text-slate-500 font-mono text-xs">
                           {call.callerId}
                         </td>
@@ -1760,6 +1992,7 @@ export const ManagerDashboard: React.FC = () => {
                     );
                   })
                 )}
+
               </tbody>
             </table>
           </div>
@@ -2145,36 +2378,180 @@ export const ManagerDashboard: React.FC = () => {
                 </div>
               )}
 
-              {/* Recipient Phone Number */}
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Destination Phone Number to Call (Real PSTN SIM)
-                </label>
-                <input
-                  type="text"
-                  placeholder="+12099722359 or your physical mobile number"
-                  value={campaignForm.targetPhone}
-                  onChange={(e) => setCampaignForm({ ...campaignForm, targetPhone: e.target.value })}
-                  className="w-full text-sm border border-slate-300 rounded-lg p-2.5 font-mono focus:ring-2 focus:ring-blue-600"
-                />
-                <p className="text-[11px] text-slate-500 mt-1">
-                  Enter your physical mobile phone number (with country code, e.g. +1...). The system will dial it immediately.
+              {/* Target Calling Region & Country Code */}
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2">
+                <div className="flex items-center justify-between">
+                  <label className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                    <Globe className="w-4 h-4 text-blue-600" />
+                    <span>1. Target Region & Automatic Country Code</span>
+                  </label>
+                  <span className="text-[10px] bg-blue-100 text-blue-800 font-bold px-2 py-0.5 rounded">
+                    Prefix Auto-Format
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-500">
+                  Select your target calling region first. All entered or uploaded numbers without an international country code will automatically have the country code applied and validated.
                 </p>
+                <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  {REGIONS.map((r) => {
+                    const isSelected = campaignForm.targetRegion === r.code;
+                    return (
+                      <button
+                        key={r.code}
+                        type="button"
+                        onClick={() => setCampaignForm({ ...campaignForm, targetRegion: r.code })}
+                        className={`p-2 rounded-lg border text-left text-xs transition-all cursor-pointer flex items-center justify-between ${
+                          isSelected
+                            ? 'bg-blue-50 border-blue-500 ring-1 ring-blue-500 text-blue-950 font-bold'
+                            : 'bg-white border-slate-200 text-slate-700 hover:bg-slate-50'
+                        }`}
+                      >
+                        <span className="flex items-center gap-1.5 truncate">
+                          <span className="text-base">{r.flag}</span>
+                          <span className="truncate">{r.name}</span>
+                        </span>
+                        {r.dialCode && (
+                          <span className="text-[10px] font-mono text-slate-500 ml-1 shrink-0 font-bold">
+                            +{r.dialCode}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
               </div>
 
-              {/* Or paste batch */}
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Or Paste Multiple Numbers (Optional)
-                </label>
-                <textarea
-                  rows={2}
-                  placeholder="+12099722359, John&#10;+18045930160, Jane"
-                  value={campaignForm.csvText}
-                  onChange={(e) => setCampaignForm({ ...campaignForm, csvText: e.target.value })}
-                  className="w-full text-xs border border-slate-300 rounded-lg p-2.5 font-mono focus:ring-2 focus:ring-blue-600"
-                />
+              {/* 2. Destination Phone Numbers & File Upload */}
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    2. Destination Numbers (Direct Input or File Upload)
+                  </label>
+                  <label className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 text-xs font-medium rounded-lg shadow-2xs cursor-pointer transition-colors">
+                    <FileSpreadsheet className="w-3.5 h-3.5 text-emerald-600" />
+                    <span>Upload CSV / Excel / TXT</span>
+                    <input
+                      type="file"
+                      accept=".csv,.xls,.xlsx,.txt"
+                      className="hidden"
+                      onChange={handleCampaignFileUpload}
+                    />
+                  </label>
+                </div>
+
+                <div>
+                  <input
+                    type="text"
+                    placeholder={`e.g. ${REGIONS.find((r) => r.code === campaignForm.targetRegion)?.example || '+12099722359'}`}
+                    value={campaignForm.targetPhone}
+                    onChange={(e) => setCampaignForm({ ...campaignForm, targetPhone: e.target.value })}
+                    className="w-full text-sm border border-slate-300 rounded-lg p-2.5 font-mono focus:ring-2 focus:ring-blue-600"
+                  />
+                  <p className="text-[11px] text-slate-500 mt-1">
+                    Enter local or international number. If entered locally (e.g. 2099722359), selected region prefix (+{REGIONS.find((r) => r.code === campaignForm.targetRegion)?.dialCode || '1'}) is added automatically.
+                  </p>
+                </div>
+
+                <div>
+                  <div className="flex items-center justify-between mb-1">
+                    <span className="text-[11px] font-semibold text-slate-600">Or Paste Multiple Contacts (Phone, Name):</span>
+                    {campaignForm.csvText && (
+                      <button
+                        type="button"
+                        onClick={() => setCampaignForm({ ...campaignForm, csvText: '' })}
+                        className="text-[10px] text-slate-400 hover:text-red-600 cursor-pointer"
+                      >
+                        Clear list
+                      </button>
+                    )}
+                  </div>
+                  <textarea
+                    rows={2}
+                    placeholder="2099722359, John Doe&#10;+18045930160, Jane Smith"
+                    value={campaignForm.csvText}
+                    onChange={(e) => setCampaignForm({ ...campaignForm, csvText: e.target.value })}
+                    className="w-full text-xs border border-slate-300 rounded-lg p-2 font-mono focus:ring-2 focus:ring-blue-600"
+                  />
+                </div>
               </div>
+
+              {/* 3. Live Verified Number Preview with Green Checkmark */}
+              {(() => {
+                const previewItems: Array<{ raw: string; normalized: string; valid: boolean; reason: string; name?: string }> = [];
+                const regionCode = campaignForm.targetRegion || 'US';
+                if (campaignForm.targetPhone.trim()) {
+                  const res = normalizePhoneNumberForRegion(campaignForm.targetPhone.trim(), regionCode);
+                  previewItems.push({
+                    raw: campaignForm.targetPhone.trim(),
+                    normalized: res.normalized,
+                    valid: res.valid,
+                    reason: res.reason,
+                    name: 'Direct Input',
+                  });
+                }
+                if (campaignForm.csvText.trim()) {
+                  const lines = campaignForm.csvText.trim().split(/[\r\n]+/);
+                  for (const line of lines) {
+                    if (!line.trim() || line.toLowerCase().includes('phone') || line.toLowerCase().includes('number')) continue;
+                    const parts = line.split(/[,\t;]/);
+                    const num = parts[0]?.trim();
+                    const name = parts[1]?.trim();
+                    if (num) {
+                      const res = normalizePhoneNumberForRegion(num, regionCode);
+                      previewItems.push({
+                        raw: num,
+                        normalized: res.normalized,
+                        valid: res.valid,
+                        reason: res.reason,
+                        name,
+                      });
+                    }
+                  }
+                }
+                if (previewItems.length === 0) return null;
+                const validCount = previewItems.filter((p) => p.valid).length;
+                return (
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 space-y-2">
+                    <div className="flex items-center justify-between text-xs">
+                      <div className="font-bold text-slate-800 flex items-center gap-1.5">
+                        <FileCheck className="w-4 h-4 text-emerald-600" />
+                        <span>Pre-Call Validation Preview ({validCount}/{previewItems.length} Callable)</span>
+                      </div>
+                      <span className="text-[11px] text-slate-500">
+                        Region: {REGIONS.find((r) => r.code === regionCode)?.name} (+{REGIONS.find((r) => r.code === regionCode)?.dialCode})
+                      </span>
+                    </div>
+                    <div className="max-h-36 overflow-y-auto space-y-1 pr-1 divide-y divide-slate-100">
+                      {previewItems.slice(0, 8).map((item, idx) => (
+                        <div key={idx} className="pt-1 first:pt-0 flex items-center justify-between text-xs font-mono">
+                          <div className="flex items-center gap-2 truncate">
+                            <span className="text-slate-400 text-[10px]">#{idx + 1}</span>
+                            <span className="font-bold text-slate-900">{item.normalized || item.raw}</span>
+                            {item.name && <span className="text-[10px] text-slate-500 font-sans">({item.name})</span>}
+                          </div>
+                          <div>
+                            {item.valid ? (
+                              <span className="inline-flex items-center gap-1 bg-emerald-50 text-emerald-800 font-bold px-2 py-0.5 rounded text-[10px] border border-emerald-300">
+                                <Check className="w-3 h-3 text-emerald-600" />
+                                <span>✓ Valid PSTN Format</span>
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1 bg-red-50 text-red-800 font-semibold px-2 py-0.5 rounded text-[10px] border border-red-300">
+                                <span>✕ {item.reason}</span>
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      ))}
+                      {previewItems.length > 8 && (
+                        <div className="text-[10px] text-slate-500 text-center pt-1 font-sans">
+                          + {previewItems.length - 8} more numbers verified and ready to dial
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                );
+              })()}
 
               {/* Voicemail Drop on No-Answer / Busy */}
               <div className="bg-indigo-50/70 border border-indigo-200 rounded-xl p-3.5 space-y-3">
@@ -2702,6 +3079,99 @@ export const ManagerDashboard: React.FC = () => {
                 >
                   <Zap className="w-3.5 h-3.5" />
                   <span>{isManagerDropping ? 'Dropping to PSTN...' : 'Drop Voicemail Now'}</span>
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ========================================== */}
+      {/* MODAL: EDIT IVR FOR REMAINING NUMBERS */}
+      {/* ========================================== */}
+      {showEditIvrModal && editingCampaign && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4 z-50">
+          <div className="bg-white rounded-xl shadow-xl max-w-md w-full p-6 space-y-4 border border-slate-200">
+            <div className="flex justify-between items-start">
+              <div>
+                <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <Edit className="w-4 h-4 text-indigo-600" />
+                  <span>Change IVR for Remaining Calls</span>
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Campaign: <span className="font-semibold text-slate-700">{editingCampaign.name}</span>
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setShowEditIvrModal(false);
+                  setEditingCampaign(null);
+                }}
+                className="text-slate-400 hover:text-slate-600 text-lg font-bold cursor-pointer"
+              >
+                &times;
+              </button>
+            </div>
+
+            <div className="p-3 bg-blue-50 border border-blue-200 rounded-lg text-xs text-blue-900 space-y-1">
+              <p className="font-semibold">Applies to All Remaining Undialed Numbers</p>
+              <p className="text-[11px] text-blue-800">
+                The selected IVR voice prompt will immediately be linked to the carrier PBX scenario for all subsequent outbound calls in this campaign.
+              </p>
+            </div>
+
+            <form onSubmit={handleUpdateCampaignIvr} className="space-y-4">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Select New IVR Voice Prompt:
+                </label>
+                <select
+                  required
+                  value={newIvrConfigId}
+                  onChange={(e) => setNewIvrConfigId(e.target.value)}
+                  className="w-full text-xs border border-slate-300 rounded-lg p-2.5 bg-white font-medium focus:ring-2 focus:ring-indigo-500"
+                >
+                  <option value="">-- Choose New IVR Voice --</option>
+                  {ivrs.map((ivr) => (
+                    <option key={ivr.id} value={ivr.id}>
+                      🎙️ {ivr.name} (Key 1 &rarr; Transfer to Live Agent)
+                    </option>
+                  ))}
+                </select>
+              </div>
+
+              {/* IVR Voice preview if chosen */}
+              {(() => {
+                const selected = ivrs.find((i) => i.id === newIvrConfigId);
+                if (!selected) return null;
+                return (
+                  <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1">
+                    <div className="font-semibold text-slate-800">Prompt Text:</div>
+                    <p className="italic text-slate-600 text-[11px]">
+                      "{selected.greetingText?.replace(/^["']|["']$/g, '').trim()}"
+                    </p>
+                  </div>
+                );
+              })()}
+
+              <div className="flex justify-end gap-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setShowEditIvrModal(false);
+                    setEditingCampaign(null);
+                  }}
+                  className="px-4 py-2 border border-slate-300 text-slate-700 text-xs font-medium rounded-lg hover:bg-slate-50 cursor-pointer"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="submit"
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 text-white text-xs font-bold rounded-lg shadow-xs flex items-center gap-1.5 cursor-pointer"
+                >
+                  <Check className="w-3.5 h-3.5" />
+                  <span>Apply IVR to Remaining Calls</span>
                 </button>
               </div>
             </form>

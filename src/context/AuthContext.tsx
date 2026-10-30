@@ -14,9 +14,16 @@ interface AuthContextType {
 const AuthContext = createContext<AuthContextType | undefined>(undefined);
 
 export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [user, setUser] = useState<UserProfile | null>(null);
+  const [user, setUser] = useState<UserProfile | null>(() => {
+    try {
+      const savedUser = localStorage.getItem('pwt_user');
+      return savedUser ? JSON.parse(savedUser) : null;
+    } catch {
+      return null;
+    }
+  });
   const [token, setToken] = useState<string | null>(() => localStorage.getItem('pwt_token'));
-  const [isLoading, setIsLoading] = useState<boolean>(true);
+  const [isLoading, setIsLoading] = useState<boolean>(!token ? false : !user);
 
   // Validate active session token on mount
   useEffect(() => {
@@ -36,9 +43,11 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (res.ok) {
           const data = await res.json();
           setUser(data.user);
+          localStorage.setItem('pwt_user', JSON.stringify(data.user));
         } else {
           // Token expired or invalid
           localStorage.removeItem('pwt_token');
+          localStorage.removeItem('pwt_user');
           setToken(null);
           setUser(null);
         }
@@ -66,6 +75,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       localStorage.setItem('pwt_token', data.token);
+      localStorage.setItem('pwt_user', JSON.stringify(data.user));
       setToken(data.token);
       setUser(data.user);
       return { success: true };
@@ -86,6 +96,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.error('Logout error:', err);
     } finally {
       localStorage.removeItem('pwt_token');
+      localStorage.removeItem('pwt_user');
       setToken(null);
       setUser(null);
     }

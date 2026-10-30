@@ -2493,8 +2493,17 @@ router.post(['/manager/ivr', '/manager/ivr-configs'], authenticate, requireRole(
       }
 
       if (!audioBuf) {
-        // Create valid WAV buffer for TTS prompts
-        audioBuf = createSimpleWavAudioBuffer(2500);
+        const textToSynth = greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+        const ttsBase64 = await TranslationService.synthesizeSpeech({
+          text: textToSynth,
+          language: 'English',
+          voice: 'Aoede',
+        });
+        if (ttsBase64) {
+          audioBuf = Buffer.from(ttsBase64, 'base64');
+        } else {
+          audioBuf = createSimpleWavAudioBuffer(2500);
+        }
       }
 
       const uploadResult = await ZadarmaConnector.uploadIvrSound({
@@ -2509,6 +2518,15 @@ router.post(['/manager/ivr', '/manager/ivr-configs'], authenticate, requireRole(
         newIvr.zadarmaSoundId = uploadResult.soundId;
         newIvr.zadarmaSoundSyncedAt = new Date().toISOString();
         console.log(`[ZADARMA PBX IVR] Successfully uploaded voice '${name}' to Zadarma PBX (Sound ID: ${uploadResult.soundId})`);
+
+        // Automatically link this sound to PBX scenario 6ac669ac99688ec02e009606
+        await ZadarmaConnector.updateIvrScenario({
+          apiKey: zadarmaAuth.apiKey,
+          apiSecret: zadarmaAuth.apiSecret,
+          scenarioId: '6ac669ac99688ec02e009606',
+          soundId: uploadResult.soundId,
+          greetingSoundId: uploadResult.soundId,
+        });
       }
     } catch (err: any) {
       console.warn(`[ZADARMA PBX IVR] Automatic voice upload failed: ${err.message}`);
@@ -2550,7 +2568,17 @@ router.post(['/manager/ivr/:id/sync-zadarma', '/manager/ivr-configs/:id/sync-zad
     }
 
     if (!audioBuf) {
-      audioBuf = createSimpleWavAudioBuffer(2500);
+      const textToSynth = ivr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+      const ttsBase64 = await TranslationService.synthesizeSpeech({
+        text: textToSynth,
+        language: 'English',
+        voice: 'Aoede',
+      });
+      if (ttsBase64) {
+        audioBuf = Buffer.from(ttsBase64, 'base64');
+      } else {
+        audioBuf = createSimpleWavAudioBuffer(2500);
+      }
     }
 
     const uploadResult = await ZadarmaConnector.uploadIvrSound({
@@ -2571,11 +2599,20 @@ router.post(['/manager/ivr/:id/sync-zadarma', '/manager/ivr-configs/:id/sync-zad
         }
       });
 
+      // Link to Scenario
+      await ZadarmaConnector.updateIvrScenario({
+        apiKey: zadarmaAuth.apiKey,
+        apiSecret: zadarmaAuth.apiSecret,
+        scenarioId: '6ac669ac99688ec02e009606',
+        soundId: uploadResult.soundId,
+        greetingSoundId: uploadResult.soundId,
+      });
+
       return res.json({
         success: true,
         soundId: uploadResult.soundId,
         soundName: uploadResult.soundName,
-        message: `Voice successfully uploaded to Zadarma Cloud PBX! (Sound ID: ${uploadResult.soundId}). Recipient will now hear this greeting on PSTN calls.`,
+        message: `Voice successfully uploaded to Zadarma Cloud PBX and linked to Scenario! (Sound ID: ${uploadResult.soundId}). Recipient will now hear this greeting on PSTN calls.`,
       });
     }
 
@@ -2583,6 +2620,7 @@ router.post(['/manager/ivr/:id/sync-zadarma', '/manager/ivr-configs/:id/sync-zad
       error: uploadResult.message || 'Zadarma PBX rejected the sound file upload.',
     });
   } catch (err: any) {
+
     return res.status(500).json({ error: `Upload to Zadarma failed: ${err.message}` });
   }
 });
@@ -3085,6 +3123,125 @@ router.post('/manager/campaigns/:id/pause', authenticate, requireRole(['manager'
   res.json({ success: true, message: 'Campaign paused.' });
 });
 
+// Run Remaining Campaign: Dial only contacts that did NOT press DTMF keys (skipping those who responded)
+router.post('/manager/campaigns/:id/run-remaining', authenticate, requireRole(['manager', 'admin']), async (req: AuthenticatedRequest, res: Response) => {
+  const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : 'mgr_alpha');
+  const { id } = req.params;
+
+  const data = db.get();
+  const campaign = data.campaigns.find((c) => c.id === id && (c.managerId === managerId || req.user?.role === 'admin'));
+  if (!campaign) return res.status(404).json({ error: 'Campaign not found.' });
+
+  // 1. Check healthy SIP connection
+  const healthySip = telephony.getHealthySipConnection(managerId, campaign.sipConnectionId);
+  if (!healthySip) {
+    return res.status(503).json({
+      error: 'Cannot run campaign: All assigned SIP connections are currently offline or unhealthy.',
+    });
+  }
+
+  // 2. Identify which contacts already pressed DTMF or bridged with an agent
+  const campaignCalls = data.calls.filter((c) => c.campaignId === id);
+  const responderCallIds = new Set(
+    campaignCalls
+      .filter((c) => (c.dtmfSequence && c.dtmfSequence.trim().length > 0) || c.status === 'BRIDGED')
+      .map((c) => c.id)
+  );
+
+  const contacts = data.campaign_contacts.filter((c) => c.campaignId === id);
+  let queuedRemainingCount = 0;
+  let skippedResponderCount = 0;
+
+  await db.update((d) => {
+    const c = d.campaigns.find((item) => item.id === id);
+    if (c) {
+      c.status = 'RUNNING';
+      c.completedAt = undefined;
+    }
+
+    const campContacts = d.campaign_contacts.filter((item) => item.campaignId === id);
+    campContacts.forEach((contact) => {
+      // If contact made a call that pressed DTMF, SKIP it!
+      if (contact.callId && responderCallIds.has(contact.callId)) {
+        skippedResponderCount++;
+        return;
+      }
+
+      // If valid number and did NOT press DTMF, queue for dialing
+      if (contact.validationStatus === 'VALID') {
+        contact.status = 'QUEUED';
+        contact.attempts = 0;
+        contact.callId = undefined;
+        queuedRemainingCount++;
+      }
+    });
+  });
+
+  realtime.broadcast('campaign.progress', {
+    campaignId: id,
+    status: 'RUNNING',
+    message: `Run Remaining activated: ${queuedRemainingCount} non-DTMF numbers queued (${skippedResponderCount} DTMF responders skipped).`,
+  }, { managerId });
+
+  res.json({
+    success: true,
+    campaignId: id,
+    queuedRemainingCount,
+    skippedResponderCount,
+    message: `Run Remaining active! Queued ${queuedRemainingCount} numbers that didn't press DTMF keys. Skipped ${skippedResponderCount} contacts who already pressed DTMF keys.`,
+  });
+});
+
+// Edit IVR for running/paused/active campaign's remaining numbers
+router.patch('/manager/campaigns/:id/ivr', authenticate, requireRole(['manager', 'admin']), async (req: AuthenticatedRequest, res: Response) => {
+  const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : 'mgr_alpha');
+  const { id } = req.params;
+  const { ivrConfigId } = req.body;
+
+  if (!ivrConfigId) {
+    return res.status(400).json({ error: 'New IVR configuration ID is required.' });
+  }
+
+  const data = db.get();
+  const campaign = data.campaigns.find((c) => c.id === id && (c.managerId === managerId || req.user?.role === 'admin'));
+  if (!campaign) return res.status(404).json({ error: 'Campaign not found.' });
+
+  const ivr = data.ivr_configs.find((i) => i.id === ivrConfigId);
+  if (!ivr) return res.status(404).json({ error: 'Selected IVR configuration not found.' });
+
+  await db.update((d) => {
+    const c = d.campaigns.find((item) => item.id === id);
+    if (c) {
+      c.ivrConfigId = ivrConfigId;
+    }
+  });
+
+  // If Zadarma provider active, link new IVR sound to scenario
+  const zadarmaAuth = getActiveZadarmaProvider(managerId);
+  if (zadarmaAuth.apiKey && zadarmaAuth.apiSecret && ivr.zadarmaSoundId) {
+    try {
+      await ZadarmaConnector.updateIvrScenario({
+        apiKey: zadarmaAuth.apiKey,
+        apiSecret: zadarmaAuth.apiSecret,
+        scenarioId: '6ac669ac99688ec02e009606',
+        soundId: ivr.zadarmaSoundId,
+        greetingSoundId: ivr.zadarmaSoundId,
+      });
+      console.log(`[CAMPAIGN EDIT IVR] Updated PBX scenario 6ac669ac99688ec02e009606 to sound ${ivr.zadarmaSoundId} for campaign ${id}`);
+    } catch (e: any) {
+      console.warn('[CAMPAIGN EDIT IVR] PBX scenario update note:', e.message);
+    }
+  }
+
+  res.json({
+    success: true,
+    campaignId: id,
+    ivrConfigId,
+    ivrName: ivr.name,
+    message: `Campaign IVR updated to '${ivr.name}'! All remaining dials will now use this IVR voice.`,
+  });
+});
+
 // Manager Reports (Calls filtered strictly by managerId)
 router.get('/manager/reports', authenticate, requireRole(['manager']), (req: AuthenticatedRequest, res: Response) => {
   const managerId = req.managerId!;
@@ -3209,10 +3366,28 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
     openCalls.sort((a, b) => new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime());
 
     const candidate = openCalls.find((c) => {
-      if (c.agentId !== agent!.id) return false;
-      if (!['BRIDGED', 'RINGING', 'DIALING', 'ANSWERED'].includes(c.status)) return false;
-      if (c.campaignId && !(c as any).isDirectTranslationCall && (!c.dtmfSequence || c.dtmfSequence.length === 0)) return false;
-      return true;
+      // Must belong strictly to this agent's manager
+      if (c.managerId && agent!.managerId && c.managerId !== agent!.managerId) return false;
+
+      // Agent must be AVAILABLE (or already assigned to this call) to take a new call
+      if (agent!.state !== 'AVAILABLE' && agent!.currentCallId !== c.id) return false;
+
+      // For IVR campaign calls: customer MUST have pressed DTMF 1 (or direct translation) before agent rings
+      if (c.campaignId && !(c as any).isDirectTranslationCall && (!c.dtmfSequence || c.dtmfSequence.length === 0)) {
+        return false;
+      }
+
+      // Priority 1: Call already assigned to this specific agent
+      if (c.agentId === agent!.id && ['BRIDGED', 'RINGING', 'DIALING', 'ANSWERED'].includes(c.status)) {
+        return true;
+      }
+
+      // Priority 2: Unassigned call belonging to this manager that has bridged or is ready
+      if (!c.agentId && c.managerId === agent!.managerId && ['BRIDGED', 'RINGING'].includes(c.status)) {
+        return true;
+      }
+
+      return false;
     });
 
     if (candidate) {
@@ -3228,13 +3403,19 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
           agt.currentCallId = candidate!.id;
           agt.lastStateChange = new Date().toISOString();
         }
+        const callTarget = d.calls.find((c) => c.id === candidate!.id);
+        if (callTarget && !callTarget.agentId) {
+          callTarget.agentId = agent!.id;
+        }
       });
       activeCallDtmf = data.dtmf_events
         .filter((d) => d.callId === candidate!.id)
         .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
     } else {
-      // No valid call for agent: ensure agent is NOT ringing or busy on a phantom call
-      if (agent.state === 'RINGING' || (agent.state === 'BUSY' && !agent.currentCallId)) {
+      // Prevent resetting agent state during 3-second auto-answer countdown (allow 15s grace window)
+      const lastChange = agent.lastStateChange ? new Date(agent.lastStateChange).getTime() : 0;
+      const isRecentState = Date.now() - lastChange < 15000;
+      if (!isRecentState && (agent.state === 'RINGING' || (agent.state === 'BUSY' && !agent.currentCallId))) {
         await db.update((d) => {
           const agt = d.agents.find((a) => a.id === agent!.id);
           if (agt) {
@@ -3312,6 +3493,40 @@ router.post('/agent/phone', authenticate, requireRole(['agent', 'admin', 'manage
     }
   });
   res.json({ success: true, phoneNumber: cleanPhone, message: 'Agent phone updated successfully.' });
+});
+
+// Save Call Wrap-Up Data (Disposition, Agent Notes, Tags)
+router.post('/agent/call-notes', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
+  const { callId, notes, disposition, tags } = req.body;
+  if (!callId) return res.status(400).json({ error: 'Call ID is required.' });
+
+  const now = new Date().toISOString();
+  await db.update((d) => {
+    const call = d.calls.find((c) => c.id === callId);
+    if (call) {
+      if (notes !== undefined) {
+        call.notes = notes;
+        call.wrapUpNotes = notes;
+      }
+      if (disposition !== undefined) {
+        call.disposition = disposition;
+      }
+      if (tags && Array.isArray(tags)) {
+        call.wrapUpTags = tags;
+      }
+      call.wrappedUpAt = now;
+    }
+  });
+
+  realtime.broadcast('call.notes_updated', {
+    callId,
+    notes,
+    disposition,
+    tags,
+    updatedAt: now,
+  });
+
+  res.json({ success: true, message: 'Wrap-up details saved successfully.' });
 });
 
 // Force-bridge an active or dialing call directly with agent station
@@ -3568,6 +3783,7 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
     realtime.broadcast('agent.incoming_call', {
       callId: call.id,
       agentId,
+      managerId: call.managerId,
       customerNumber: call.customerNumber,
       callerId: call.callerId,
       startTime: call.startTime,
@@ -3576,7 +3792,7 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
       isTransferredFromIvr: true,
       transferReason: `Customer pressed DTMF ${effectiveDigit} in IVR menu`,
       dtmfSequence: newSeq,
-    });
+    }, { role: 'agent', agentId, managerId: call.managerId });
 
     return res.json({
       success: true,
@@ -3640,6 +3856,7 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
   realtime.broadcast('agent.incoming_call', {
     callId,
     agentId,
+    managerId: req.managerId || 'mgr_alpha',
     customerNumber: caller || 'PSTN Caller',
     callerId: '+18045930160',
     startTime: now,
@@ -3648,7 +3865,7 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
     isTransferredFromIvr: true,
     transferReason: `Customer pressed DTMF ${effectiveDigit}`,
     dtmfSequence: effectiveDigit,
-  });
+  }, { role: 'agent', agentId, managerId: req.managerId || 'mgr_alpha' });
 
   res.json({ success: true, callId, agentId, dtmfDigit: effectiveDigit });
 });

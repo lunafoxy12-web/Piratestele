@@ -3,6 +3,8 @@ import { db, Call, Campaign, CampaignContact, DtmfEvent, SipConnection, SystemEr
 import { makeTwilioCall, makeSignalWireCall } from './twilio.ts';
 import { SignalWireTrunkConnector } from './signalwireTrunkConnector.ts';
 import { ZadarmaConnector } from './zadarma.ts';
+import { TranslationService } from './services/translationService.ts';
+import { convertTo8kMonoWav } from './services/audioUtils.ts';
 
 // Explicit WebRTC & SIP Audio Stream Session Tracking
 export interface AudioStreamSession {
@@ -89,14 +91,32 @@ class RealtimeBroadcaster {
   }
 
   public broadcast(event: string, data: any, filter?: { role?: string; managerId?: string; agentId?: string }): void {
-    const isCallEvent = event.startsWith('call.') || event.startsWith('agent.') || event.startsWith('dtmf.');
     for (const client of this.clients.values()) {
-      if (filter) {
-        if (filter.role && client.role !== filter.role && client.role !== 'admin') continue;
-        // Don't filter out active agents or admins for real-time call, bridge, and DTMF events
-        if (filter.managerId && client.managerId && client.managerId !== filter.managerId && client.role !== 'admin' && !(client.role === 'agent' && isCallEvent)) continue;
-        if (filter.agentId && client.agentId && client.agentId !== filter.agentId && client.role !== 'admin') continue;
+      // 1. Role filter
+      if (filter?.role) {
+        if (client.role !== filter.role && client.role !== 'admin') continue;
       }
+
+      // 2. Ring beep & agent incoming call events must NEVER be dispatched to manager dashboards
+      if ((event === 'agent.incoming_call' || event === 'agent.ringing') && client.role === 'manager') {
+        continue;
+      }
+
+      // 3. Strict Manager Isolation:
+      // An agent or manager must match the managerId of the campaign / call
+      if (filter?.managerId) {
+        if (client.managerId && client.managerId !== filter.managerId && client.role !== 'admin') {
+          continue;
+        }
+      }
+
+      // 4. Strict Agent Targeting: If targeted to a specific agentId, only that agent receives it
+      if (filter?.agentId && client.role !== 'admin') {
+        if (client.role === 'agent' && client.agentId && client.agentId !== filter.agentId) {
+          continue;
+        }
+      }
+
       try {
         client.send(event, data);
       } catch (err) {
@@ -895,15 +915,62 @@ class TelephonyEngine {
 
       // Ensure manager's IVR sound is linked to Zadarma Cloud PBX Scenario so the PSTN caller hears it
       if (!isAiTranslationMode) {
-        const soundToLink = ivr?.zadarmaSoundId || '6acb652e621acf6feb0535e7';
+        let soundToLink = ivr?.zadarmaSoundId;
+
+        // If IVR sound hasn't been uploaded to Zadarma yet, synthesize and upload now
+        if (!soundToLink || soundToLink === '6acb652e621acf6feb0535e7') {
+          try {
+            console.log(`[ZADARMA PBX IVR] Uploading manager's custom voice '${ivr?.name || 'Manager IVR'}' to Zadarma PBX...`);
+            let audioBuf: Buffer | null = null;
+            if (ivr?.audioUrl && ivr.audioUrl.startsWith('data:')) {
+              const matches = ivr.audioUrl.match(/^data:([^;]+);base64,(.+)$/);
+              if (matches) audioBuf = Buffer.from(matches[2], 'base64');
+            }
+            if (!audioBuf) {
+              const textToSpeak = ivr?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+              const ttsBase64 = await TranslationService.synthesizeSpeech({
+                text: textToSpeak,
+                language: 'English',
+                voice: 'Aoede',
+              });
+              if (ttsBase64) audioBuf = Buffer.from(ttsBase64, 'base64');
+            }
+            if (audioBuf) {
+              const wav8k = convertTo8kMonoWav(audioBuf);
+              const upRes = await ZadarmaConnector.uploadIvrSound({
+                apiKey,
+                apiSecret,
+                name: (ivr?.name || 'ivr_custom').replace(/[^a-zA-Z0-9_\-]/g, '_'),
+                audioBuffer: wav8k,
+                fileName: `${(ivr?.name || 'ivr_custom').replace(/[^a-zA-Z0-9_\-]/g, '_')}.wav`,
+              });
+              if (upRes.success && upRes.soundId) {
+                soundToLink = upRes.soundId;
+                await db.update((d) => {
+                  const targetIvr = d.ivr_configs.find((i) => i.id === ivr.id);
+                  if (targetIvr) {
+                    targetIvr.zadarmaSoundId = upRes.soundId;
+                    targetIvr.zadarmaSoundSyncedAt = new Date().toISOString();
+                  }
+                });
+                console.log(`[ZADARMA PBX IVR] Custom sound uploaded with ID: ${soundToLink}`);
+              }
+            }
+          } catch (synthErr: any) {
+            console.warn('[ZADARMA PBX IVR] Dynamic TTS upload note:', synthErr?.message);
+          }
+        }
+
+        const effectiveSound = soundToLink || '6ae34ecbad7b131b13004922';
         try {
-          await ZadarmaConnector.requestApi(
-            '/v1/pbx/ivr/scenario/edit/',
-            { id: '6ac669ac99688ec02e009606', sound_id: soundToLink },
-            { apiKey, apiSecret },
-            'PUT'
-          );
-          console.log(`[ZADARMA PBX IVR] Linked sound '${soundToLink}' (${ivr?.name || 'Manager IVR'}) to PBX scenario 6ac669ac99688ec02e009606`);
+          await ZadarmaConnector.updateIvrScenario({
+            apiKey,
+            apiSecret,
+            scenarioId: '6ac669ac99688ec02e009606',
+            soundId: effectiveSound,
+            greetingSoundId: effectiveSound,
+          });
+          console.log(`[ZADARMA PBX IVR] Successfully linked sound '${effectiveSound}' (${ivr?.name || 'Manager IVR'}) to PBX scenario 6ac669ac99688ec02e009606`);
         } catch (linkErr) {
           console.warn('[ZADARMA PBX IVR] Scenario sound link note:', linkErr);
         }
@@ -1267,7 +1334,7 @@ class TelephonyEngine {
       });
     });
 
-    // Real-time broadcast for Admin & Manager monitors
+    // Real-time broadcast for Admin & Manager monitors (strictly filtered by manager)
     realtime.broadcast('dtmf.received', {
       callId,
       digit,
@@ -1278,7 +1345,7 @@ class TelephonyEngine {
       action: resultingAction,
       customerPhone: call.customerNumber,
       managerId: call.managerId,
-    });
+    }, { managerId: call.managerId });
 
     // Execute Resulting Action
     let transferDetails: any = null;
@@ -1457,10 +1524,11 @@ class TelephonyEngine {
       });
     });
 
-    // Alert the agent browser via SSE
+    // Alert ONLY the selected available agent browser of this specific manager via SSE
     realtime.broadcast('agent.incoming_call', {
       callId,
       agentId: selectedAgent.id,
+      managerId: targetManagerId,
       customerNumber: call.customerNumber,
       callerId: call.callerId,
       startTime: call.startTime,
@@ -1468,13 +1536,14 @@ class TelephonyEngine {
       dtmfDigit: call.dtmfSequence || '1',
       isTransferredFromIvr: true,
       transferReason: 'PSTN caller pressed DTMF 1 in IVR menu',
-    });
+    }, { role: 'agent', agentId: selectedAgent.id, managerId: targetManagerId });
 
     realtime.broadcast('agent.state_changed', {
       agentId: selectedAgent.id,
+      managerId: targetManagerId,
       state: 'RINGING',
       currentCallId: callId,
-    });
+    }, { role: 'agent', agentId: selectedAgent.id, managerId: targetManagerId });
 
     return {
       success: true,

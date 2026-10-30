@@ -510,6 +510,7 @@ zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager', '
     if (isDirectMode) {
       realtime.broadcast('agent.incoming_call', {
         agentId: resolvedAgentId,
+        managerId: req.managerId,
         callId,
         callerId: resolvedFrom,
         customerNumber: to,
@@ -517,13 +518,14 @@ zadarmaRouter.post('/callback', authenticate, requireRole(['admin', 'manager', '
         isDirectTranslationCall: true,
         agentLanguage: agentLanguage || 'Urdu',
         customerLanguage: customerLanguage || 'Arabic',
-      });
+      }, { role: 'agent', agentId: resolvedAgentId, managerId: req.managerId });
 
       realtime.broadcast('agent.state_changed', {
         agentId: resolvedAgentId,
+        managerId: req.managerId,
         state: 'BUSY',
         currentCallId: callId,
-      });
+      }, { role: 'agent', agentId: resolvedAgentId, managerId: req.managerId });
     }
 
     return res.json({

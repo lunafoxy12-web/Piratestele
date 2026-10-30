@@ -299,6 +299,9 @@ export interface Call {
   recordingUrl?: string;
   notes?: string;
   disposition?: string;
+  wrapUpNotes?: string;
+  wrapUpTags?: string[];
+  wrappedUpAt?: string;
   voicemailDropped?: boolean;
   voicemailDropId?: string;
 }
