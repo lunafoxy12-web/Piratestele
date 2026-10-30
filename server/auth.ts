@@ -60,7 +60,10 @@ export function createSession(user: User): { token: string; session: Session } {
     );
     if (agt) {
       agentId = agt.id;
-      managerId = agt.managerId || 'mgr_alpha';
+      managerId = agt.managerId || (user as any).managerId || 'mgr_alpha';
+    } else {
+      agentId = (user as any).agentId || user.id;
+      managerId = (user as any).managerId || 'mgr_alpha';
     }
   }
 

@@ -3707,38 +3707,8 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
       options: ivr.options || [],
     } : null;
 
-    // Case A: Initial media connection (NO DTMF digit yet) on an IVR campaign call
-    if (!digit && isIvrCall) {
-      console.log(`[WEBRTC INCOMING] Initial media leg connected for IVR call ${call.id}. Setting status to IVR_ACTIVE to stream manager IVR prompt.`);
-      await db.update((d) => {
-        const c = d.calls.find((item) => item.id === call!.id);
-        if (c) {
-          c.status = 'IVR_ACTIVE';
-          c.answerTime = c.answerTime || now;
-          c.sipResponseCode = 200;
-          c.sipResponseText = '200 OK (PSTN Recipient Answered - Streaming Manager IVR Voice)';
-        }
-      });
-
-      realtime.broadcast('call.ivr_active', {
-        callId: call.id,
-        status: 'IVR_ACTIVE',
-        customerNumber: call.customerNumber,
-        ivrGreetingText: ivrConfigPayload?.greetingText,
-      }, { managerId: call.managerId });
-
-      return res.json({
-        success: true,
-        callId: call.id,
-        status: 'IVR_ACTIVE',
-        isIvrCall: true,
-        playIvrGreeting: true,
-        ivrConfig: ivrConfigPayload,
-        agentId,
-      });
-    }
-
-    // Case B: Real DTMF pressed (or direct zero-IVR call)
+    // WebRTC Extension 100 media connection reached agent station.
+    // In Zadarma PBX scenario, Extension 100 is dialed when recipient presses DTMF 1 (or direct transfer).
     const effectiveDigit = String(digit || '1').trim();
     const existingSeq = call.dtmfSequence || '';
     const newSeq = existingSeq ? `${existingSeq}${effectiveDigit}` : effectiveDigit;
@@ -3792,29 +3762,21 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
       isTransferredFromIvr: true,
       transferReason: `Customer pressed DTMF ${effectiveDigit} in IVR menu`,
       dtmfSequence: newSeq,
-    }, { role: 'agent', agentId, managerId: call.managerId });
+    }, { role: 'agent', managerId: call.managerId });
 
     return res.json({
       success: true,
       callId: call.id,
       status: 'RINGING',
-      isIvrCall,
+      isIvrCall: false,
       dtmfDigit: effectiveDigit,
+      managerId: call.managerId,
       ivrConfig: ivrConfigPayload,
       agentId,
     });
   }
 
-  // If no existing call was matched, only ring agent if a DTMF digit was actually pressed or confirmed
-  if (!digit) {
-    return res.json({
-      success: true,
-      message: 'Initial media connection acknowledged. Awaiting DTMF key press from PSTN recipient.',
-      isIvrCall: true,
-      playIvrGreeting: false,
-    });
-  }
-
+  // If no existing call was matched, create call record with DTMF digit 1 and ring agent
   const callId = `call_zd_webrtc_${Date.now()}`;
   const effectiveDigit = String(digit || '1').trim();
   await db.update((d) => {

@@ -45,7 +45,7 @@ interface RtcAudioStats {
 
 export const AgentApp: React.FC = () => {
   const { token, user } = useAuth();
-  const { latestAgentEvent, liveDtmfEvents, latestVoiceMessage, triggerRefresh } = useRealtime();
+  const { latestAgentEvent, latestIncomingCall, liveDtmfEvents, latestVoiceMessage, triggerRefresh } = useRealtime();
 
   const [agentState, setAgentState] = useState<'OFFLINE' | 'AVAILABLE' | 'RINGING' | 'BUSY' | 'WRAP-UP'>('AVAILABLE');
   const [stationMode, setStationMode] = useState<'TRANSLATION_STUDIO' | 'CLASSIC_SOFTPHONE'>('CLASSIC_SOFTPHONE');
@@ -272,12 +272,16 @@ export const AgentApp: React.FC = () => {
 
                 if (status === 'incoming') {
                   const incomingCaller = data?.caller || 'PSTN Customer';
-                  console.log('[ZADARMA WEBRTC] Inbound media connection from caller:', incomingCaller);
+                  console.log('[ZADARMA WEBRTC] Inbound media connection from Zadarma PBX on Extension 100:', incomingCaller);
 
                   // Connect audio leg so media stream flows between browser and Zadarma PBX
                   connectRealPstnAudio();
 
-                  // Query backend WITHOUT sending fake DTMF digit to verify if this is an IVR call
+                  // Extension 100 is connected by Zadarma PBX when the PSTN receiver presses DTMF 1 in scenario
+                  // Trigger 3-second ring beep pulse for available agent, then auto-answer with clear 2-way audio!
+                  start3SecondRingBeepAndAutoAnswer('1', data?.callId || activeCallRef.current?.id, user?.managerId);
+
+                  // Synchronize with backend
                   if (token) {
                     fetch('/api/agent/webrtc-incoming', {
                       method: 'POST',
@@ -288,23 +292,14 @@ export const AgentApp: React.FC = () => {
                       body: JSON.stringify({
                         caller: data?.caller,
                         callerName: data?.callername,
+                        digit: '1',
                       }),
                     })
                       .then((r) => r.json())
                       .then((resData) => {
                         console.log('[WEBRTC INCOMING SYNC RESULT]', resData);
-                        if (resData.isIvrCall) {
-                          if (resData.dtmfDigit || resData.status === 'RINGING') {
-                            // PSTN recipient confirmed DTMF key 1 -> Ring agent with 3s beep & auto-answer!
-                            start3SecondRingBeepAndAutoAnswer(resData.dtmfDigit || '1', resData.callId);
-                          } else {
-                            // IVR call is currently playing greeting on PSTN leg: wait for recipient to press DTMF
-                            console.log('[WEBRTC INCOMING] IVR call active on carrier leg. Awaiting recipient DTMF 1 before ringing agent station.');
-                            if (resData.ivrConfig) setActiveIvrConfig(resData.ivrConfig);
-                          }
-                        } else {
-                          // Direct human call (Zero-IVR): Ring agent station with 3s ring beep & auto-connect
-                          start3SecondRingBeepAndAutoAnswer('1', resData.callId);
+                        if (resData.callId) {
+                          setActiveCall((prev) => prev ? { ...prev, id: resData.callId, callId: resData.callId, status: 'RINGING' } : prev);
                         }
                       })
                       .catch((err) => console.warn('[SYNC WEBRTC INCOMING NOTE]', err));
@@ -745,16 +740,21 @@ export const AgentApp: React.FC = () => {
   };
 
   // Ring beep audio tone generator (pulsed dual tone 880Hz + 1200Hz)
-  const playRingBeepPulse = (ctx: AudioContext) => {
+  const playRingBeepPulse = (ctx?: AudioContext) => {
     // Ring beep sound must ONLY ever play on the agent dashboard, never on the manager dashboard
     if (user?.role !== 'agent') return;
     try {
-      if (ctx.state === 'suspended') ctx.resume();
-      const now = ctx.currentTime;
+      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioCtx) return;
+      const audioCtx = ctx || mixerAudioContextRef.current || new AudioCtx();
+      if (audioCtx.state === 'suspended') {
+        audioCtx.resume().catch(() => {});
+      }
+      const now = audioCtx.currentTime;
 
-      const osc1 = ctx.createOscillator();
-      const osc2 = ctx.createOscillator();
-      const gain = ctx.createGain();
+      const osc1 = audioCtx.createOscillator();
+      const osc2 = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
 
       osc1.type = 'sine';
       osc1.frequency.setValueAtTime(880, now);
@@ -762,12 +762,12 @@ export const AgentApp: React.FC = () => {
       osc2.frequency.setValueAtTime(1200, now);
 
       gain.gain.setValueAtTime(0.001, now);
-      gain.gain.linearRampToValueAtTime(0.35, now + 0.02);
+      gain.gain.linearRampToValueAtTime(0.4, now + 0.02);
       gain.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
 
       osc1.connect(gain);
       osc2.connect(gain);
-      gain.connect(ctx.destination);
+      gain.connect(audioCtx.destination);
 
       osc1.start(now);
       osc1.stop(now + 0.23);
@@ -886,7 +886,11 @@ export const AgentApp: React.FC = () => {
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (AudioCtx) {
-        const ctx = new AudioCtx();
+        const ctx = mixerAudioContextRef.current || new AudioCtx();
+        mixerAudioContextRef.current = ctx;
+        if (ctx.state === 'suspended') {
+          ctx.resume().catch(() => {});
+        }
         playRingBeepPulse(ctx);
         const beepSchedule = [400, 1000, 1400, 2000, 2400];
         beepSchedule.forEach((delay) => {
@@ -936,6 +940,15 @@ export const AgentApp: React.FC = () => {
 
       // Auto-answer line and connect 2-way WebRTC audio
       connectRealPstnAudio();
+      try {
+        const webPhone = (window as any).zdrmWebPhone;
+        if (webPhone?.webCallSession && typeof webPhone.webCallSession.accept === 'function') {
+          webPhone.webCallSession.accept({ audio: true, video: false });
+        }
+      } catch (webrtcAcceptErr) {
+        console.warn('[ZADARMA WEBRTC ACCEPT NOTE]', webrtcAcceptErr);
+      }
+
       if (handleCallActionRef.current) {
         handleCallActionRef.current('ANSWER');
       }
@@ -963,7 +976,33 @@ export const AgentApp: React.FC = () => {
     return () => clearInterval(interval);
   }, [token, triggerRefresh]);
 
-  // Handle incoming real-time SSE agent events (strictly isolated by manager and agent availability)
+  // Dedicated listener for agent.incoming_call so rapid state changes never drop the ringing event
+  useEffect(() => {
+    if (!latestIncomingCall) return;
+    // 1. Strict Role Guard: Only agents ring, NEVER managers or admins
+    if (user?.role !== 'agent') return;
+
+    // 2. Strict Manager Isolation: Event must belong to the manager of this agent
+    if (latestIncomingCall.managerId && user?.managerId && latestIncomingCall.managerId !== user.managerId) {
+      console.log(`[AGENT APP] Ignored incoming call: campaign manager (${latestIncomingCall.managerId}) does not match agent manager (${user.managerId})`);
+      return;
+    }
+
+    // 3. Availability Check: Must be AVAILABLE to receive new call
+    if (agentState !== 'AVAILABLE' && !isAutoAnsweringRef.current) {
+      console.log(`[AGENT APP] Agent station is currently ${agentState}, not AVAILABLE.`);
+      return;
+    }
+
+    console.log('[SSE INCOMING CALL] Initiating 3s ring beep and auto-answer on available agent terminal:', latestIncomingCall);
+    start3SecondRingBeepAndAutoAnswer(
+      latestIncomingCall.dtmfDigit || '1',
+      latestIncomingCall.callId,
+      latestIncomingCall.managerId
+    );
+  }, [latestIncomingCall]);
+
+  // Handle real-time SSE agent events (strictly isolated by manager and agent availability)
   useEffect(() => {
     if (!latestAgentEvent) return;
 
@@ -975,15 +1014,8 @@ export const AgentApp: React.FC = () => {
       return;
     }
 
-    // 3. Strict Agent ID Check: If addressed to a specific agent, only that agent rings
-    if (latestAgentEvent.agentId && user?.agentId && latestAgentEvent.agentId !== user.agentId) {
-      return;
-    }
-
     if (latestAgentEvent.type === 'incoming') {
-      // Must be currently AVAILABLE to take an incoming call (not BUSY, OFFLINE, WRAP-UP)
       if (agentState !== 'AVAILABLE' && !isAutoAnsweringRef.current) {
-        console.log(`[AGENT APP] Ignored incoming call: agent is currently ${agentState}, not AVAILABLE.`);
         return;
       }
       console.log('[SSE EVENT] Incoming call to available agent station. Starting 3s ring beep and auto-answer...', latestAgentEvent);
@@ -998,7 +1030,11 @@ export const AgentApp: React.FC = () => {
       console.log('[SSE EVENT] DTMF received event for available agent. Starting 3s ring beep and auto-answer...', latestAgentEvent);
       start3SecondRingBeepAndAutoAnswer((latestAgentEvent as any).digit || '1', (latestAgentEvent as any).callId, (latestAgentEvent as any).managerId);
     } else if (latestAgentEvent.type === 'state_changed') {
-      if (!user?.agentId || latestAgentEvent.agentId === user?.agentId || latestAgentEvent.currentCallId === activeCall?.id) {
+      if (latestAgentEvent.state === 'RINGING') {
+        if ((agentState === 'AVAILABLE' || agentState === 'RINGING') && !isAutoAnsweringRef.current) {
+          start3SecondRingBeepAndAutoAnswer(latestAgentEvent.dtmfDigit || '1', latestAgentEvent.currentCallId || latestAgentEvent.callId, latestAgentEvent.managerId);
+        }
+      } else {
         setAgentState(latestAgentEvent.state);
         if (latestAgentEvent.state === 'BUSY') {
           stopRingtone();
@@ -2163,76 +2199,18 @@ export const AgentApp: React.FC = () => {
         </div>
       )}
 
-      {/* Mode Navigation Tabs - Governed strictly by Admin Policy */}
-      {!managerPolicy ? (
-        <div className="bg-slate-100 rounded-xl p-3 flex items-center justify-center text-xs text-slate-500 animate-pulse">
-          Synchronizing manager routing policy...
+      {/* Softphone Mode Banner (Classic Softphone & Direct Human Voice) */}
+      <div className="bg-slate-900 border border-slate-800 text-white rounded-xl px-5 py-3 flex items-center justify-between text-xs shadow-sm">
+        <div className="flex items-center gap-2.5">
+          <div className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" />
+          <span className="font-bold tracking-wide">PSTN Softphone Station &amp; Direct Voice Bridge</span>
         </div>
-      ) : managerPolicy.allowedRoutingMode === 'BOTH' ? (
-        <div className="flex border-b border-slate-200 gap-2">
-          <button
-            type="button"
-            onClick={() => setStationMode('TRANSLATION_STUDIO')}
-            className={`px-4 py-2.5 text-xs font-bold rounded-t-xl flex items-center gap-2 transition-all cursor-pointer border-t border-x ${
-              stationMode === 'TRANSLATION_STUDIO'
-                ? 'bg-white text-indigo-700 border-slate-200 border-b-transparent shadow-2xs -mb-px'
-                : 'bg-slate-50 text-slate-600 border-transparent hover:text-slate-900'
-            }`}
-          >
-            <Languages className="w-4 h-4 text-indigo-600" />
-            <span>AI Voice Translation Studio (Bidirectional)</span>
-            <span className="bg-indigo-100 text-indigo-800 text-[10px] px-2 py-0.5 rounded-full font-bold">
-              {managerPolicy.enforcedAgentLanguage || 'Urdu'} ⇄ {managerPolicy.enforcedCustomerLanguage || 'Arabic'}
-            </span>
-          </button>
-
-          <button
-            type="button"
-            onClick={() => setStationMode('CLASSIC_SOFTPHONE')}
-            className={`px-4 py-2.5 text-xs font-bold rounded-t-xl flex items-center gap-2 transition-all cursor-pointer border-t border-x ${
-              stationMode === 'CLASSIC_SOFTPHONE'
-                ? 'bg-white text-slate-900 border-slate-200 border-b-transparent shadow-2xs -mb-px'
-                : 'bg-slate-50 text-slate-600 border-transparent hover:text-slate-900'
-            }`}
-          >
-            <Radio className="w-4 h-4 text-emerald-600" />
-            <span>Classic Softphone Terminal</span>
-          </button>
-        </div>
-      ) : managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION' ? (
-        <div className="bg-indigo-50/80 border border-indigo-200 rounded-xl px-4 py-2.5 flex items-center justify-between text-xs font-semibold text-indigo-950 shadow-2xs">
-          <div className="flex items-center gap-2">
-            <Languages className="w-4 h-4 text-indigo-700" />
-            <span>Active Mode: <strong>AI Voice Translation Studio (Enforced by Admin Policy)</strong></span>
-          </div>
-          <span className="bg-indigo-200/80 text-indigo-900 text-[10px] px-2.5 py-0.5 rounded-full font-bold">
-            {managerPolicy.enforcedAgentLanguage || 'Urdu'} ⇄ {managerPolicy.enforcedCustomerLanguage || 'Arabic'}
-          </span>
-        </div>
-      ) : (
-        <div className="bg-blue-50/80 border border-blue-200 rounded-xl px-4 py-2.5 flex items-center justify-between text-xs font-semibold text-blue-950 shadow-2xs">
-          <div className="flex items-center gap-2">
-            <Radio className="w-4 h-4 text-blue-700" />
-            <span>Active Mode: <strong>Classic Softphone & Direct Human Voice (Enforced by Admin Policy)</strong></span>
-          </div>
-          <span className="bg-blue-200/80 text-blue-900 text-[10px] px-2.5 py-0.5 rounded-full font-bold">
-            Direct PSTN Agent Bridge
-          </span>
-        </div>
-      )}
-
-      {stationMode === 'TRANSLATION_STUDIO' && (
-        <VoiceTranslationStudio
-          token={token}
-          activeCall={activeCall}
-          onCallStateChange={fetchAgentStatus}
-          webrtcStatus={webrtcStatus}
-          webrtcSipLogin={webrtcSipLogin}
-        />
-      )}
+        <span className="bg-slate-800 text-slate-300 font-mono text-[11px] px-2.5 py-1 rounded-full border border-slate-700">
+          Zadarma Cloud PBX &middot; Ext 100
+        </span>
+      </div>
 
       {/* Main Terminal Screen */}
-      {stationMode === 'CLASSIC_SOFTPHONE' && (
       <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-8 text-center space-y-6">
         {/* Status Indicator */}
         <div className="flex justify-center">
@@ -3127,7 +3105,6 @@ export const AgentApp: React.FC = () => {
           </div>
         )}
       </div>
-      )}
     </div>
   );
 };

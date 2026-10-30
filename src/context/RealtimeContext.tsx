@@ -7,6 +7,7 @@ interface RealtimeContextType {
   liveDtmfEvents: DtmfEventItem[];
   activeCalls: CallItem[];
   latestAgentEvent: any;
+  latestIncomingCall: any;
   latestCampaignEvent: any;
   latestSipHealthEvent: any;
   latestSystemError: any;
@@ -24,6 +25,7 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [liveDtmfEvents, setLiveDtmfEvents] = useState<DtmfEventItem[]>([]);
   const [activeCalls, setActiveCalls] = useState<CallItem[]>([]);
   const [latestAgentEvent, setLatestAgentEvent] = useState<any>(null);
+  const [latestIncomingCall, setLatestIncomingCall] = useState<any>(null);
   const [latestCampaignEvent, setLatestCampaignEvent] = useState<any>(null);
   const [latestSipHealthEvent, setLatestSipHealthEvent] = useState<any>(null);
   const [latestSystemError, setLatestSystemError] = useState<any>(null);
@@ -136,7 +138,9 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     eventSource.addEventListener('agent.incoming_call', (e) => {
       try {
         const data = JSON.parse(e.data);
-        setLatestAgentEvent({ type: 'incoming', ...data });
+        const incomingPayload = { type: 'incoming', ...data, timestamp: Date.now() };
+        setLatestIncomingCall(incomingPayload);
+        setLatestAgentEvent(incomingPayload);
         setTriggerRefresh((prev) => prev + 1);
       } catch (err) {
         console.error('Error parsing agent.incoming_call:', err);
@@ -213,6 +217,7 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
         liveDtmfEvents,
         activeCalls,
         latestAgentEvent,
+        latestIncomingCall,
         latestCampaignEvent,
         latestSipHealthEvent,
         latestSystemError,

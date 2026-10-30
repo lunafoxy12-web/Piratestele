@@ -1524,7 +1524,7 @@ class TelephonyEngine {
       });
     });
 
-    // Alert ONLY the selected available agent browser of this specific manager via SSE
+    // Alert available agent browser of this specific manager via SSE
     realtime.broadcast('agent.incoming_call', {
       callId,
       agentId: selectedAgent.id,
@@ -1536,14 +1536,14 @@ class TelephonyEngine {
       dtmfDigit: call.dtmfSequence || '1',
       isTransferredFromIvr: true,
       transferReason: 'PSTN caller pressed DTMF 1 in IVR menu',
-    }, { role: 'agent', agentId: selectedAgent.id, managerId: targetManagerId });
+    }, { role: 'agent', managerId: targetManagerId });
 
     realtime.broadcast('agent.state_changed', {
       agentId: selectedAgent.id,
       managerId: targetManagerId,
       state: 'RINGING',
       currentCallId: callId,
-    }, { role: 'agent', agentId: selectedAgent.id, managerId: targetManagerId });
+    }, { role: 'agent', managerId: targetManagerId });
 
     return {
       success: true,
