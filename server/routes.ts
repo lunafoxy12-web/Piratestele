@@ -12,6 +12,7 @@ import twilioRouter from './routes/twilioRouter.ts';
 import signalwireRouter from './routes/signalwireRouter.ts';
 import customVoipRouter from './routes/customVoipRouter.ts';
 import { TranslationService } from './services/translationService.ts';
+import { convertTo8kMonoWav } from './services/audioUtils.ts';
 
 const router = express.Router();
 
@@ -3218,16 +3219,56 @@ router.patch('/manager/campaigns/:id/ivr', authenticate, requireRole(['manager',
 
   // If Zadarma provider active, link new IVR sound to scenario
   const zadarmaAuth = getActiveZadarmaProvider(managerId);
-  if (zadarmaAuth.apiKey && zadarmaAuth.apiSecret && ivr.zadarmaSoundId) {
+  if (zadarmaAuth.apiKey && zadarmaAuth.apiSecret) {
     try {
-      await ZadarmaConnector.updateIvrScenario({
-        apiKey: zadarmaAuth.apiKey,
-        apiSecret: zadarmaAuth.apiSecret,
-        scenarioId: '6ac669ac99688ec02e009606',
-        soundId: ivr.zadarmaSoundId,
-        greetingSoundId: ivr.zadarmaSoundId,
-      });
-      console.log(`[CAMPAIGN EDIT IVR] Updated PBX scenario 6ac669ac99688ec02e009606 to sound ${ivr.zadarmaSoundId} for campaign ${id}`);
+      let soundToLink = ivr.zadarmaSoundId;
+      if (!soundToLink) {
+        let audioBuf: Buffer | null = null;
+        if (ivr.audioUrl && ivr.audioUrl.startsWith('data:')) {
+          const matches = ivr.audioUrl.match(/^data:([^;]+);base64,(.+)$/);
+          if (matches) audioBuf = Buffer.from(matches[2], 'base64');
+        }
+        if (!audioBuf) {
+          const textToSpeak = ivr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+          const ttsBase64 = await TranslationService.synthesizeSpeech({
+            text: textToSpeak,
+            language: 'English',
+            voice: 'Aoede',
+          });
+          if (ttsBase64) audioBuf = Buffer.from(ttsBase64, 'base64');
+        }
+        if (audioBuf) {
+          const wav8k = convertTo8kMonoWav(audioBuf);
+          const upRes = await ZadarmaConnector.uploadIvrSound({
+            apiKey: zadarmaAuth.apiKey,
+            apiSecret: zadarmaAuth.apiSecret,
+            name: (ivr.name || `ivr_${Date.now()}`).replace(/[^a-zA-Z0-9_\-]/g, '_'),
+            audioBuffer: wav8k,
+            fileName: `${(ivr.name || 'ivr_voice').replace(/[^a-zA-Z0-9_\-]/g, '_')}.wav`,
+          });
+          if (upRes.success && upRes.soundId) {
+            soundToLink = upRes.soundId;
+            await db.update((d) => {
+              const targetIvr = d.ivr_configs.find((i) => i.id === ivr.id);
+              if (targetIvr) {
+                targetIvr.zadarmaSoundId = upRes.soundId;
+                targetIvr.zadarmaSoundSyncedAt = new Date().toISOString();
+              }
+            });
+          }
+        }
+      }
+
+      if (soundToLink) {
+        await ZadarmaConnector.updateIvrScenario({
+          apiKey: zadarmaAuth.apiKey,
+          apiSecret: zadarmaAuth.apiSecret,
+          scenarioId: '6ac669ac99688ec02e009606',
+          soundId: soundToLink,
+          greetingSoundId: soundToLink,
+        });
+        console.log(`[CAMPAIGN EDIT IVR] Updated PBX scenario 6ac669ac99688ec02e009606 to sound ${soundToLink} for campaign ${id}`);
+      }
     } catch (e: any) {
       console.warn('[CAMPAIGN EDIT IVR] PBX scenario update note:', e.message);
     }
@@ -3495,26 +3536,34 @@ router.post('/agent/phone', authenticate, requireRole(['agent', 'admin', 'manage
   res.json({ success: true, phoneNumber: cleanPhone, message: 'Agent phone updated successfully.' });
 });
 
-// Save Call Wrap-Up Data (Disposition, Agent Notes, Tags)
+// Save Call Wrap-Up Data (Disposition, Agent Notes, Tags, Agent Name)
 router.post('/agent/call-notes', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
   const { callId, notes, disposition, tags } = req.body;
   if (!callId) return res.status(400).json({ error: 'Call ID is required.' });
 
   const now = new Date().toISOString();
+  const agentUsername = req.user?.username || (req as any).agentId || 'Agent';
+
+  let updatedCall: any = null;
+  let managerIdToNotify = '';
+
   await db.update((d) => {
-    const call = d.calls.find((c) => c.id === callId);
+    const call = d.calls.find((c) => c.id === callId || c.callId === callId);
     if (call) {
       if (notes !== undefined) {
-        call.notes = notes;
-        call.wrapUpNotes = notes;
+        call.notes = String(notes);
+        call.wrapUpNotes = String(notes);
       }
       if (disposition !== undefined) {
-        call.disposition = disposition;
+        call.disposition = String(disposition);
       }
       if (tags && Array.isArray(tags)) {
-        call.wrapUpTags = tags;
+        call.wrapUpTags = tags.map((t: any) => String(t).trim()).filter(Boolean);
       }
       call.wrappedUpAt = now;
+      call.wrapUpAgentName = agentUsername;
+      updatedCall = { ...call };
+      managerIdToNotify = call.managerId || '';
     }
   });
 
@@ -3523,10 +3572,15 @@ router.post('/agent/call-notes', authenticate, requireRole(['agent', 'admin', 'm
     notes,
     disposition,
     tags,
+    wrapUpAgentName: agentUsername,
     updatedAt: now,
-  });
+  }, managerIdToNotify ? { managerId: managerIdToNotify } : undefined);
 
-  res.json({ success: true, message: 'Wrap-up details saved successfully.' });
+  if (updatedCall) {
+    realtime.broadcast('call.updated', updatedCall, managerIdToNotify ? { managerId: managerIdToNotify } : undefined);
+  }
+
+  res.json({ success: true, message: 'Wrap-up details saved successfully.', call: updatedCall });
 });
 
 // Force-bridge an active or dialing call directly with agent station
@@ -3647,20 +3701,6 @@ router.post('/agent/call-action', authenticate, requireRole(['agent', 'admin', '
   res.json({ success: true, action });
 });
 
-router.post('/agent/call-notes', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
-  const { callId, notes, disposition } = req.body;
-  if (!callId) return res.status(400).json({ error: 'Call ID is required.' });
-
-  await db.update((d) => {
-    const call = d.calls.find((c) => c.id === callId);
-    if (call) {
-      call.notes = notes || '';
-      call.disposition = disposition || 'COMPLETED';
-    }
-  });
-
-  res.json({ success: true, message: 'Call notes saved successfully.' });
-});
 
 // Record incoming WebRTC call triggered when Zadarma PBX connects to extension 100
 router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {

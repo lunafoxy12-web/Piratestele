@@ -28,9 +28,7 @@ import {
   MessageSquare,
   Volume1,
   RefreshCw,
-  Languages,
 } from 'lucide-react';
-import { VoiceTranslationStudio } from './VoiceTranslationStudio.tsx';
 
 interface RtcAudioStats {
   jitterMs: number;
@@ -48,7 +46,6 @@ export const AgentApp: React.FC = () => {
   const { latestAgentEvent, latestIncomingCall, liveDtmfEvents, latestVoiceMessage, triggerRefresh } = useRealtime();
 
   const [agentState, setAgentState] = useState<'OFFLINE' | 'AVAILABLE' | 'RINGING' | 'BUSY' | 'WRAP-UP'>('AVAILABLE');
-  const [stationMode, setStationMode] = useState<'TRANSLATION_STUDIO' | 'CLASSIC_SOFTPHONE'>('CLASSIC_SOFTPHONE');
   const [managerPolicy, setManagerPolicy] = useState<{
     allowedRoutingMode: 'IVR_THEN_DIRECT_AGENT' | 'AI_VOICE_TRANSLATION' | 'BOTH';
     enforcedAgentLanguage: string;
@@ -82,6 +79,12 @@ export const AgentApp: React.FC = () => {
   const [isSpeakerOn, setIsSpeakerOn] = useState<boolean>(true);
   const [autoAnswer, setAutoAnswer] = useState<boolean>(true);
   const [wrapUpNotes, setWrapUpNotes] = useState<string>('');
+  const [wrapUpCall, setWrapUpCall] = useState<CallItem | null>(null);
+  const wrapUpCallRef = useRef<CallItem | null>(null);
+  wrapUpCallRef.current = wrapUpCall;
+  const [selectedDisposition, setSelectedDisposition] = useState<string>('Customer Interested / Inquiry Handled');
+  const [wrapUpTags, setWrapUpTags] = useState<string[]>(['Interested']);
+  const [customTagInput, setCustomTagInput] = useState<string>('');
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [isAnswering, setIsAnswering] = useState<boolean>(false);
   const [answerError, setAnswerError] = useState<string | null>(null);
@@ -331,6 +334,12 @@ export const AgentApp: React.FC = () => {
                     keepAliveTimerRef.current = null;
                   }
 
+                  const endedCall = activeCallRef.current || activeCall;
+                  if (endedCall) {
+                    setWrapUpCall(endedCall);
+                    wrapUpCallRef.current = endedCall;
+                  }
+
                   const currentCallId = activeCallRef.current?.id;
                   if (currentCallId) {
                     fetch('/api/agent/call-action', {
@@ -348,7 +357,7 @@ export const AgentApp: React.FC = () => {
                   }
                   setActiveCall(null);
                   setAgentState('WRAP-UP');
-                  setStatusMessage('PSTN customer ended the call.');
+                  setStatusMessage('PSTN customer ended call. Enter wrap-up details below.');
                   setTimeout(() => setStatusMessage(null), 4000);
                 }
               };
@@ -382,6 +391,13 @@ export const AgentApp: React.FC = () => {
       });
       if (res.ok) {
         const data = await res.json();
+        // Prevent background polling from overriding or clobbering UI during 3-second auto-answer countdown
+        if (isAutoAnsweringRef.current || autoAnswerSecondsLeft !== null) {
+          if (data.ivrConfig) setActiveIvrConfig(data.ivrConfig);
+          if (data.activeCallDtmf) setActiveCallDtmf(data.activeCallDtmf);
+          return;
+        }
+
         if (data.activeCall && !data.activeCall.endTime) {
           setActiveCall(data.activeCall);
           const isIvr = data.activeCall.status === 'IVR_ACTIVE';
@@ -391,7 +407,7 @@ export const AgentApp: React.FC = () => {
           if (isIvr) {
             setAgentState('AVAILABLE');
           } else if (isAgentRinging) {
-            if (!isAutoAnsweringRef.current) {
+            if (!isAutoAnsweringRef.current && autoAnswerSecondsLeft === null) {
               start3SecondRingBeepAndAutoAnswer(data.activeCall.dtmfSequence || '1', data.activeCall.id);
             }
           } else if (data.activeCall.status === 'BRIDGED') {
@@ -399,16 +415,12 @@ export const AgentApp: React.FC = () => {
           } else {
             setAgentState(data.agent?.state || 'AVAILABLE');
           }
-          // If active call is AI Translation, open Translation Studio automatically
-          if (data.activeCall.routingType === 'AI_VOICE_TRANSLATION' || (data.activeCall as any).isDirectTranslationCall) {
-            setStationMode('TRANSLATION_STUDIO');
-          } else if (data.activeCall.routingType === 'IVR_THEN_DIRECT_AGENT') {
-            setStationMode('CLASSIC_SOFTPHONE');
-          }
         } else {
-          if (!isAutoAnsweringRef.current) {
-            setActiveCall(null);
-            setAgentState(data.agent?.state || 'AVAILABLE');
+          if (!isAutoAnsweringRef.current && autoAnswerSecondsLeft === null) {
+            if (agentState !== 'WRAP-UP') {
+              setActiveCall(null);
+              setAgentState(data.agent?.state || 'AVAILABLE');
+            }
           }
         }
         if (data.ivrConfig) {
@@ -422,12 +434,6 @@ export const AgentApp: React.FC = () => {
         }
         if (data.managerPolicy) {
           setManagerPolicy(data.managerPolicy);
-          // Strictly lock mode to what Admin allowed for this manager
-          if (data.managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION') {
-            setStationMode('TRANSLATION_STUDIO');
-          } else if (data.managerPolicy.allowedRoutingMode === 'IVR_THEN_DIRECT_AGENT') {
-            setStationMode('CLASSIC_SOFTPHONE');
-          }
         }
       }
     } catch (err) {
@@ -1734,8 +1740,6 @@ export const AgentApp: React.FC = () => {
     }
   };
 
-  const [selectedDisposition, setSelectedDisposition] = useState<string>('Resolved');
-
   const handleCallAction = async (action: 'ANSWER' | 'MUTE' | 'HOLD' | 'SPEAKER' | 'END') => {
     if (!token) return;
     const currentCall = activeCall || activeCallRef.current || {
@@ -1948,7 +1952,11 @@ export const AgentApp: React.FC = () => {
         setIsCustomerSpeaking(false);
         setCustomerSpokenMessage(null);
 
-        const res = await fetch('/api/agent/call-action', {
+        const endedCall = activeCall || activeCallRef.current || currentCall;
+        setWrapUpCall(endedCall);
+        wrapUpCallRef.current = endedCall;
+
+        fetch('/api/agent/call-action', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({
@@ -1965,7 +1973,7 @@ export const AgentApp: React.FC = () => {
         setActiveSessionId(null);
         setIsOnHold(false);
         setIsMuted(false);
-        setStatusMessage('Call ended. Enter call notes and outcome below.');
+        setStatusMessage('Call ended. Enter call wrap-up & disposition below.');
         setTimeout(() => setStatusMessage(null), 4000);
       } catch (err) {
         console.error('Failed to end call:', err);
@@ -2025,27 +2033,34 @@ export const AgentApp: React.FC = () => {
   handleCallActionRef.current = handleCallAction;
 
   const handleCompleteWrapUp = async () => {
-    if (activeCall && token) {
+    const targetCall = wrapUpCallRef.current || wrapUpCall || activeCallRef.current || activeCall;
+    const targetCallId = targetCall?.id || targetCall?.callId;
+
+    if (targetCallId && token) {
       try {
         await fetch('/api/agent/call-notes', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
           body: JSON.stringify({
-            callId: activeCall.id,
-            notes: wrapUpNotes,
+            callId: targetCallId,
+            notes: wrapUpNotes.trim(),
             disposition: selectedDisposition,
+            tags: wrapUpTags,
           }),
         });
       } catch (e) {
-        console.warn('Save notes warning:', e);
+        console.warn('Save wrap-up notes warning:', e);
       }
     }
     setWrapUpNotes('');
+    setWrapUpTags([]);
+    setWrapUpCall(null);
+    wrapUpCallRef.current = null;
     setActiveCall(null);
     setActiveCallDtmf([]);
     await handleStateChange('AVAILABLE');
-    setStatusMessage('Call notes saved! Agent is now Available for calls.');
-    setTimeout(() => setStatusMessage(null), 3000);
+    setStatusMessage('Call wrap-up & notes submitted to Manager Dashboard! Station available.');
+    setTimeout(() => setStatusMessage(null), 4000);
   };
 
   const handleSimulateIvrBridgeCall = async () => {
@@ -2206,20 +2221,20 @@ export const AgentApp: React.FC = () => {
           <span className="font-bold tracking-wide">PSTN Softphone Station &amp; Direct Voice Bridge</span>
         </div>
         <span className="bg-slate-800 text-slate-300 font-mono text-[11px] px-2.5 py-1 rounded-full border border-slate-700">
-          Zadarma Cloud PBX &middot; Ext 100
+          Enterprise Voice Switch &middot; Ext 100 (Connected)
         </span>
       </div>
 
       {/* Main Terminal Screen */}
       <div className="bg-white border border-slate-200 rounded-2xl shadow-sm p-8 text-center space-y-6">
-        {/* Status Indicator */}
+        {/* Status Indicator (Rock-Solid Stable: No Bouncing) */}
         <div className="flex justify-center">
           <div
             className={`inline-flex items-center gap-2 px-4 py-1.5 rounded-full text-xs font-bold uppercase tracking-wider ${
               agentState === 'AVAILABLE'
                 ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
                 : agentState === 'RINGING'
-                ? 'bg-amber-100 text-amber-800 border border-amber-300 animate-bounce'
+                ? 'bg-amber-100 text-amber-900 border border-amber-400'
                 : agentState === 'BUSY'
                 ? 'bg-red-100 text-red-800 border border-red-300'
                 : agentState === 'WRAP-UP'
@@ -2227,21 +2242,21 @@ export const AgentApp: React.FC = () => {
                 : 'bg-slate-100 text-slate-600 border border-slate-300'
             }`}
           >
-            <Radio className="w-3.5 h-3.5 animate-pulse" />
+            <Radio className="w-3.5 h-3.5" />
             <span>AGENT STATUS: {agentState}</span>
           </div>
         </div>
 
         {/* STATE: IVR_ACTIVE (MANAGER'S IVR VOICE PROMPT PLAYING TO PSTN CALLER) */}
-        {(activeCall?.status === 'IVR_ACTIVE' || isIvrGreetingPlaying) && activeCall?.status !== 'BRIDGED' && agentState !== 'BUSY' && (
+        {(activeCall?.status === 'IVR_ACTIVE' || isIvrGreetingPlaying) && !isAutoAnsweringRef.current && autoAnswerSecondsLeft === null && activeCall?.status !== 'BRIDGED' && agentState === 'AVAILABLE' && (
           <div className="bg-gradient-to-br from-indigo-50 to-purple-50 border-2 border-indigo-400 rounded-2xl p-6 sm:p-8 space-y-5 max-w-lg mx-auto shadow-lg text-center animate-fade-in">
-            <div className="w-16 h-16 bg-indigo-600 text-white rounded-full flex items-center justify-center mx-auto shadow-md animate-pulse">
+            <div className="w-16 h-16 bg-indigo-600 text-white rounded-full flex items-center justify-center mx-auto shadow-md">
               <Headphones className="w-8 h-8" />
             </div>
 
             <div>
               <div className="inline-flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-100 text-indigo-900 text-xs font-bold uppercase tracking-wider mb-2 border border-indigo-200">
-                <Radio className="w-3.5 h-3.5 text-indigo-600 animate-ping" />
+                <Radio className="w-3.5 h-3.5 text-indigo-600" />
                 <span>IVR Voice Prompt Streaming to Customer</span>
               </div>
               <div className="text-2xl font-black text-slate-900 font-mono">
@@ -2289,20 +2304,19 @@ export const AgentApp: React.FC = () => {
           </div>
         )}
 
-        {/* STATE 1: RINGING / 3-SECOND RING BEEP AUTO-ANSWER (INCOMING BRIDGED CALL) */}
+        {/* STATE 1: RINGING / 3-SECOND RING BEEP AUTO-ANSWER (INCOMING BRIDGED CALL - ROCK SOLID STABLE) */}
         {(agentState === 'RINGING' || autoAnswerSecondsLeft !== null || (activeCall && !activeCall.endTime && activeCall.status === 'RINGING')) && activeCall?.status !== 'BRIDGED' && (
-          <div className="bg-gradient-to-br from-amber-50 to-orange-50 border-2 border-amber-400 rounded-3xl p-6 sm:p-8 space-y-5 max-w-lg mx-auto shadow-2xl text-center animate-fade-in ring-4 ring-amber-200/50">
-            {/* Pulsing Ring Icon with Animated Wave */}
+          <div className="bg-gradient-to-br from-amber-50 to-orange-50 border-2 border-amber-400 rounded-3xl p-6 sm:p-8 space-y-5 max-w-lg mx-auto shadow-xl text-center ring-2 ring-amber-300">
+            {/* Steady Ring Icon with Calm Visual Profile (Zero Shaking / Zero Blinking) */}
             <div className="relative w-20 h-20 mx-auto flex items-center justify-center">
-              <span className="absolute inset-0 rounded-full bg-amber-400 opacity-75 animate-ping" />
-              <div className="w-20 h-20 bg-gradient-to-br from-amber-500 to-orange-600 text-white rounded-full flex items-center justify-center shadow-xl z-10 animate-bounce">
+              <div className="w-20 h-20 bg-gradient-to-br from-amber-500 to-orange-600 text-white rounded-full flex items-center justify-center shadow-lg z-10">
                 <PhoneCall className="w-10 h-10" />
               </div>
             </div>
 
             <div>
               <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-amber-100 text-amber-900 text-xs font-black uppercase tracking-wider mb-2 border border-amber-300">
-                <Volume2 className="w-3.5 h-3.5 text-amber-700 animate-pulse" />
+                <Volume2 className="w-3.5 h-3.5 text-amber-700" />
                 <span>3-Second Ring Beep Active &middot; Auto-Connecting Line</span>
               </div>
               <div className="text-3xl font-black text-slate-900 font-mono tracking-tight">
@@ -2880,27 +2894,45 @@ export const AgentApp: React.FC = () => {
 
         {/* STATE 3: WRAP-UP */}
         {agentState === 'WRAP-UP' && (
-          <div className="bg-indigo-50 border border-indigo-200 rounded-2xl p-6 space-y-4 max-w-lg mx-auto shadow-sm text-left">
+          <div className="bg-gradient-to-br from-indigo-50/90 to-purple-50/90 border border-indigo-200 rounded-2xl p-6 space-y-4 max-w-lg mx-auto shadow-sm text-left">
             <div className="flex items-center justify-between border-b border-indigo-100 pb-3">
               <div className="flex items-center gap-2 text-indigo-900 font-bold">
                 <FileText className="w-5 h-5 text-indigo-700" />
-                <span className="text-base">Call Disposition & Agent Notes</span>
+                <span className="text-base">Call Disposition & Wrap-Up</span>
               </div>
-              <span className="text-xs bg-indigo-200/80 text-indigo-900 font-semibold px-2 py-0.5 rounded">
+              <span className="text-xs bg-indigo-200/80 text-indigo-900 font-semibold px-2.5 py-0.5 rounded-full">
                 Post-Call Wrap-Up
               </span>
             </div>
 
-            <div className="space-y-3">
+            {/* Target Call Info */}
+            <div className="bg-white/80 border border-indigo-200/70 rounded-xl p-3 flex items-center justify-between text-xs">
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Call Outcome / Disposition</label>
+                <span className="text-slate-500 font-medium">Recipient Customer: </span>
+                <span className="font-bold font-mono text-slate-900">
+                  {wrapUpCall?.customerNumber || 'Customer Lead'}
+                </span>
+              </div>
+              {wrapUpCall?.callerId && (
+                <div className="text-[11px] text-slate-500 font-mono">
+                  Caller ID: {wrapUpCall.callerId}
+                </div>
+              )}
+            </div>
+
+            <div className="space-y-3.5">
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Call Outcome / Disposition <span className="text-indigo-600 font-bold">*</span>
+                </label>
                 <select
                   value={selectedDisposition}
                   onChange={(e) => setSelectedDisposition(e.target.value)}
-                  className="w-full text-xs font-semibold border border-slate-300 rounded-lg p-2 bg-white text-slate-800"
+                  className="w-full text-xs font-semibold border border-slate-300 rounded-lg p-2.5 bg-white text-slate-900 shadow-xs focus:ring-2 focus:ring-indigo-600"
                 >
                   <option value="Customer Interested / Inquiry Handled">Customer Interested / Inquiry Handled</option>
                   <option value="Issue Resolved">Issue Resolved</option>
+                  <option value="Sale Closed">Sale Closed</option>
                   <option value="Callback Requested">Callback Requested</option>
                   <option value="Information Provided">Information Provided</option>
                   <option value="Follow-up Required">Follow-up Required</option>
@@ -2909,24 +2941,92 @@ export const AgentApp: React.FC = () => {
                 </select>
               </div>
 
+              {/* Wrap-Up Tags */}
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Agent Notes & Call Summary</label>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Call Tags / Categories
+                </label>
+                <div className="flex flex-wrap gap-1.5 mb-2">
+                  {['Interested', 'Quoted', 'Callback', 'Sale', 'Follow-Up', 'VIP Customer', 'Escalated'].map((tag) => {
+                    const isSelected = wrapUpTags.includes(tag);
+                    return (
+                      <button
+                        key={tag}
+                        type="button"
+                        onClick={() => {
+                          if (isSelected) {
+                            setWrapUpTags(wrapUpTags.filter((t) => t !== tag));
+                          } else {
+                            setWrapUpTags([...wrapUpTags, tag]);
+                          }
+                        }}
+                        className={`text-[11px] px-2.5 py-1 rounded-md font-semibold transition-all border cursor-pointer ${
+                          isSelected
+                            ? 'bg-indigo-600 text-white border-indigo-700 shadow-xs'
+                            : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-100'
+                        }`}
+                      >
+                        {isSelected ? `✓ #${tag}` : `+ #${tag}`}
+                      </button>
+                    );
+                  })}
+                </div>
+
+                <div className="flex gap-2">
+                  <input
+                    type="text"
+                    placeholder="Add custom tag (e.g. Discount Requested)..."
+                    value={customTagInput}
+                    onChange={(e) => setCustomTagInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        e.preventDefault();
+                        const clean = customTagInput.trim();
+                        if (clean && !wrapUpTags.includes(clean)) {
+                          setWrapUpTags([...wrapUpTags, clean]);
+                          setCustomTagInput('');
+                        }
+                      }
+                    }}
+                    className="flex-1 text-xs border border-slate-300 rounded-lg px-2.5 py-1.5 bg-white text-slate-800"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const clean = customTagInput.trim();
+                      if (clean && !wrapUpTags.includes(clean)) {
+                        setWrapUpTags([...wrapUpTags, clean]);
+                        setCustomTagInput('');
+                      }
+                    }}
+                    disabled={!customTagInput.trim()}
+                    className="px-3 py-1.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-white text-xs font-semibold rounded-lg"
+                  >
+                    Add Tag
+                  </button>
+                </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Agent Notes & Call Summary <span className="text-slate-400 font-normal">(Visible on Manager Dashboard)</span>
+                </label>
                 <textarea
                   rows={4}
-                  placeholder="Record summary of customer conversation, action items, or agreement..."
+                  placeholder="Record summary of customer conversation, pricing discussed, action items, or agreed terms..."
                   value={wrapUpNotes || ''}
                   onChange={(e) => setWrapUpNotes(e.target.value)}
-                  className="w-full text-xs border border-slate-300 rounded-lg p-2.5 bg-white focus:ring-2 focus:ring-indigo-600"
+                  className="w-full text-xs border border-slate-300 rounded-lg p-2.5 bg-white focus:ring-2 focus:ring-indigo-600 leading-relaxed text-slate-900"
                 />
               </div>
             </div>
 
             <button
               onClick={handleCompleteWrapUp}
-              className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md transition-colors flex items-center justify-center gap-2 cursor-pointer"
+              className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md transition-colors flex items-center justify-center gap-2 cursor-pointer active:scale-98"
             >
               <CheckCircle className="w-4 h-4" />
-              <span>Save Call Notes & Return to Available</span>
+              <span>Save Call Notes & Submit to Manager Dashboard</span>
             </button>
           </div>
         )}

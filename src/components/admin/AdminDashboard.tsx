@@ -1630,11 +1630,25 @@ export const AdminDashboard: React.FC = () => {
                       <td className="py-3 px-4 text-xs font-semibold text-slate-800">
                         {call.agentName || '—'}
                       </td>
-                      <td className="py-3 px-4 text-xs text-slate-500">
-                        <div>{new Date(call.startTime).toLocaleTimeString()}</div>
-                        {call.notes && (
-                          <div className="text-[11px] text-slate-700 italic truncate max-w-xs mt-0.5">
-                            "{call.notes}"
+                      <td className="py-3 px-4 text-xs">
+                        <div className="text-slate-500 font-mono text-[11px]">{new Date(call.startTime).toLocaleTimeString()}</div>
+                        {call.disposition && (
+                          <span className="mt-1 inline-block text-[10px] font-bold px-2 py-0.5 rounded-full bg-indigo-50 text-indigo-700 border border-indigo-200">
+                            {call.disposition}
+                          </span>
+                        )}
+                        {(call.wrapUpNotes || call.notes) && (
+                          <div className="text-[11px] text-slate-700 italic truncate max-w-xs mt-0.5" title={call.wrapUpNotes || call.notes}>
+                            📝 "{call.wrapUpNotes || call.notes}"
+                          </div>
+                        )}
+                        {Array.isArray(call.wrapUpTags) && call.wrapUpTags.length > 0 && (
+                          <div className="flex gap-1 flex-wrap mt-0.5">
+                            {call.wrapUpTags.map((tag: string, i: number) => (
+                              <span key={i} className="text-[9px] bg-slate-100 text-slate-600 px-1 py-0.2 rounded font-medium">
+                                #{tag}
+                              </span>
+                            ))}
                           </div>
                         )}
                       </td>

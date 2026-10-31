@@ -124,6 +124,18 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     });
 
+    eventSource.addEventListener('call.notes_updated', () => {
+      setTriggerRefresh((prev) => prev + 1);
+    });
+
+    eventSource.addEventListener('call.updated', (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        setActiveCalls((prev) => prev.map((c) => (c.id === data.id ? { ...c, ...data } : c)));
+      } catch {}
+      setTriggerRefresh((prev) => prev + 1);
+    });
+
     eventSource.addEventListener('call.failed', (e) => {
       try {
         const data = JSON.parse(e.data);

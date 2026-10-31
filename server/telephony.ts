@@ -913,12 +913,12 @@ class TelephonyEngine {
       const isAiTranslationMode = campaign.routingType === 'AI_VOICE_TRANSLATION';
       console.log(`[ZADARMA DISPATCH] Placing real PSTN call to ${contact.phoneNumber} (Mode: ${isAiTranslationMode ? 'AI Voice Translation Bot (Zero-IVR)' : 'IVR Menu -> Direct Agent'})...`);
 
-      // Ensure manager's IVR sound is linked to Zadarma Cloud PBX Scenario so the PSTN caller hears it
+      // Ensure manager's exact IVR sound is linked to Zadarma Cloud PBX Scenario so the PSTN caller hears it
       if (!isAiTranslationMode) {
         let soundToLink = ivr?.zadarmaSoundId;
 
         // If IVR sound hasn't been uploaded to Zadarma yet, synthesize and upload now
-        if (!soundToLink || soundToLink === '6acb652e621acf6feb0535e7') {
+        if (!soundToLink) {
           try {
             console.log(`[ZADARMA PBX IVR] Uploading manager's custom voice '${ivr?.name || 'Manager IVR'}' to Zadarma PBX...`);
             let audioBuf: Buffer | null = null;
@@ -940,9 +940,9 @@ class TelephonyEngine {
               const upRes = await ZadarmaConnector.uploadIvrSound({
                 apiKey,
                 apiSecret,
-                name: (ivr?.name || 'ivr_custom').replace(/[^a-zA-Z0-9_\-]/g, '_'),
+                name: (ivr?.name || `ivr_${Date.now()}`).replace(/[^a-zA-Z0-9_\-]/g, '_'),
                 audioBuffer: wav8k,
-                fileName: `${(ivr?.name || 'ivr_custom').replace(/[^a-zA-Z0-9_\-]/g, '_')}.wav`,
+                fileName: `${(ivr?.name || 'ivr_voice').replace(/[^a-zA-Z0-9_\-]/g, '_')}.wav`,
               });
               if (upRes.success && upRes.soundId) {
                 soundToLink = upRes.soundId;
@@ -953,7 +953,7 @@ class TelephonyEngine {
                     targetIvr.zadarmaSoundSyncedAt = new Date().toISOString();
                   }
                 });
-                console.log(`[ZADARMA PBX IVR] Custom sound uploaded with ID: ${soundToLink}`);
+                console.log(`[ZADARMA PBX IVR] Custom sound uploaded with ID: ${soundToLink} for IVR: ${ivr?.name}`);
               }
             }
           } catch (synthErr: any) {
@@ -961,18 +961,19 @@ class TelephonyEngine {
           }
         }
 
-        const effectiveSound = soundToLink || '6ae34ecbad7b131b13004922';
-        try {
-          await ZadarmaConnector.updateIvrScenario({
-            apiKey,
-            apiSecret,
-            scenarioId: '6ac669ac99688ec02e009606',
-            soundId: effectiveSound,
-            greetingSoundId: effectiveSound,
-          });
-          console.log(`[ZADARMA PBX IVR] Successfully linked sound '${effectiveSound}' (${ivr?.name || 'Manager IVR'}) to PBX scenario 6ac669ac99688ec02e009606`);
-        } catch (linkErr) {
-          console.warn('[ZADARMA PBX IVR] Scenario sound link note:', linkErr);
+        if (soundToLink) {
+          try {
+            await ZadarmaConnector.updateIvrScenario({
+              apiKey,
+              apiSecret,
+              scenarioId: '6ac669ac99688ec02e009606',
+              soundId: soundToLink,
+              greetingSoundId: soundToLink,
+            });
+            console.log(`[ZADARMA PBX IVR] Successfully linked exact manager sound '${soundToLink}' (${ivr?.name || 'Manager IVR'}) to PBX scenario 6ac669ac99688ec02e009606`);
+          } catch (linkErr) {
+            console.warn('[ZADARMA PBX IVR] Scenario sound link note:', linkErr);
+          }
         }
       }
 

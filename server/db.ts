@@ -302,6 +302,7 @@ export interface Call {
   wrapUpNotes?: string;
   wrapUpTags?: string[];
   wrappedUpAt?: string;
+  wrapUpAgentName?: string;
   voicemailDropped?: boolean;
   voicemailDropId?: string;
 }

@@ -35,7 +35,6 @@ import {
   Check,
   Trash2,
   Sparkles,
-  Languages,
   Voicemail,
   Zap,
   ArrowRight,
@@ -239,6 +238,7 @@ export const ManagerDashboard: React.FC = () => {
   const [previewAudioUrl, setPreviewAudioUrl] = useState<string | null>(null);
   const [isPlayingPreview, setIsPlayingPreview] = useState<boolean>(false);
   const audioPlayerRef = useRef<HTMLAudioElement | null>(null);
+  const [wrapUpModalCall, setWrapUpModalCall] = useState<CallItem | null>(null);
 
   const showNotification = (type: 'success' | 'error', text: string) => {
     setStatusMessage({ type, text });
@@ -1119,20 +1119,17 @@ export const ManagerDashboard: React.FC = () => {
             </div>
             <button
               onClick={() => {
-                const defaultRouting = managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION'
-                  ? 'AI_VOICE_TRANSLATION'
-                  : 'IVR_THEN_DIRECT_AGENT';
                 setCampaignForm({
                   name: `Campaign ${new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric' })}`,
                   ivrConfigId: ivrs[0]?.id || '',
                   targetRegion: 'US',
                   targetPhone: '',
                   csvText: '',
-                  routingType: defaultRouting,
-                  agentLanguage: managerPolicy.enforcedAgentLanguage || 'Urdu',
-                  customerLanguage: managerPolicy.enforcedCustomerLanguage || 'Arabic',
+                  routingType: 'IVR_THEN_DIRECT_AGENT',
+                  agentLanguage: 'Urdu',
+                  customerLanguage: 'Arabic',
                   autoDetectCustomerLanguage: false,
-                  aiBotGreeting: 'مرحباً، جاري توصيلك بممثل الخدمة',
+                  aiBotGreeting: '',
                   voicemailDropEnabled: true,
                   voicemailTemplateId: '',
                 });
@@ -1174,16 +1171,9 @@ export const ManagerDashboard: React.FC = () => {
                         >
                           {camp.status}
                         </span>
-                        {camp.routingType === 'AI_VOICE_TRANSLATION' ? (
-                          <span className="text-[11px] px-2.5 py-0.5 rounded-full font-bold bg-emerald-100 text-emerald-800 border border-emerald-200 flex items-center gap-1">
-                            <Sparkles className="w-3 h-3 text-emerald-600" />
-                            <span>AI Translation ({camp.agentLanguage || 'Urdu'} ⇄ {camp.customerLanguage || 'Arabic'})</span>
-                          </span>
-                        ) : (
-                          <span className="text-[11px] px-2.5 py-0.5 rounded-full font-bold bg-blue-100 text-blue-800 border border-blue-200 flex items-center gap-1">
-                            <span>📞 IVR → Direct Agent</span>
-                          </span>
-                        )}
+                        <span className="text-[11px] px-2.5 py-0.5 rounded-full font-bold bg-blue-100 text-blue-800 border border-blue-200 flex items-center gap-1">
+                          <span>📞 IVR → Direct Agent</span>
+                        </span>
                       </div>
                       <p className="text-xs text-slate-500 mt-1">
                         IVR Voice: <strong>{ivrs.find((i) => i.id === camp.ivrConfigId)?.name || 'Standard Service Menu'}</strong> &middot; Created on {new Date(camp.createdAt).toLocaleDateString()}
@@ -1944,37 +1934,68 @@ export const ManagerDashboard: React.FC = () => {
                         </td>
                         <td className="py-3 px-4">
                           {(call.disposition || (call as any).wrapUpNotes || call.notes) ? (
-                            <div className="space-y-1">
-                              {call.disposition && (
-                                <span className={`text-[11px] font-bold px-2 py-0.5 rounded-full inline-block border ${
-                                  call.disposition === 'Resolved' || call.disposition === 'Sale Closed'
-                                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
-                                    : call.disposition === 'Follow-Up Needed'
-                                    ? 'bg-blue-50 text-blue-800 border-blue-300'
-                                    : call.disposition === 'Not Interested'
-                                    ? 'bg-slate-100 text-slate-700 border-slate-300'
-                                    : 'bg-indigo-50 text-indigo-800 border-indigo-200'
-                                }`}>
-                                  {call.disposition}
-                                </span>
-                              )}
+                            <div className="space-y-1.5 max-w-sm">
+                              <div className="flex items-center gap-2 flex-wrap">
+                                {call.disposition && (
+                                  <span className={`text-[11px] font-bold px-2.5 py-0.5 rounded-full inline-flex items-center gap-1 border shadow-xs ${
+                                    call.disposition === 'Resolved' || call.disposition === 'Sale Closed' || call.disposition.includes('Resolved') || call.disposition.includes('Closed') || call.disposition.includes('Interested')
+                                      ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                                      : call.disposition.includes('Callback') || call.disposition.includes('Follow-up')
+                                      ? 'bg-amber-50 text-amber-800 border-amber-300'
+                                      : call.disposition.includes('Not Interested') || call.disposition.includes('Wrong')
+                                      ? 'bg-slate-100 text-slate-700 border-slate-300'
+                                      : 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                                  }`}>
+                                    <CheckCircle2 className="w-3 h-3 shrink-0" />
+                                    <span>{call.disposition}</span>
+                                  </span>
+                                )}
+                                <button
+                                  type="button"
+                                  onClick={() => setWrapUpModalCall(call)}
+                                  className="text-[10px] text-indigo-600 hover:text-indigo-800 font-bold underline cursor-pointer"
+                                  title="Click to view full wrap-up details and conversation summary"
+                                >
+                                  View Details
+                                </button>
+                              </div>
+
                               {((call as any).wrapUpNotes || call.notes) && (
-                                <p className="text-[11px] text-slate-700 italic max-w-xs truncate" title={(call as any).wrapUpNotes || call.notes}>
-                                  📝 {(call as any).wrapUpNotes || call.notes}
-                                </p>
+                                <div className="text-xs text-slate-800 bg-slate-50 border border-slate-200/90 rounded-lg p-2 leading-relaxed shadow-xs" title={(call as any).wrapUpNotes || call.notes}>
+                                  <div className="flex items-center gap-1 text-[10px] font-bold text-slate-500 uppercase tracking-wider mb-0.5">
+                                    <FileText className="w-3 h-3 text-indigo-600 shrink-0" />
+                                    <span>Agent Wrap-Up Notes:</span>
+                                  </div>
+                                  <div className="text-slate-700 italic">
+                                    "{(call as any).wrapUpNotes || call.notes}"
+                                  </div>
+                                </div>
                               )}
+
                               {Array.isArray((call as any).wrapUpTags) && (call as any).wrapUpTags.length > 0 && (
                                 <div className="flex gap-1 flex-wrap">
                                   {(call as any).wrapUpTags.map((tag: string, i: number) => (
-                                    <span key={i} className="text-[9px] bg-slate-100 text-slate-600 px-1.5 py-0.2 rounded font-medium">
+                                    <span key={i} className="text-[10px] bg-indigo-50 text-indigo-700 border border-indigo-200 px-2 py-0.5 rounded-md font-semibold">
                                       #{tag}
                                     </span>
                                   ))}
                                 </div>
                               )}
+
+                              {((call as any).wrapUpAgentName || (call as any).wrapUpAgent || agentName !== '—') && (
+                                <div className="text-[10px] text-slate-500 font-medium flex items-center gap-1">
+                                  <User className="w-3 h-3 text-slate-400 shrink-0" />
+                                  <span>Logged by: <strong className="text-slate-700">@{(call as any).wrapUpAgentName || (call as any).wrapUpAgent || agentName}</strong></span>
+                                  {(call as any).wrappedUpAt && (
+                                    <span className="text-slate-400">({new Date((call as any).wrappedUpAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })})</span>
+                                  )}
+                                </div>
+                              )}
                             </div>
                           ) : (
-                            <span className="text-slate-400 text-xs italic">Pending Wrap-Up</span>
+                            <span className="text-slate-400 text-xs italic bg-slate-50 px-2 py-1 rounded border border-slate-200 inline-block">
+                              Pending Wrap-Up
+                            </span>
                           )}
                         </td>
                         <td className="py-3 px-4 text-slate-500 font-mono text-xs">
@@ -2162,172 +2183,33 @@ export const ManagerDashboard: React.FC = () => {
               </div>
 
               {/* Admin Route Badge (No SIP/VoIP Selection) */}
+              {/* Voice Gateway Status (No Technical Provider Names) */}
               <div className="bg-emerald-50 border border-emerald-200 rounded-lg p-3 flex items-center justify-between text-xs">
                 <div className="flex items-center gap-2 text-emerald-900 font-semibold">
                   <ShieldCheck className="w-4 h-4 text-emerald-700 shrink-0" />
-                  <span>Carrier Route: Admin-Assigned Route</span>
+                  <span>Outbound Voice Gateway: Verified &amp; Ready</span>
                 </div>
                 <span className="text-[11px] bg-emerald-200/80 text-emerald-900 font-bold px-2 py-0.5 rounded">
                   PSTN Connected
                 </span>
               </div>
 
-              {/* Campaign Routing & Bridge Mode Selection */}
-              <div className="space-y-2">
-                <div className="flex items-center justify-between">
-                  <label className="block text-xs font-bold text-slate-800">
-                    Campaign Routing Mode:
-                  </label>
-                  {managerPolicy.allowedRoutingMode !== 'BOTH' && (
-                    <span className="text-[10px] bg-amber-100 text-amber-800 font-semibold px-2 py-0.5 rounded-full border border-amber-200">
-                      Enforced by Admin Policy
-                    </span>
-                  )}
-                </div>
-
-                <div className="grid grid-cols-1 gap-2">
-                  {/* Option 1: IVR then Direct Agent */}
-                  {(managerPolicy.allowedRoutingMode === 'BOTH' || managerPolicy.allowedRoutingMode === 'IVR_THEN_DIRECT_AGENT') && (
-                    <label className={`p-3 rounded-xl border flex items-start gap-3 cursor-pointer transition-all ${
-                      campaignForm.routingType === 'IVR_THEN_DIRECT_AGENT'
-                        ? 'bg-blue-50/70 border-blue-400 ring-1 ring-blue-400'
-                        : 'bg-slate-50 border-slate-200'
-                    }`}>
-                      <input
-                        type="radio"
-                        name="campaignRouting"
-                        disabled={managerPolicy.allowedRoutingMode !== 'BOTH'}
-                        checked={campaignForm.routingType === 'IVR_THEN_DIRECT_AGENT'}
-                        onChange={() => setCampaignForm({ ...campaignForm, routingType: 'IVR_THEN_DIRECT_AGENT' })}
-                        className="mt-0.5 text-blue-600 focus:ring-blue-500"
-                      />
-                      <div className="space-y-0.5">
-                        <div className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
-                          <span>Option 1: Traditional IVR Menu → Direct Human Agent Bridge</span>
-                        </div>
-                        <div className="text-[11px] text-slate-500">
-                          PSTN recipient answers, hears IVR voice prompt, presses DTMF key 1, and bridges directly with live agent in normal voice.
-                        </div>
-                      </div>
-                    </label>
-                  )}
-
-                  {/* Option 2: AI Real-Time Voice Translation Bot */}
-                  {(managerPolicy.allowedRoutingMode === 'BOTH' || managerPolicy.allowedRoutingMode === 'AI_VOICE_TRANSLATION') && (
-                    <label className={`p-3 rounded-xl border flex items-start gap-3 cursor-pointer transition-all ${
-                      campaignForm.routingType === 'AI_VOICE_TRANSLATION'
-                        ? 'bg-emerald-50/70 border-emerald-400 ring-1 ring-emerald-400'
-                        : 'bg-slate-50 border-slate-200'
-                    }`}>
-                      <input
-                        type="radio"
-                        name="campaignRouting"
-                        disabled={managerPolicy.allowedRoutingMode !== 'BOTH'}
-                        checked={campaignForm.routingType === 'AI_VOICE_TRANSLATION'}
-                        onChange={() => setCampaignForm({ ...campaignForm, routingType: 'AI_VOICE_TRANSLATION' })}
-                        className="mt-0.5 text-emerald-600 focus:ring-emerald-500"
-                      />
-                      <div className="space-y-0.5">
-                        <div className="font-bold text-slate-900 text-xs flex items-center gap-1.5">
-                          <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
-                          <span>Option 2: Real-Time AI Voice Translation Bot Bridge</span>
-                        </div>
-                        <div className="text-[11px] text-slate-500">
-                          PSTN recipient hears AI Bot voice. Agent speaks in their language (Urdu), receiver hears translated bot voice (Arabic). When customer speaks Arabic, agent hears translated voice in Urdu!
-                        </div>
-                      </div>
-                    </label>
-                  )}
-                </div>
-              </div>
-
-              {/* IF OPTION 2: AI TRANSLATION CONFIGURATION */}
-              {campaignForm.routingType === 'AI_VOICE_TRANSLATION' && (
-                <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-3.5 space-y-3">
-                  <div className="flex items-center justify-between">
-                    <span className="text-xs font-bold text-emerald-950 flex items-center gap-1.5">
-                      <Languages className="w-4 h-4 text-emerald-700" />
-                      <span>AI Bidirectional Translation Languages</span>
-                    </span>
-                    {!managerPolicy.allowManagerOverrideLanguages && (
-                      <span className="text-[10px] bg-emerald-200/80 text-emerald-900 font-bold px-2 py-0.5 rounded-full">
-                        Admin Enforced
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-3">
-                    <div>
-                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                        Agent Speaks (Flow A):
-                      </label>
-                      <select
-                        disabled={!managerPolicy.allowManagerOverrideLanguages}
-                        value={campaignForm.agentLanguage}
-                        onChange={(e) => setCampaignForm({ ...campaignForm, agentLanguage: e.target.value })}
-                        className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-bold text-blue-900 disabled:bg-slate-100 disabled:text-slate-600"
-                      >
-                        <option value="Urdu">Urdu (اردو)</option>
-                        <option value="English">English</option>
-                        <option value="Hindi">Hindi (हिन्दी)</option>
-                        <option value="Spanish">Spanish (Español)</option>
-                        <option value="French">French (Français)</option>
-                        <option value="German">German (Deutsch)</option>
-                      </select>
-                    </div>
-
-                    <div>
-                      <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                        Customer Speaks & Hears (Flow B):
-                      </label>
-                      <select
-                        disabled={!managerPolicy.allowManagerOverrideLanguages}
-                        value={campaignForm.customerLanguage}
-                        onChange={(e) => setCampaignForm({ ...campaignForm, customerLanguage: e.target.value })}
-                        className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-bold text-emerald-900 disabled:bg-slate-100 disabled:text-slate-600"
-                      >
-                        <option value="Arabic">Arabic (العربية)</option>
-                        <option value="Urdu">Urdu (اردو)</option>
-                        <option value="English">English</option>
-                        <option value="French">French (Français)</option>
-                        <option value="Spanish">Spanish (Español)</option>
-                        <option value="Turkish">Turkish (Türkçe)</option>
-                      </select>
-                    </div>
-                  </div>
-
-                  <div>
-                    <label className="block text-[11px] font-semibold text-slate-700 mb-1">
-                      Initial Bot Greeting (Spoken to Customer upon answer):
-                    </label>
-                    <input
-                      type="text"
-                      value={campaignForm.aiBotGreeting}
-                      onChange={(e) => setCampaignForm({ ...campaignForm, aiBotGreeting: e.target.value })}
-                      placeholder="e.g. مرحباً، جاري توصيلك بممثل الخدمة"
-                      className="w-full bg-white border border-slate-300 rounded-lg p-2 text-xs font-medium text-slate-900 focus:ring-2 focus:ring-emerald-600"
-                    />
-                  </div>
-                </div>
-              )}
-
-              {/* IF OPTION 1: SELECT IVR VOICE */}
-              {campaignForm.routingType === 'IVR_THEN_DIRECT_AGENT' && (
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">Select IVR Voice / Prompt</label>
-                  <select
-                    required
-                    value={campaignForm.ivrConfigId}
-                    onChange={(e) => setCampaignForm({ ...campaignForm, ivrConfigId: e.target.value })}
-                    className="w-full text-sm border border-slate-300 rounded-lg p-2.5 bg-white font-medium"
-                  >
-                    <option value="">-- Choose IVR Voice --</option>
-                    {ivrs.map((ivr) => (
-                      <option key={ivr.id} value={ivr.id}>
-                        🎙️ {ivr.name} (Key 1 &rarr; Transfer to Live Agent)
-                      </option>
-                    ))}
-                  </select>
+              {/* Select Manager's IVR Voice */}
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">Select Campaign IVR Voice / Greeting</label>
+                <select
+                  required
+                  value={campaignForm.ivrConfigId}
+                  onChange={(e) => setCampaignForm({ ...campaignForm, ivrConfigId: e.target.value })}
+                  className="w-full text-sm border border-slate-300 rounded-lg p-2.5 bg-white font-medium"
+                >
+                  <option value="">-- Choose IVR Voice --</option>
+                  {ivrs.map((ivr) => (
+                    <option key={ivr.id} value={ivr.id}>
+                      🎙️ {ivr.name} (Key 1 &rarr; Transfer to Live Agent)
+                    </option>
+                  ))}
+                </select>
 
                   {/* Selected IVR Voice Live Preview */}
                   {(() => {
@@ -2376,7 +2258,6 @@ export const ManagerDashboard: React.FC = () => {
                     );
                   })()}
                 </div>
-              )}
 
               {/* Target Calling Region & Country Code */}
               <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2">
@@ -3175,6 +3056,117 @@ export const ManagerDashboard: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL: CALL WRAP-UP & DISPOSITION DETAILS */}
+      {wrapUpModalCall && (
+        <div className="fixed inset-0 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 overflow-y-auto">
+          <div className="bg-white rounded-2xl shadow-2xl max-w-lg w-full p-6 space-y-4 border border-slate-200 animate-fade-in my-8">
+            <div className="flex items-start justify-between pb-3 border-b border-slate-100">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-indigo-50 text-indigo-700 rounded-xl border border-indigo-200">
+                  <FileText className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">Call Wrap-Up & Disposition Details</h3>
+                  <p className="text-xs text-slate-500">Submitted directly by station agent after call closure</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setWrapUpModalCall(null)}
+                className="text-slate-400 hover:text-slate-600 font-bold text-lg cursor-pointer p-1"
+              >
+                &times;
+              </button>
+            </div>
+
+            {/* Quick Metrics */}
+            <div className="grid grid-cols-2 gap-2 text-xs">
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider block">Recipient Number</span>
+                <span className="font-bold font-mono text-slate-900 text-sm">{wrapUpModalCall.customerNumber}</span>
+              </div>
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3">
+                <span className="text-[10px] text-slate-500 font-medium uppercase tracking-wider block">Duration / Caller ID</span>
+                <span className="font-semibold font-mono text-slate-800">
+                  {formatSeconds(wrapUpModalCall.durationSeconds || 0)} &middot; {wrapUpModalCall.callerId}
+                </span>
+              </div>
+            </div>
+
+            {/* Disposition Outcome */}
+            <div className="space-y-1">
+              <span className="text-xs font-bold text-slate-700">Call Outcome / Disposition:</span>
+              <div>
+                <span className={`text-xs font-bold px-3 py-1 rounded-full inline-flex items-center gap-1.5 border shadow-xs ${
+                  wrapUpModalCall.disposition === 'Resolved' || wrapUpModalCall.disposition === 'Sale Closed' || wrapUpModalCall.disposition?.includes('Resolved') || wrapUpModalCall.disposition?.includes('Closed') || wrapUpModalCall.disposition?.includes('Interested')
+                    ? 'bg-emerald-50 text-emerald-800 border-emerald-300'
+                    : wrapUpModalCall.disposition?.includes('Callback') || wrapUpModalCall.disposition?.includes('Follow-up')
+                    ? 'bg-amber-50 text-amber-800 border-amber-300'
+                    : wrapUpModalCall.disposition?.includes('Not Interested') || wrapUpModalCall.disposition?.includes('Wrong')
+                    ? 'bg-slate-100 text-slate-700 border-slate-300'
+                    : 'bg-indigo-50 text-indigo-800 border-indigo-200'
+                }`}>
+                  <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                  <span>{wrapUpModalCall.disposition || 'Pending Disposition'}</span>
+                </span>
+              </div>
+            </div>
+
+            {/* Wrap-Up Tags */}
+            {Array.isArray((wrapUpModalCall as any).wrapUpTags) && (wrapUpModalCall as any).wrapUpTags.length > 0 && (
+              <div className="space-y-1">
+                <span className="text-xs font-bold text-slate-700">Assigned Tags:</span>
+                <div className="flex flex-wrap gap-1.5">
+                  {(wrapUpModalCall as any).wrapUpTags.map((tag: string, i: number) => (
+                    <span key={i} className="text-xs bg-indigo-50 text-indigo-700 border border-indigo-200 px-2.5 py-0.5 rounded-lg font-semibold">
+                      #{tag}
+                    </span>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* Agent Full Notes */}
+            <div className="space-y-1">
+              <span className="text-xs font-bold text-slate-700">Agent Summary & Conversation Notes:</span>
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-xs text-slate-800 leading-relaxed font-normal shadow-xs whitespace-pre-wrap">
+                {((wrapUpModalCall as any).wrapUpNotes || wrapUpModalCall.notes) ? (
+                  `"${(wrapUpModalCall as any).wrapUpNotes || wrapUpModalCall.notes}"`
+                ) : (
+                  <span className="text-slate-400 italic">No notes were entered for this call.</span>
+                )}
+              </div>
+            </div>
+
+            {/* Agent Signoff & Timestamp */}
+            <div className="bg-indigo-50/60 border border-indigo-100 rounded-xl p-3 flex items-center justify-between text-xs text-slate-600">
+              <div className="flex items-center gap-1.5">
+                <User className="w-4 h-4 text-indigo-600" />
+                <span>
+                  Agent: <strong className="text-slate-900">@{(wrapUpModalCall as any).wrapUpAgentName || (wrapUpModalCall as any).wrapUpAgent || agents.find((a) => a.id === wrapUpModalCall.agentId)?.name || 'Station Agent'}</strong>
+                </span>
+              </div>
+              {(wrapUpModalCall as any).wrappedUpAt && (
+                <div className="flex items-center gap-1 text-[11px] text-slate-500">
+                  <Clock className="w-3.5 h-3.5 text-slate-400" />
+                  <span>{new Date((wrapUpModalCall as any).wrappedUpAt).toLocaleString()}</span>
+                </div>
+              )}
+            </div>
+
+            <div className="pt-2 flex justify-end border-t border-slate-100">
+              <button
+                type="button"
+                onClick={() => setWrapUpModalCall(null)}
+                className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold rounded-lg transition-colors cursor-pointer"
+              >
+                Close
+              </button>
+            </div>
           </div>
         </div>
       )}
