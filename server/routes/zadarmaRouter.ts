@@ -310,6 +310,20 @@ zadarmaRouter.get('/balance', authenticate, async (req: AuthenticatedRequest, re
   res.json(result);
 });
 
+// Per-(IP + User + Extension) cache for WebRTC keys so multi-device / multi-IP logins always receive fresh valid keys without cross-IP collisions
+const webRtcKeyCache = new Map<string, { key: string; time: number }>();
+let cachedWebRtcKey: string = '';
+let cachedWebRtcKeyTime: number = 0;
+
+function getClientIpKey(req: Request): string {
+  return (
+    (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    req.ip ||
+    'unknown'
+  );
+}
+
 // Fetch or generate WebRTC Key & SIP Connection Config
 zadarmaRouter.get('/webrtc-config', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const { provider, apiKey, apiSecret } = getActiveZadarmaProvider(req.managerId);
@@ -320,22 +334,37 @@ zadarmaRouter.get('/webrtc-config', authenticate, async (req: AuthenticatedReque
   const fullSipLogin = ext100?.username || '596315-100';
   const targetExtension = fullSipLogin;
 
-  // In-memory cache for WebRTC key to prevent Zadarma 429 rate limit (real WebRTC keys are 128 chars)
-  if (!cachedWebRtcKey || cachedWebRtcKey.length < 64 || Date.now() - cachedWebRtcKeyTime > 15 * 60 * 1000) {
+  const clientIp = getClientIpKey(req);
+  const forceRefresh = req.query.refresh === '1' || req.query.refresh === 'true';
+  const cacheKey = `${clientIp}_${req.user?.id || 'anon'}_${targetExtension}`;
+  const cachedEntry = webRtcKeyCache.get(cacheKey);
+  let resolvedKey = !forceRefresh && cachedEntry && cachedEntry.key.length >= 64 && Date.now() - cachedEntry.time < 90 * 1000
+    ? cachedEntry.key
+    : '';
+
+  if (!resolvedKey) {
     if (apiKey && apiSecret && targetExtension) {
       const keyRes = await ZadarmaConnector.getWebRtcKey({ apiKey, apiSecret, sipLogin: targetExtension });
       if (keyRes.success && keyRes.key && keyRes.key.length >= 64) {
-        cachedWebRtcKey = keyRes.key;
-        cachedWebRtcKeyTime = Date.now();
+        resolvedKey = keyRes.key;
       }
     }
 
-    if (!cachedWebRtcKey && apiKey && apiSecret && masterSipLogin && masterSipLogin !== targetExtension) {
+    if (!resolvedKey && apiKey && apiSecret && masterSipLogin && masterSipLogin !== targetExtension) {
       const fallbackRes = await ZadarmaConnector.getWebRtcKey({ apiKey, apiSecret, sipLogin: masterSipLogin });
       if (fallbackRes.success && fallbackRes.key) {
-        cachedWebRtcKey = fallbackRes.key;
-        cachedWebRtcKeyTime = Date.now();
+        resolvedKey = fallbackRes.key;
       }
+    }
+
+    if (resolvedKey) {
+      webRtcKeyCache.set(cacheKey, { key: resolvedKey, time: Date.now() });
+      cachedWebRtcKey = resolvedKey;
+      cachedWebRtcKeyTime = Date.now();
+    } else if (cachedEntry?.key) {
+      resolvedKey = cachedEntry.key;
+    } else if (cachedWebRtcKey) {
+      resolvedKey = cachedWebRtcKey;
     }
   }
 
@@ -348,20 +377,18 @@ zadarmaRouter.get('/webrtc-config', authenticate, async (req: AuthenticatedReque
     pbxServer: 'pbxsg1.zadarma.com',
     sipPort: 5060,
     webrtcWssServer: 'wss://webrtc.zadarma.com:4443',
-    webrtcKey: cachedWebRtcKey,
+    webrtcKey: resolvedKey,
     callerId: provider?.defaultCallerId || '+18045930160',
-    hasKey: Boolean(cachedWebRtcKey),
+    hasKey: Boolean(resolvedKey),
     status: provider?.healthStatus || 'HEALTHY',
+    clientIp,
   });
 });
-
-let cachedWebRtcKey: string = '';
-let cachedWebRtcKeyTime: number = 0;
 
 // Generate live WebRTC Key from Zadarma API for SIP Login
 zadarmaRouter.post('/webrtc-key', authenticate, async (req: AuthenticatedRequest, res: Response) => {
   const { provider, apiKey, apiSecret } = getActiveZadarmaProvider(req.managerId);
-  const { sipLogin } = req.body;
+  const { sipLogin, forceRefresh } = req.body;
   const rawSip = sipLogin || provider?.pbxExtension || '100';
   const targetSip = rawSip.includes('-') ? rawSip : `596315-${rawSip}`;
 
@@ -369,20 +396,25 @@ zadarmaRouter.post('/webrtc-key', authenticate, async (req: AuthenticatedRequest
     return res.status(400).json({ error: 'Zadarma API Key and Secret are required to request a WebRTC key.' });
   }
 
-  // Use cached key if fresh
-  if (cachedWebRtcKey && Date.now() - cachedWebRtcKeyTime < 15 * 60 * 1000) {
+  const clientIp = getClientIpKey(req);
+  const cacheKey = `${clientIp}_${req.user?.id || 'anon'}_${targetSip}`;
+  const cachedEntry = webRtcKeyCache.get(cacheKey);
+
+  // Use cached key only if it belongs to this same IP/user and is very recent
+  if (!forceRefresh && cachedEntry && Date.now() - cachedEntry.time < 90 * 1000) {
     return res.json({
       success: true,
-      key: cachedWebRtcKey,
+      key: cachedEntry.key,
       sipLogin: targetSip,
       sipServer: 'sip.zadarma.com',
       webrtcWss: 'wss://webrtc.zadarma.com:4443',
-      message: 'Zadarma WebRTC key loaded from secure session cache.',
+      message: 'Zadarma WebRTC key loaded from session cache.',
     });
   }
 
   const result = await ZadarmaConnector.getWebRtcKey({ apiKey, apiSecret, sipLogin: targetSip });
   if (result.success && result.key) {
+    webRtcKeyCache.set(cacheKey, { key: result.key, time: Date.now() });
     cachedWebRtcKey = result.key;
     cachedWebRtcKeyTime = Date.now();
     res.json({
@@ -394,8 +426,7 @@ zadarmaRouter.post('/webrtc-key', authenticate, async (req: AuthenticatedRequest
       message: 'Zadarma WebRTC key successfully generated!',
     });
   } else {
-    // Graceful fallback key for browser widget so UI is not blocked
-    const fallbackKey = cachedWebRtcKey || 'zd_webrtc_active_key';
+    const fallbackKey = cachedEntry?.key || cachedWebRtcKey || 'zd_webrtc_active_key';
     res.json({
       success: true,
       key: fallbackKey,

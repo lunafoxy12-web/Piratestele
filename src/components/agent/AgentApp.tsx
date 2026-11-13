@@ -91,6 +91,7 @@ export const AgentApp: React.FC = () => {
 
   // Real Hardware Microphone & Speaker Audio Engine
   const localStreamRef = useRef<MediaStream | null>(null);
+  const physicalMixerMicStreamRef = useRef<MediaStream | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
@@ -100,6 +101,7 @@ export const AgentApp: React.FC = () => {
   const mixerAudioContextRef = useRef<AudioContext | null>(null);
   const mixerMicGainRef = useRef<GainNode | null>(null);
   const mixerIvrGainRef = useRef<GainNode | null>(null);
+  const mixerKeepAliveGainRef = useRef<GainNode | null>(null);
   const mixerDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const ivrAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const ivrMelodyTimerRef = useRef<NodeJS.Timeout | null>(null);
@@ -122,6 +124,12 @@ export const AgentApp: React.FC = () => {
   activeIvrConfigRef.current = activeIvrConfig;
 
   const handleCallActionRef = useRef<any>(null);
+  const start3SecondRingBeepAndAutoAnswerRef = useRef<any>(null);
+  const connectRealPstnAudioRef = useRef<any>(null);
+  const stopRingtoneRef = useRef<any>(null);
+  const stopMicrophoneRef = useRef<any>(null);
+  const stopAgentSpeechRecognitionRef = useRef<any>(null);
+  const disconnectRealPstnAudioRef = useRef<any>(null);
   const remoteAudioBridgeRef = useRef<{ bridgeCtx: AudioContext; sourceNode: MediaStreamAudioSourceNode; gainNode: GainNode } | null>(null);
 
   // 3-Second Ring Beep & Auto-Answer Engine
@@ -142,6 +150,8 @@ export const AgentApp: React.FC = () => {
   const [selectedMicId, setSelectedMicId] = useState<string>('');
   const [micError, setMicError] = useState<string | null>(null);
   const [isTestingMicStandalone, setIsTestingMicStandalone] = useState<boolean>(false);
+  const isTestingMicStandaloneRef = useRef<boolean>(false);
+  isTestingMicStandaloneRef.current = isTestingMicStandalone;
   const [agentSpeechText, setAgentSpeechText] = useState<string>('');
   const [isMicAutoTranscribe, setIsMicAutoTranscribe] = useState<boolean>(false);
   const [conversationHistory, setConversationHistory] = useState<Array<{ sender: 'agent' | 'customer'; text: string; time: string }>>([]);
@@ -170,8 +180,38 @@ export const AgentApp: React.FC = () => {
   activeCallRef.current = activeCall;
   const tokenRef = useRef<string | null>(token);
   tokenRef.current = token;
+  const agentStateRef = useRef<'OFFLINE' | 'AVAILABLE' | 'RINGING' | 'BUSY' | 'WRAP-UP'>(agentState);
+  agentStateRef.current = agentState;
+  const userRef = useRef(user);
+  userRef.current = user;
+  const isMutedRef = useRef<boolean>(isMuted);
+  isMutedRef.current = isMuted;
+  const isSpeakerOnRef = useRef<boolean>(isSpeakerOn);
+  isSpeakerOnRef.current = isSpeakerOn;
+  const speakerVolumeRef = useRef<number>(speakerVolume);
+  speakerVolumeRef.current = speakerVolume;
 
-  // Intercept navigator.mediaDevices.getUserMedia so Zadarma WebRTC engine streams from our Audio Mixer
+  // Unlock browser AudioContext automatically on mobile/desktop interaction so incoming WebRTC & ringtone never fail
+  useEffect(() => {
+    const unlockAudio = () => {
+      if (mixerAudioContextRef.current && mixerAudioContextRef.current.state === 'suspended') {
+        mixerAudioContextRef.current.resume().catch(() => {});
+      }
+      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume().catch(() => {});
+      }
+    };
+    window.addEventListener('pointerdown', unlockAudio, { passive: true });
+    window.addEventListener('touchstart', unlockAudio, { passive: true });
+    window.addEventListener('keydown', unlockAudio, { passive: true });
+    return () => {
+      window.removeEventListener('pointerdown', unlockAudio);
+      window.removeEventListener('touchstart', unlockAudio);
+      window.removeEventListener('keydown', unlockAudio);
+    };
+  }, []);
+
+  // Intercept navigator.mediaDevices.getUserMedia so WebRTC engine streams from our Audio Mixer
   useEffect(() => {
     if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
       if (!originalGetUserMediaRef.current) {
@@ -181,8 +221,7 @@ export const AgentApp: React.FC = () => {
         if (constraints?.audio && !constraints.video) {
           try {
             const mixedStream = await initOrGetMixerStream();
-            if (mixedStream) {
-              console.log('[WEBRTC AUDIO MIXER] Successfully routed Web Audio mixed stream into Zadarma WebRTC');
+            if (mixedStream && mixedStream.getAudioTracks().some((t) => t.readyState === 'live')) {
               return mixedStream;
             }
           } catch (e) {
@@ -200,11 +239,11 @@ export const AgentApp: React.FC = () => {
     async function initZadarmaWebphone() {
       try {
         setWebrtcStatus('INITIALIZING');
-        // 1. Fetch live WebRTC config from backend (configured for PBX extension 100)
-        const res = await fetch('/api/zadarma/webrtc-config', {
+        // 1. Fetch fresh live WebRTC config for this device & IP
+        const res = await fetch('/api/zadarma/webrtc-config?refresh=1', {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
         });
-        if (!res.ok) throw new Error(`HTTP ${res.status} fetching Zadarma WebRTC config`);
+        if (!res.ok) throw new Error(`HTTP ${res.status} fetching WebRTC config`);
         const config = await res.json();
 
         const sipLogin = config.fullSipLogin || config.sipLogin || '596315-100';
@@ -219,7 +258,7 @@ export const AgentApp: React.FC = () => {
               'Content-Type': 'application/json',
               ...(token ? { Authorization: `Bearer ${token}` } : {}),
             },
-            body: JSON.stringify({ sipLogin }),
+            body: JSON.stringify({ sipLogin, forceRefresh: true }),
           });
           if (keyRes.ok) {
             const keyData = await keyRes.json();
@@ -228,10 +267,10 @@ export const AgentApp: React.FC = () => {
         }
 
         if (!key) {
-          throw new Error('Zadarma WebRTC key not available. Verify Zadarma API credentials in VoIP Settings.');
+          throw new Error('Voice WebRTC key not available.');
         }
 
-        // 2. Dynamically load official Zadarma WebRTC library and loader
+        // 2. Dynamically load WebRTC library and loader
         const loadScript = (src: string, id: string): Promise<void> => {
           return new Promise((resolve, reject) => {
             if (document.getElementById(id)) return resolve();
@@ -250,19 +289,18 @@ export const AgentApp: React.FC = () => {
 
         if (!isMounted) return;
 
-        // 3. Initialize Zadarma WebRTC widget headlessly
+        // 3. Initialize WebRTC widget headlessly
         if (typeof (window as any).zadarmaWidgetFn === 'function') {
           try {
             (window as any).zadarmaWidgetFn(key, sipLogin, 'square', 'en', true, 'bottom-right');
             if (isMounted) setWebrtcStatus('REGISTERED');
-            console.log('[ZADARMA WEBRTC] Client initialized for SIP extension:', sipLogin);
           } catch (widgetErr) {
-            console.warn('[ZADARMA WIDGET INIT NOTE]', widgetErr);
+            console.warn('[WEBRTC WIDGET INIT NOTE]', widgetErr);
             if (isMounted) setWebrtcStatus('REGISTERED');
           }
         }
 
-        // 4. Hook into Zadarma WebRTC push socket and status messages
+        // 4. Hook into WebRTC push socket and status messages (always using refs so closures never go stale)
         const pollForWebPhone = setInterval(() => {
           const phone = (window as any).zdrmWebrtcPhone || (window as any).zdrmWebPhone;
           if (phone) {
@@ -271,26 +309,26 @@ export const AgentApp: React.FC = () => {
               const origGetStatus = phone.apiWidget.getStatusMessage;
               phone.apiWidget.getStatusMessage = (status: string, data: any) => {
                 if (typeof origGetStatus === 'function') origGetStatus(status, data);
-                console.log('[ZADARMA WEBRTC EVENT]', status, data);
 
                 if (status === 'incoming') {
-                  const incomingCaller = data?.caller || 'PSTN Customer';
-                  console.log('[ZADARMA WEBRTC] Inbound media connection from Zadarma PBX on Extension 100:', incomingCaller);
+                  // Connect audio leg immediately so media stream establishes reliably across mobile & desktop NATs
+                  connectRealPstnAudioRef.current?.();
 
-                  // Connect audio leg so media stream flows between browser and Zadarma PBX
-                  connectRealPstnAudio();
-
-                  // Extension 100 is connected by Zadarma PBX when the PSTN receiver presses DTMF 1 in scenario
-                  // Trigger 3-second ring beep pulse for available agent, then auto-answer with clear 2-way audio!
-                  start3SecondRingBeepAndAutoAnswer('1', data?.callId || activeCallRef.current?.id, user?.managerId);
+                  // Trigger 3-second ring beep pulse for available agent, then auto-answer with clear 2-way audio
+                  start3SecondRingBeepAndAutoAnswerRef.current?.(
+                    '1',
+                    data?.callId || activeCallRef.current?.id,
+                    userRef.current?.managerId
+                  );
 
                   // Synchronize with backend
-                  if (token) {
+                  const activeTok = tokenRef.current;
+                  if (activeTok) {
                     fetch('/api/agent/webrtc-incoming', {
                       method: 'POST',
                       headers: {
                         'Content-Type': 'application/json',
-                        Authorization: `Bearer ${token}`,
+                        Authorization: `Bearer ${activeTok}`,
                       },
                       body: JSON.stringify({
                         caller: data?.caller,
@@ -300,41 +338,44 @@ export const AgentApp: React.FC = () => {
                     })
                       .then((r) => r.json())
                       .then((resData) => {
-                        console.log('[WEBRTC INCOMING SYNC RESULT]', resData);
                         if (resData.callId) {
-                          setActiveCall((prev) => prev ? { ...prev, id: resData.callId, callId: resData.callId, status: 'RINGING' } : prev);
+                          setActiveCall((prev) =>
+                            prev ? { ...prev, id: resData.callId, callId: resData.callId, status: 'RINGING' } : prev
+                          );
                         }
                       })
                       .catch((err) => console.warn('[SYNC WEBRTC INCOMING NOTE]', err));
                   }
                 } else if (status === 'dtmf' || data?.key || data?.dtmf) {
                   const digit = String(data?.key || data?.dtmf || data?.digit || '1').trim();
-                  console.log('[ZADARMA WEBRTC DTMF DETECTED]', digit);
-                  start3SecondRingBeepAndAutoAnswer(digit, activeCallRef.current?.id);
+                  start3SecondRingBeepAndAutoAnswerRef.current?.(
+                    digit,
+                    activeCallRef.current?.id,
+                    userRef.current?.managerId
+                  );
                 } else if (status === 'confirmed' || status === 'talking') {
                   if (isMounted) setWebrtcStatus('CALL_ACTIVE');
                   setAgentState('BUSY');
-                  stopRingtone();
-                  // Ensure audio elements are active
+                  stopRingtoneRef.current?.();
                   const remoteEl = document.getElementById('zdrm-webRTCRemoteView') as HTMLMediaElement;
                   if (remoteEl) {
-                    remoteEl.muted = !isSpeakerOn;
-                    remoteEl.volume = Math.max(0.05, Math.min(1, speakerVolume / 100));
+                    remoteEl.setAttribute('playsinline', 'true');
+                    remoteEl.muted = !isSpeakerOnRef.current;
+                    remoteEl.volume = Math.max(0.05, Math.min(1, speakerVolumeRef.current / 100));
                     remoteEl.play().catch(() => {});
                   }
                 } else if (status === 'canceled' || status === 'call_ended' || status === 'hangup') {
-                  console.log('[ZADARMA WEBRTC] PSTN caller ended call:', status, data);
                   if (isMounted) setWebrtcStatus('REGISTERED');
-                  stopRingtone();
-                  stopMicrophone();
-                  stopAgentSpeechRecognition();
-                  disconnectRealPstnAudio();
+                  stopRingtoneRef.current?.();
+                  stopMicrophoneRef.current?.();
+                  stopAgentSpeechRecognitionRef.current?.();
+                  disconnectRealPstnAudioRef.current?.();
                   if (keepAliveTimerRef.current) {
                     clearInterval(keepAliveTimerRef.current);
                     keepAliveTimerRef.current = null;
                   }
 
-                  const endedCall = activeCallRef.current || activeCall;
+                  const endedCall = activeCallRef.current;
                   if (endedCall) {
                     setWrapUpCall(endedCall);
                     wrapUpCallRef.current = endedCall;
@@ -367,9 +408,9 @@ export const AgentApp: React.FC = () => {
 
         setTimeout(() => clearInterval(pollForWebPhone), 12000);
       } catch (err: any) {
-        console.warn('[ZADARMA WEBRTC INIT ERROR]', err?.message || err);
+        console.warn('[WEBRTC INIT ERROR]', err?.message || err);
         if (isMounted) {
-          setWebrtcError(err?.message || 'Zadarma WebRTC initialization note');
+          setWebrtcError(err?.message || 'WebRTC initialization note');
           setWebrtcStatus('ERROR');
         }
       }
@@ -488,34 +529,63 @@ export const AgentApp: React.FC = () => {
     }
   };
 
-  // Initialize or get Web Audio Mixed Stream (isolates mic during IVR; streams manager voice)
+  // Initialize or get Web Audio Mixed Stream (isolates standalone mic test tracks so stopping mic test NEVER kills WebRTC uplink)
   const initOrGetMixerStream = async (): Promise<MediaStream | null> => {
     try {
       const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
       if (!AudioCtx) return null;
-      if (!mixerAudioContextRef.current) {
+      if (!mixerAudioContextRef.current || mixerAudioContextRef.current.state === 'closed') {
         mixerAudioContextRef.current = new AudioCtx({ sampleRate: 48000 });
+        mixerDestinationRef.current = null;
+        mixerMicGainRef.current = null;
+        mixerIvrGainRef.current = null;
+        mixerKeepAliveGainRef.current = null;
       }
       const ctx = mixerAudioContextRef.current;
       if (ctx.state === 'suspended') {
         await ctx.resume().catch(() => {});
       }
-      if (!mixerDestinationRef.current) {
+
+      const destTracksEnded =
+        !mixerDestinationRef.current ||
+        mixerDestinationRef.current.stream.getAudioTracks().length === 0 ||
+        mixerDestinationRef.current.stream.getAudioTracks().every((t) => t.readyState !== 'live');
+
+      if (destTracksEnded) {
         mixerDestinationRef.current = ctx.createMediaStreamDestination();
+        mixerMicGainRef.current = null;
+        mixerIvrGainRef.current = null;
+        mixerKeepAliveGainRef.current = null;
       }
+
       if (!mixerMicGainRef.current) {
         mixerMicGainRef.current = ctx.createGain();
         mixerMicGainRef.current.gain.setValueAtTime(isIvrGreetingPlayingRef.current ? 0 : 1.0, ctx.currentTime);
-        mixerMicGainRef.current.connect(mixerDestinationRef.current);
+        mixerMicGainRef.current.connect(mixerDestinationRef.current!);
       }
       if (!mixerIvrGainRef.current) {
         mixerIvrGainRef.current = ctx.createGain();
         mixerIvrGainRef.current.gain.setValueAtTime(isIvrGreetingPlayingRef.current ? 1.0 : 0.0, ctx.currentTime);
-        mixerIvrGainRef.current.connect(mixerDestinationRef.current);
+        mixerIvrGainRef.current.connect(mixerDestinationRef.current!);
+      }
+      if (!mixerKeepAliveGainRef.current) {
+        // Silent keep-alive tone ensures WebRTC always receives a valid live track immediately across mobile & desktop
+        const osc = ctx.createOscillator();
+        const kGain = ctx.createGain();
+        osc.frequency.setValueAtTime(20, ctx.currentTime);
+        kGain.gain.setValueAtTime(0.00001, ctx.currentTime);
+        osc.connect(kGain);
+        kGain.connect(mixerDestinationRef.current!);
+        osc.start();
+        mixerKeepAliveGainRef.current = kGain;
       }
 
-      // If physical mic not yet connected into mixerMicGainRef, connect it now using native getUserMedia
-      if (!localStreamRef.current && originalGetUserMediaRef.current) {
+      // Connect physical mic into mixerMicGainRef if not connected or previous track ended
+      const hasLiveMixerMic =
+        physicalMixerMicStreamRef.current &&
+        physicalMixerMicStreamRef.current.getAudioTracks().some((t) => t.readyState === 'live');
+
+      if (!hasLiveMixerMic && originalGetUserMediaRef.current) {
         try {
           const micStream = await originalGetUserMediaRef.current({
             audio: {
@@ -524,14 +594,14 @@ export const AgentApp: React.FC = () => {
               autoGainControl: true,
             },
           });
-          localStreamRef.current = micStream;
+          physicalMixerMicStreamRef.current = micStream;
           const micSource = ctx.createMediaStreamSource(micStream);
           micSource.connect(mixerMicGainRef.current);
         } catch (e) {
           console.warn('Physical mic capture for mixer note:', e);
         }
       }
-      return mixerDestinationRef.current.stream;
+      return mixerDestinationRef.current!.stream;
     } catch (e) {
       console.warn('initOrGetMixerStream error:', e);
       return null;
@@ -801,18 +871,21 @@ export const AgentApp: React.FC = () => {
 
   // Auto-connect with 3-second ring beep sound upon DTMF confirmation (Zero clicks required by agent)
   const start3SecondRingBeepAndAutoAnswer = (digit: string = '1', incomingCallId?: string, managerIdOfCall?: string) => {
+    const curUser = userRef.current;
+    const curState = agentStateRef.current;
+
     // 1. Role Check: Strictly agent role only, NEVER manager
-    if (user?.role !== 'agent') return;
+    if (curUser?.role !== 'agent') return;
 
     // 2. Manager Isolation: Call must belong to this agent's manager
-    if (managerIdOfCall && user?.managerId && managerIdOfCall !== user.managerId) {
-      console.log(`[AGENT AUTO-ANSWER] Ignored: call manager ${managerIdOfCall} does not match agent manager ${user.managerId}`);
+    if (managerIdOfCall && curUser?.managerId && managerIdOfCall !== curUser.managerId) {
+      console.log(`[AGENT AUTO-ANSWER] Ignored: call manager ${managerIdOfCall} does not match agent manager ${curUser.managerId}`);
       return;
     }
 
-    // 3. Availability Check: Agent MUST be in AVAILABLE or RINGING state, not BUSY, OFFLINE, or WRAP-UP
-    if (agentState !== 'AVAILABLE' && agentState !== 'RINGING' && !isAutoAnsweringRef.current) {
-      console.log(`[AGENT AUTO-ANSWER] Ignored: agent is ${agentState}, not AVAILABLE.`);
+    // 3. Availability Check: Must not interrupt an already BUSY or OFFLINE station
+    if (curState !== 'AVAILABLE' && curState !== 'RINGING' && !isAutoAnsweringRef.current) {
+      console.log(`[AGENT AUTO-ANSWER] Ignored: agent is ${curState}, not AVAILABLE.`);
       return;
     }
 
@@ -1047,7 +1120,9 @@ export const AgentApp: React.FC = () => {
         } else if (latestAgentEvent.state === 'WRAP-UP' || latestAgentEvent.state === 'AVAILABLE' || latestAgentEvent.state === 'OFFLINE') {
           if (!latestAgentEvent.currentCallId) {
             stopRingtone();
-            stopMicrophone();
+            if (!isTestingMicStandaloneRef.current) {
+              stopMicrophone();
+            }
             stopAgentSpeechRecognition();
             disconnectRealPstnAudio();
             if (keepAliveTimerRef.current) {
@@ -1066,7 +1141,9 @@ export const AgentApp: React.FC = () => {
     ) {
       console.log('[AGENT APP] Received call ended event from carrier:', latestAgentEvent);
       stopRingtone();
-      stopMicrophone();
+      if (!isTestingMicStandaloneRef.current) {
+        stopMicrophone();
+      }
       stopAgentSpeechRecognition();
       disconnectRealPstnAudio();
       if (keepAliveTimerRef.current) {
@@ -1284,67 +1361,128 @@ export const AgentApp: React.FC = () => {
     refreshAudioDevices();
   }, []);
 
-  // Hardware Microphone Capture & Live Analyser
-  const startMicrophone = async () => {
+  // Hardware Microphone Capture & Live Analyser (Uses raw native getUserMedia so standalone test & repeated clicks work reliably every time)
+  const startMicrophone = async (deviceIdOverride?: string) => {
     try {
       setMicPermission('requesting');
       setMicError(null);
 
-      // Stop existing stream if running
-      if (localStreamRef.current) {
-        localStreamRef.current.getTracks().forEach((t) => t.stop());
-      }
+      // Cleanly tear down any previous test capture before starting a fresh one
       if (animFrameRef.current) {
         cancelAnimationFrame(animFrameRef.current);
+        animFrameRef.current = null;
+      }
+      if (micSourceRef.current) {
+        try { micSourceRef.current.disconnect(); } catch {}
+        micSourceRef.current = null;
+      }
+      if (analyserRef.current) {
+        try { analyserRef.current.disconnect(); } catch {}
+        analyserRef.current = null;
+      }
+      if (localStreamRef.current) {
+        localStreamRef.current.getTracks().forEach((t) => t.stop());
+        localStreamRef.current = null;
+      }
+      if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
+        try { await audioContextRef.current.close(); } catch {}
+        audioContextRef.current = null;
       }
 
-      const stream = await navigator.mediaDevices.getUserMedia({
-        audio: {
-          echoCancellation: true,
-          noiseSuppression: true,
-          autoGainControl: true,
-          deviceId: selectedMicId ? { exact: selectedMicId } : undefined,
-        },
-      });
+      // Create and resume AudioContext synchronously inside user-gesture flow for mobile Safari/Chrome
+      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+      const ctx = new AudioContextClass();
+      audioContextRef.current = ctx;
+      if (ctx.state === 'suspended') {
+        ctx.resume().catch(() => {});
+      }
+
+      const rawGetUserMedia =
+        originalGetUserMediaRef.current ||
+        (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia
+          ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
+          : null);
+
+      if (!rawGetUserMedia) {
+        throw new Error('Microphone API not supported in this browser.');
+      }
+
+      const targetMicId = deviceIdOverride ?? selectedMicId;
+      let stream: MediaStream;
+      try {
+        stream = await rawGetUserMedia({
+          audio: targetMicId
+            ? {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+                deviceId: { ideal: targetMicId },
+              }
+            : {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true,
+              },
+        });
+      } catch {
+        // Fallback for strict mobile browsers / changed deviceId
+        stream = await rawGetUserMedia({ audio: true });
+      }
 
       localStreamRef.current = stream;
       setMicPermission('granted');
 
-      const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
-      const ctx = new AudioContextClass();
-      audioContextRef.current = ctx;
+      if (ctx.state === 'suspended') {
+        await ctx.resume().catch(() => {});
+      }
 
       const source = ctx.createMediaStreamSource(stream);
       micSourceRef.current = source;
 
       const analyser = ctx.createAnalyser();
-      analyser.fftSize = 64;
-      analyser.smoothingTimeConstant = 0.5;
+      analyser.fftSize = 256;
+      analyser.smoothingTimeConstant = 0.45;
       analyserRef.current = analyser;
 
       source.connect(analyser);
 
-      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      const freqData = new Uint8Array(analyser.frequencyBinCount);
+      const timeData = new Uint8Array(analyser.fftSize);
 
       const loop = () => {
-        if (!analyserRef.current) return;
-        analyserRef.current.getByteFrequencyData(dataArray);
+        const activeAnalyser = analyserRef.current;
+        if (!activeAnalyser) return;
 
-        let sum = 0;
-        for (let i = 0; i < dataArray.length; i++) {
-          sum += dataArray[i];
+        activeAnalyser.getByteFrequencyData(freqData);
+        activeAnalyser.getByteTimeDomainData(timeData);
+
+        let freqSum = 0;
+        for (let i = 0; i < freqData.length; i++) {
+          freqSum += freqData[i];
         }
-        const avg = sum / dataArray.length;
-        const level = Math.min(100, Math.round((avg / 128) * 100));
+        const freqLevel = Math.min(100, Math.round((freqSum / freqData.length / 100) * 100));
 
-        setMicAudioLevel(isMuted ? 0 : level);
-        setIsAgentSpeaking(level > 12 && !isMuted);
+        // Compute time-domain RMS for responsive VU reaction on quiet mobile/headset mics
+        let rmsSum = 0;
+        for (let i = 0; i < timeData.length; i++) {
+          const norm = (timeData[i] - 128) / 128;
+          rmsSum += norm * norm;
+        }
+        const rms = Math.sqrt(rmsSum / timeData.length);
+        const rmsLevel = Math.min(100, Math.round(rms * 350));
+
+        const level = Math.max(freqLevel, rmsLevel);
+        const mutedNow = isMutedRef.current;
+
+        setMicAudioLevel(mutedNow ? 0 : level);
+        setIsAgentSpeaking(level > 12 && !mutedNow);
 
         // Generate 15 equalizer visualizer bars from real mic data
         const bars: number[] = [];
-        const step = Math.max(1, Math.floor(dataArray.length / 15));
+        const step = Math.max(1, Math.floor(freqData.length / 15));
         for (let i = 0; i < 15; i++) {
-          const val = isMuted ? 8 : Math.round((dataArray[Math.min(dataArray.length - 1, i * step)] / 255) * 100);
+          const binVal = Math.round((freqData[Math.min(freqData.length - 1, i * step)] / 220) * 100);
+          const val = mutedNow ? 8 : Math.max(binVal, Math.round(rmsLevel * 0.7));
           bars.push(Math.max(10, Math.min(100, val)));
         }
         setMicFrequencies(bars);
@@ -1366,11 +1504,19 @@ export const AgentApp: React.FC = () => {
       cancelAnimationFrame(animFrameRef.current);
       animFrameRef.current = null;
     }
+    if (micSourceRef.current) {
+      try { micSourceRef.current.disconnect(); } catch {}
+      micSourceRef.current = null;
+    }
+    if (analyserRef.current) {
+      try { analyserRef.current.disconnect(); } catch {}
+      analyserRef.current = null;
+    }
     if (localStreamRef.current) {
       localStreamRef.current.getTracks().forEach((t) => t.stop());
       localStreamRef.current = null;
     }
-    if (audioContextRef.current) {
+    if (audioContextRef.current && audioContextRef.current.state !== 'closed') {
       try {
         audioContextRef.current.close();
       } catch {}
@@ -1442,7 +1588,8 @@ export const AgentApp: React.FC = () => {
         ) as HTMLMediaElement;
 
         if (remoteMedia) {
-          // Never allow display:none or visibility:hidden to silence audio in Chromium/WebKit
+          // Never allow display:none or visibility:hidden to silence audio in Chromium/WebKit/iOS Safari
+          remoteMedia.setAttribute('playsinline', 'true');
           remoteMedia.style.setProperty('display', 'block', 'important');
           remoteMedia.style.setProperty('visibility', 'visible', 'important');
           remoteMedia.style.setProperty('position', 'fixed', 'important');
@@ -1453,8 +1600,8 @@ export const AgentApp: React.FC = () => {
           remoteMedia.style.setProperty('opacity', '0.01', 'important');
           remoteMedia.style.setProperty('pointer-events', 'none', 'important');
 
-          remoteMedia.muted = !isSpeakerOn;
-          remoteMedia.volume = Math.max(0.2, Math.min(1, (speakerVolume ?? 85) / 100));
+          remoteMedia.muted = !isSpeakerOnRef.current;
+          remoteMedia.volume = Math.max(0.2, Math.min(1, (speakerVolumeRef.current ?? 85) / 100));
 
           remoteMedia.play().catch((e) => {
             console.warn('[PSTN AUDIO PLAY NOTE]', e);
@@ -2031,6 +2178,12 @@ export const AgentApp: React.FC = () => {
     }
   };
   handleCallActionRef.current = handleCallAction;
+  start3SecondRingBeepAndAutoAnswerRef.current = start3SecondRingBeepAndAutoAnswer;
+  connectRealPstnAudioRef.current = connectRealPstnAudio;
+  stopRingtoneRef.current = stopRingtone;
+  stopMicrophoneRef.current = stopMicrophone;
+  stopAgentSpeechRecognitionRef.current = stopAgentSpeechRecognition;
+  disconnectRealPstnAudioRef.current = disconnectRealPstnAudio;
 
   const handleCompleteWrapUp = async () => {
     const targetCall = wrapUpCallRef.current || wrapUpCall || activeCallRef.current || activeCall;
@@ -2610,7 +2763,7 @@ export const AgentApp: React.FC = () => {
                       value={selectedMicId || ''}
                       onChange={(e) => {
                         setSelectedMicId(e.target.value);
-                        startMicrophone();
+                        startMicrophone(e.target.value);
                       }}
                       className="bg-slate-700 border border-slate-600 text-slate-200 rounded text-[11px] py-1 px-2"
                     >
@@ -2632,7 +2785,7 @@ export const AgentApp: React.FC = () => {
                   </div>
                   <button
                     type="button"
-                    onClick={startMicrophone}
+                    onClick={() => startMicrophone()}
                     className="px-2.5 py-1 bg-red-800 hover:bg-red-700 text-white font-bold rounded text-[11px]"
                   >
                     Re-enable Mic
@@ -3114,6 +3267,13 @@ export const AgentApp: React.FC = () => {
                 </div>
               )}
 
+              {micError && (
+                <div className="p-2.5 bg-red-50 border border-red-200 text-red-700 text-[11px] rounded-lg flex items-center gap-1.5">
+                  <AlertCircle className="w-3.5 h-3.5 text-red-500 shrink-0" />
+                  <span>{micError}</span>
+                </div>
+              )}
+
               {/* Device Selector */}
               {audioDevices.inputs.length > 0 && (
                 <div className="pt-1">
@@ -3122,7 +3282,7 @@ export const AgentApp: React.FC = () => {
                     value={selectedMicId || ''}
                     onChange={(e) => {
                       setSelectedMicId(e.target.value);
-                      if (isTestingMicStandalone) startMicrophone();
+                      if (isTestingMicStandalone) startMicrophone(e.target.value);
                     }}
                     className="w-full bg-white border border-slate-300 text-slate-700 text-xs rounded-lg p-1.5"
                   >

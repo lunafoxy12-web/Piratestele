@@ -124,8 +124,8 @@ twilioRouter.post('/dtmf', async (req: Request, res: Response) => {
     return res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
   }
 
-  // Handle DTMF input in telephony engine
-  await telephony.handleDtmfInput(call.id, String(Digits || ''));
+  // Handle DTMF input in telephony engine ONCE (already invokes initiateAgentTransfer for TRANSFER_TO_AGENT)
+  const dtmfResult = await telephony.handleDtmfInput(call.id, String(Digits || ''));
 
   const campaign = call.campaignId ? data.campaigns.find((c) => c.id === call.campaignId) : null;
   const ivr = campaign ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId) : data.ivr_configs[0];
@@ -134,7 +134,7 @@ twilioRouter.post('/dtmf', async (req: Request, res: Response) => {
   const action = matchedOption?.action || (Digits === '1' ? 'TRANSFER_TO_AGENT' : Digits === '2' ? 'REPEAT_MENU' : 'END_CALL');
 
   if (action === 'TRANSFER_TO_AGENT') {
-    const transferResult = await telephony.initiateAgentTransfer(call.id, call.managerId);
+    const transferResult = dtmfResult.transferResult || await telephony.initiateAgentTransfer(call.id, call.managerId);
 
     if (transferResult.success) {
       console.log(`[AGENT BRIDGED] Connecting customer directly to human agent ${transferResult.agentName}...`);
@@ -147,13 +147,14 @@ twilioRouter.post('/dtmf', async (req: Request, res: Response) => {
 </Response>`;
       return res.type('text/xml').send(twiml);
     } else {
-      console.log(`[AGENT BUSY] No available free agent under manager ${call.managerId}`);
+      console.log(`[AGENT QUEUED] No immediate free agent under manager ${call.managerId}; placing caller in live hold poll loop...`);
+      const appUrl = process.env.APP_URL || '';
+      const pollUrl = `${appUrl}/api/twilio/queue-poll?callId=${encodeURIComponent(call.id)}&amp;attempt=1`;
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">All representative agents are currently assisting other callers. Please stay on the line or call back shortly.</Say>
-  <Pause length="2"/>
-  <Say voice="alice">Thank you for calling Pirates World Tele Solution. Goodbye.</Say>
-  <Hangup/>
+  <Say voice="alice">Connecting you to our next available representative. Please stay on the line.</Say>
+  <Pause length="3"/>
+  <Redirect method="POST">${pollUrl}</Redirect>
 </Response>`;
       return res.type('text/xml').send(twiml);
     }
@@ -175,6 +176,47 @@ twilioRouter.post('/dtmf', async (req: Request, res: Response) => {
     await telephony.endCall(call.id, 'COMPLETED', 'Caller ended IVR menu interaction.');
     return res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Say voice="alice">Thank you for calling Pirates World Tele Solution. Goodbye.</Say><Hangup/></Response>');
   }
+});
+
+// Queue poll webhook so callers wait briefly for an agent instead of immediate hangup
+twilioRouter.post('/queue-poll', async (req: Request, res: Response) => {
+  const callId = String(req.query.callId || req.body?.callId || '').trim();
+  const attempt = parseInt(String(req.query.attempt || '1'), 10) || 1;
+  const data = db.get();
+  const call = data.calls.find((c) => c.id === callId || c.callSid === callId);
+
+  if (!call || ['COMPLETED', 'FAILED', 'CANCELLED'].includes(call.status)) {
+    return res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
+  }
+
+  const transferResult = await telephony.initiateAgentTransfer(call.id, call.managerId);
+  if (transferResult.success) {
+    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Representative agent ${escapeXml(transferResult.agentName || 'Agent')} is ready. Connecting now.</Say>
+  <Dial timeout="25">
+    <Conference waitUrl="http://twimlets.com/holdmusic?Bucket=com.twilio.music.classical" statusCallbackEvent="join leave">conf_${call.id}</Conference>
+  </Dial>
+</Response>`;
+    return res.type('text/xml').send(twiml);
+  }
+
+  if (attempt >= 6) {
+    return res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">All representative agents are currently assisting other callers. Please stay on the line or call back shortly. Goodbye.</Say>
+  <Hangup/>
+</Response>`);
+  }
+
+  const appUrl = process.env.APP_URL || '';
+  const nextPollUrl = `${appUrl}/api/twilio/queue-poll?callId=${encodeURIComponent(call.id)}&amp;attempt=${attempt + 1}`;
+  return res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>http://twimlets.com/holdmusic?Bucket=com.twilio.music.classical</Play>
+  <Pause length="4"/>
+  <Redirect method="POST">${nextPollUrl}</Redirect>
+</Response>`);
 });
 
 export default twilioRouter;

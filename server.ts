@@ -16,7 +16,8 @@ async function startServer() {
   const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
   const isProd = process.env.NODE_ENV === 'production';
 
-  // 1. Cyber Security: Disable server stack fingerprinting
+  // 1. Cyber Security & Proxy Awareness: Trust reverse proxy X-Forwarded-For headers across mobile/multi-IP clients
+  app.set('trust proxy', true);
   app.disable('x-powered-by');
 
   // 2. Cyber Security: Enforce hardened HTTP security headers
@@ -39,13 +40,24 @@ async function startServer() {
   // 3. Cyber Security: Anti-Brute-Force & Anti-DDoS Rate Limiter
   const ipHits = new Map<string, { count: number; resetTime: number }>();
   app.use('/api', (req, res, next) => {
-    // Whitelist health checks and SSE events from strict throttling
-    if (req.path === '/health' || req.path === '/events') return next();
+    // Whitelist health checks, SSE events, carrier webhooks, and real-time audio keep-alive from throttling
+    if (
+      req.path === '/health' ||
+      req.path === '/events' ||
+      req.path.startsWith('/twilio/') ||
+      req.path.startsWith('/signalwire/') ||
+      req.path.startsWith('/zadarma/webhook') ||
+      req.path.startsWith('/zadarma/events') ||
+      req.path.startsWith('/zadarma/notifications') ||
+      req.path === '/agent/call-session/keep-alive'
+    ) {
+      return next();
+    }
 
     const clientIp = req.headers['x-forwarded-for']?.toString().split(',')[0].trim() || req.socket.remoteAddress || 'unknown';
     const now = Date.now();
     const isAuthRoute = req.path.startsWith('/auth/login');
-    const limit = isAuthRoute ? 20 : 300; // 20 attempts/min for login (anti brute-force), 300/min for general API
+    const limit = isAuthRoute ? 30 : 1000; // Allow multiple concurrent devices behind shared mobile CGNAT IPs
     const windowMs = 60 * 1000;
 
     const key = `${clientIp}_${isAuthRoute ? 'auth' : 'api'}`;

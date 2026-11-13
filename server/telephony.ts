@@ -76,6 +76,8 @@ type SseClient = {
   role: string;
   managerId?: string;
   agentId?: string;
+  clientIp?: string;
+  connectedAt?: number;
   send: (event: string, data: any) => void;
 };
 
@@ -83,14 +85,34 @@ class RealtimeBroadcaster {
   private clients = new Map<string, SseClient>();
 
   public addClient(client: SseClient): void {
-    this.clients.set(client.id, client);
+    this.clients.set(client.id, { ...client, connectedAt: Date.now() });
   }
 
   public removeClient(id: string): void {
     this.clients.delete(id);
   }
 
+  public hasActiveAgentClient(agentId: string): boolean {
+    for (const c of this.clients.values()) {
+      if (c.role === 'agent' && c.agentId === agentId) return true;
+    }
+    return false;
+  }
+
+  public getOnlineAgentIds(managerId?: string): string[] {
+    const ids = new Set<string>();
+    for (const c of this.clients.values()) {
+      if (c.role === 'agent' && c.agentId) {
+        if (!managerId || !c.managerId || c.managerId === managerId) {
+          ids.add(c.agentId);
+        }
+      }
+    }
+    return Array.from(ids);
+  }
+
   public broadcast(event: string, data: any, filter?: { role?: string; managerId?: string; agentId?: string }): void {
+    const deadClients: string[] = [];
     for (const client of this.clients.values()) {
       // 1. Role filter
       if (filter?.role) {
@@ -120,8 +142,12 @@ class RealtimeBroadcaster {
       try {
         client.send(event, data);
       } catch (err) {
-        console.error(`Failed to send SSE to client ${client.id}:`, err);
+        console.error(`Failed to send SSE to client ${client.id}, pruning:`, err);
+        deadClients.push(client.id);
       }
+    }
+    for (const deadId of deadClients) {
+      this.clients.delete(deadId);
     }
   }
 }
@@ -1389,36 +1415,58 @@ class TelephonyEngine {
     const queueTuneUrl = ivr?.queueTuneUrl || 'http://twimlets.com/holdmusic?Bucket=com.twilio.music.classical';
     const queueGreetingText = ivr?.queueGreetingText || 'All representative agents are currently assisting other callers. Please hold, your call is in queue and will be answered shortly.';
 
-    // Release any stale agent locks if previous call was terminated or not found
-    data.agents.forEach((a) => {
-      if (a.currentCallId) {
-        const pastCall = data.calls.find((item) => item.id === a.currentCallId);
-        if (!pastCall || pastCall.endTime || ['COMPLETED', 'FAILED', 'BUSY', 'NO_ANSWER'].includes(pastCall.status)) {
-          a.currentCallId = null;
-          if (a.state === 'RINGING' || a.state === 'BUSY' || a.state === 'WRAP-UP') {
+    // Release any stale agent locks if previous call was terminated or abandoned across devices/sessions
+    const nowMs = Date.now();
+    const staleReleasedIds: string[] = [];
+    await db.update((d) => {
+      d.agents.forEach((a) => {
+        if (a.currentCallId && a.currentCallId !== callId) {
+          const pastCall = d.calls.find((item) => item.id === a.currentCallId);
+          if (!pastCall || pastCall.endTime || ['COMPLETED', 'FAILED', 'BUSY', 'NO_ANSWER', 'CANCELLED'].includes(pastCall.status)) {
+            a.currentCallId = null;
+            if (a.state === 'RINGING' || a.state === 'BUSY' || a.state === 'WRAP-UP') {
+              a.state = 'AVAILABLE';
+              a.lastStateChange = new Date().toISOString();
+              staleReleasedIds.push(a.id);
+            }
+          }
+        } else if (!a.currentCallId && (a.state === 'RINGING' || a.state === 'WRAP-UP')) {
+          const lastChangeMs = a.lastStateChange ? new Date(a.lastStateChange).getTime() : 0;
+          // Auto-release stale RINGING (>25s) or abandoned WRAP-UP (>45s) locks with no live call
+          if ((a.state === 'RINGING' && nowMs - lastChangeMs > 25000) || (a.state === 'WRAP-UP' && nowMs - lastChangeMs > 45000)) {
             a.state = 'AVAILABLE';
+            a.lastStateChange = new Date().toISOString();
+            staleReleasedIds.push(a.id);
           }
         }
-      }
+      });
     });
 
-    const targetManagerId = managerId || call.managerId || (campaign ? campaign.managerId : undefined);
+    const refreshedData = db.get();
+    const freshCall = refreshedData.calls.find((c) => c.id === callId) || call;
+    const targetManagerId = managerId || freshCall.managerId || (campaign ? campaign.managerId : undefined);
 
     // 1. STRICT MANAGER ISOLATION:
     // Only agents created by / assigned to THIS specific manager can receive this call!
     // NEVER route calls of one manager to agents of another manager.
-    let availableAgents: typeof data.agents = [];
+    let availableAgents: typeof refreshedData.agents = [];
+
+    const hasLiveCall = (agent: Agent): boolean => {
+      if (!agent.currentCallId || agent.currentCallId === callId) return false;
+      const c = refreshedData.calls.find((item) => item.id === agent.currentCallId);
+      return Boolean(c && !c.endTime && ['BRIDGED', 'ANSWERED'].includes(c.status));
+    };
 
     if (targetManagerId) {
       // Find all enabled agents belonging to this specific manager
-      const managerAgents = data.agents.filter(
+      const managerAgents = refreshedData.agents.filter(
         (a) => a.managerId === targetManagerId && a.enabled
       );
 
-      // Priority 1: If call already had a specific agent assigned from this manager and they are available
-      if (call.agentId) {
-        const assigned = managerAgents.find((a) => a.id === call.agentId);
-        if (assigned && (assigned.state === 'AVAILABLE' || assigned.currentCallId === call.id)) {
+      // Priority 1: If call already had a specific agent assigned from this manager and they are available or ringing for this exact call
+      if (freshCall.agentId) {
+        const assigned = managerAgents.find((a) => a.id === freshCall.agentId);
+        if (assigned && (assigned.state === 'AVAILABLE' || assigned.currentCallId === freshCall.id)) {
           availableAgents = [assigned];
         }
       }
@@ -1426,23 +1474,33 @@ class TelephonyEngine {
       // Priority 2: Any currently free or AVAILABLE agent created by this manager
       if (availableAgents.length === 0) {
         availableAgents = managerAgents.filter(
-          (a) => a.state === 'AVAILABLE' && !a.currentCallId
+          (a) => a.state === 'AVAILABLE' && (!a.currentCallId || a.currentCallId === callId)
         );
       }
 
-      // If all agents of this manager are busy or offline, do NOT route to other managers' agents.
-      // The call will cleanly queue in this manager's hold queue until one of their agents is free.
+      // Priority 3: Prefer agents actively connected via SSE (even if stuck in stale WRAP-UP/RINGING with no live call)
+      if (availableAgents.length === 0) {
+        const onlineRecoverable = managerAgents.filter(
+          (a) =>
+            a.state !== 'OFFLINE' &&
+            !hasLiveCall(a) &&
+            (realtime.hasActiveAgentClient(a.id) || a.state === 'WRAP-UP')
+        );
+        if (onlineRecoverable.length > 0) {
+          availableAgents = [onlineRecoverable[0]];
+        }
+      }
     } else {
       // Generic fallback only if no managerId is associated with this call at all
-      if (call.agentId) {
-        const assigned = data.agents.find((a) => a.id === call.agentId && a.enabled);
-        if (assigned && (assigned.state === 'AVAILABLE' || assigned.currentCallId === call.id)) {
+      if (freshCall.agentId) {
+        const assigned = refreshedData.agents.find((a) => a.id === freshCall.agentId && a.enabled);
+        if (assigned && (assigned.state === 'AVAILABLE' || assigned.currentCallId === freshCall.id)) {
           availableAgents = [assigned];
         }
       }
       if (availableAgents.length === 0) {
-        availableAgents = data.agents.filter(
-          (a) => a.enabled && a.state === 'AVAILABLE' && !a.currentCallId
+        availableAgents = refreshedData.agents.filter(
+          (a) => a.enabled && a.state === 'AVAILABLE' && (!a.currentCallId || a.currentCallId === callId)
         );
       }
     }
@@ -1937,11 +1995,12 @@ class TelephonyEngine {
         camp.ivrCompletedCount += 1;
       }
 
-      // Handle agent state transition to WRAP-UP
+      // Handle agent state transition to WRAP-UP and release currentCallId lock cleanly
       if (c?.agentId) {
         const agt = d.agents.find((a) => a.id === c.agentId);
         if (agt && (agt.state === 'BUSY' || agt.state === 'RINGING')) {
           agt.state = 'WRAP-UP';
+          agt.currentCallId = null;
           agt.lastStateChange = new Date().toISOString();
 
           d.agent_states.push({
@@ -1952,6 +2011,8 @@ class TelephonyEngine {
             timestamp: new Date().toISOString(),
             reason: `Call ${callId} ended`,
           });
+        } else if (agt && agt.currentCallId === callId) {
+          agt.currentCallId = null;
         }
       }
 

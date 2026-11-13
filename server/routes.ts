@@ -333,7 +333,47 @@ router.post('/auth/login', async (req: Request, res: Response) => {
 
   const { token, session } = createSession(user);
 
-  await logAudit(user.username, user.role, 'LOGIN_SUCCESS', 'AUTH', { role: user.role }, req.ip);
+  // When an agent logs in on any device/IP, ensure abandoned stale locks (WRAP-UP, RINGING, BUSY, OFFLINE without an active live call) are cleared so this station can immediately receive bridged calls
+  if (user.role === 'agent' && session.agentId) {
+    let becameAvailable = false;
+    await db.update((d) => {
+      const agt = d.agents.find((a) => a.id === session.agentId);
+      if (agt) {
+        const liveCall = agt.currentCallId
+          ? d.calls.find(
+              (c) =>
+                c.id === agt.currentCallId &&
+                !c.endTime &&
+                ['BRIDGED', 'ANSWERED'].includes(c.status)
+            )
+          : null;
+        if (!liveCall) {
+          agt.currentCallId = null;
+          if (agt.state !== 'AVAILABLE') {
+            agt.state = 'AVAILABLE';
+            agt.lastStateChange = new Date().toISOString();
+            becameAvailable = true;
+          }
+        }
+      }
+    });
+    if (becameAvailable) {
+      realtime.broadcast(
+        'agent.state_changed',
+        { agentId: session.agentId, state: 'AVAILABLE', currentCallId: null },
+        { managerId: session.managerId }
+      );
+      setTimeout(() => {
+        telephony.processQueueForManager(session.managerId).catch(() => {});
+      }, 150);
+    }
+  }
+
+  const clientIp =
+    (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    req.ip;
+  await logAudit(user.username, user.role, 'LOGIN_SUCCESS', 'AUTH', { role: user.role }, clientIp);
 
   // Return session details (strip sensitive password/salt)
   res.json({
@@ -393,9 +433,15 @@ router.get('/events', (req: Request, res: Response) => {
     }
   }
 
+  const clientIp =
+    (req.headers['x-forwarded-for'] as string)?.split(',')[0]?.trim() ||
+    req.socket?.remoteAddress ||
+    req.ip;
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
   res.flushHeaders?.();
 
   const clientId = `client_${Date.now()}_${Math.random().toString(36).substring(7)}`;
@@ -409,20 +455,55 @@ router.get('/events', (req: Request, res: Response) => {
     role,
     managerId,
     agentId,
+    clientIp,
     send: sendEvent,
   });
+
+  // Auto-heal stale non-live agent state when an agent terminal connects SSE
+  if (role === 'agent' && agentId) {
+    const data = db.get();
+    const agt = data.agents.find((a) => a.id === agentId);
+    if (agt && agt.state !== 'AVAILABLE' && agt.state !== 'OFFLINE') {
+      const liveCall = agt.currentCallId
+        ? data.calls.find((c) => c.id === agt.currentCallId && !c.endTime && ['BRIDGED', 'ANSWERED', 'RINGING'].includes(c.status))
+        : null;
+      const lastChangeMs = agt.lastStateChange ? new Date(agt.lastStateChange).getTime() : 0;
+      if (!liveCall && Date.now() - lastChangeMs > 20000) {
+        db.update((d) => {
+          const target = d.agents.find((a) => a.id === agentId);
+          if (target) {
+            target.state = 'AVAILABLE';
+            target.currentCallId = null;
+            target.lastStateChange = new Date().toISOString();
+          }
+        }).then(() => {
+          telephony.processQueueForManager(agt.managerId).catch(() => {});
+        }).catch(() => {});
+      }
+    }
+  }
 
   // Initial keepalive handshake
   sendEvent('connected', { clientId, timestamp: new Date().toISOString() });
 
   const heartbeat = setInterval(() => {
-    res.write(':keepalive\n\n');
+    try {
+      res.write(':keepalive\n\n');
+    } catch {
+      cleanup();
+    }
   }, 15000);
 
-  req.on('close', () => {
+  let cleaned = false;
+  const cleanup = () => {
+    if (cleaned) return;
+    cleaned = true;
     clearInterval(heartbeat);
     realtime.removeClient(clientId);
-  });
+  };
+
+  req.on('close', cleanup);
+  res.on('close', cleanup);
 });
 
 // ==========================================
@@ -3381,15 +3462,16 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
     } else {
       activeCall = null;
       agent.currentCallId = null;
-      if (agent.state === 'RINGING' || agent.state === 'BUSY') {
+      if (agent.state === 'RINGING' || agent.state === 'BUSY' || agent.state === 'WRAP-UP') {
         agent.state = 'AVAILABLE';
       }
       await db.update((d) => {
         const agt = d.agents.find((a) => a.id === agent!.id);
         if (agt) {
           agt.currentCallId = null;
-          if (agt.state === 'RINGING' || agt.state === 'BUSY') {
+          if (agt.state === 'RINGING' || agt.state === 'BUSY' || agt.state === 'WRAP-UP') {
             agt.state = 'AVAILABLE';
+            agt.lastStateChange = new Date().toISOString();
           }
         }
       });
@@ -3453,15 +3535,20 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
         .filter((d) => d.callId === candidate!.id)
         .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
     } else {
-      // Prevent resetting agent state during 3-second auto-answer countdown (allow 15s grace window)
+      // Prevent resetting agent state during 3-second auto-answer countdown (allow 20s grace for RINGING, 60s for WRAP-UP)
       const lastChange = agent.lastStateChange ? new Date(agent.lastStateChange).getTime() : 0;
-      const isRecentState = Date.now() - lastChange < 15000;
-      if (!isRecentState && (agent.state === 'RINGING' || (agent.state === 'BUSY' && !agent.currentCallId))) {
+      const ageMs = Date.now() - lastChange;
+      const shouldRecoverStale =
+        (agent.state === 'RINGING' && ageMs >= 20000) ||
+        (agent.state === 'BUSY' && !agent.currentCallId && ageMs >= 15000) ||
+        (agent.state === 'WRAP-UP' && !agent.currentCallId && ageMs >= 60000);
+      if (shouldRecoverStale) {
         await db.update((d) => {
           const agt = d.agents.find((a) => a.id === agent!.id);
           if (agt) {
             agt.state = 'AVAILABLE';
             agt.currentCallId = null;
+            agt.lastStateChange = new Date().toISOString();
           }
         });
         agent.state = 'AVAILABLE';
@@ -3704,25 +3791,39 @@ router.post('/agent/call-action', authenticate, requireRole(['agent', 'admin', '
 
 // Record incoming WebRTC call triggered when Zadarma PBX connects to extension 100
 router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
-  const agentId = req.agentId || 'agt_01';
-  const { caller, digit } = req.body;
   const data = db.get();
+  let agentId = req.agentId;
+  if (!agentId) {
+    const userAgent = data.agents.find(
+      (a) =>
+        a.userId === req.user?.id ||
+        a.id === req.user?.id ||
+        (req.user?.username && a.username?.toLowerCase() === req.user.username.toLowerCase())
+    );
+    agentId = userAgent ? userAgent.id : (data.agents.find((a) => a.enabled)?.id || 'agt_01');
+  }
+  const agentProfile = data.agents.find((a) => a.id === agentId);
+  const agentMgrId = req.managerId || agentProfile?.managerId;
+
+  const { caller, digit } = req.body;
 
   const cleanDigits = (s?: string) => (s ? String(s).replace(/\D/g, '').slice(-10) : '');
   const callerDigits = cleanDigits(caller);
 
-  // Look for any active campaign or outbound call in the system that matches this caller
+  // Look for any active campaign or outbound call matching this manager and caller
   let call = data.calls.find((c) => {
     if (c.endTime || ['COMPLETED', 'FAILED', 'CANCELLED'].includes(c.status)) return false;
+    if (agentMgrId && c.managerId && c.managerId !== agentMgrId) return false;
     const cCustDigits = cleanDigits(c.customerNumber);
     if (callerDigits && cCustDigits === callerDigits) return true;
     return false;
   });
 
   if (!call) {
-    // If no direct digit match, find newest active campaign call that is dialing or in IVR
+    // If no direct digit match, find newest active campaign call belonging to this manager
     call = data.calls.find((c) => {
       if (c.endTime || ['COMPLETED', 'FAILED', 'CANCELLED'].includes(c.status)) return false;
+      if (agentMgrId && c.managerId && c.managerId !== agentMgrId) return false;
       return Boolean(c.campaignId);
     });
   }
@@ -4184,8 +4285,8 @@ router.post('/twilio/dtmf', async (req: Request, res: Response) => {
     return res.type('text/xml').send('<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>');
   }
 
-  // Record DTMF key in DB and broadcast to real-time telemetry
-  await telephony.handleDtmfInput(call.id, String(Digits || ''));
+  // Record DTMF key in DB and broadcast to real-time telemetry (already invokes initiateAgentTransfer once)
+  const dtmfResult = await telephony.handleDtmfInput(call.id, String(Digits || ''));
 
   const campaign = call.campaignId ? data.campaigns.find((c) => c.id === call.campaignId) : null;
   const ivr = campaign ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId) : data.ivr_configs[0];
@@ -4194,8 +4295,7 @@ router.post('/twilio/dtmf', async (req: Request, res: Response) => {
   const action = matchedOption?.action || (Digits === '1' ? 'TRANSFER_TO_AGENT' : Digits === '2' ? 'REPEAT_MENU' : 'END_CALL');
 
   if (action === 'TRANSFER_TO_AGENT') {
-    // Automatically find free agent under the manager who created the campaign
-    const transferResult = await telephony.initiateAgentTransfer(call.id, call.managerId);
+    const transferResult = dtmfResult.transferResult || await telephony.initiateAgentTransfer(call.id, call.managerId);
 
     if (transferResult.success) {
       console.log(`[AGENT BRIDGED] Connecting customer directly to agent ${transferResult.agentName}...`);
@@ -4208,13 +4308,14 @@ router.post('/twilio/dtmf', async (req: Request, res: Response) => {
 </Response>`;
       return res.type('text/xml').send(twiml);
     } else {
-      console.log(`[AGENT BUSY] No available free agent under manager ${call.managerId}`);
+      console.log(`[AGENT QUEUED] No immediate free agent under manager ${call.managerId}; redirecting to live queue poll...`);
+      const appUrl = process.env.APP_URL || '';
+      const pollUrl = `${appUrl}/api/twilio/queue-poll?callId=${encodeURIComponent(call.id)}&amp;attempt=1`;
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">All representative agents are currently assisting other callers. Please stay on the line or call back shortly.</Say>
-  <Pause length="2"/>
-  <Say voice="alice">Thank you for calling Pirates World Tele Solution. Goodbye.</Say>
-  <Hangup/>
+  <Say voice="alice">Connecting you to our next available representative. Please stay on the line.</Say>
+  <Pause length="3"/>
+  <Redirect method="POST">${pollUrl}</Redirect>
 </Response>`;
       return res.type('text/xml').send(twiml);
     }
