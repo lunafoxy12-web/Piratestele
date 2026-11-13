@@ -30,7 +30,7 @@ twilioRouter.all('/call-twiml', (req: Request, res: Response) => {
   const rawGreeting = ivr?.greetingText || 'Hello from Pirates World Tele Solution. Press 1 to connect with an agent, or 2 to hear this greeting again.';
   const greeting = rawGreeting.replace(/^["']|["']$/g, '').trim();
 
-  const appUrl = process.env.APP_URL || '';
+  const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
   const dtmfUrl = `${appUrl}/api/twilio/dtmf${callId ? `?callId=${encodeURIComponent(callId)}` : ''}`;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -148,7 +148,7 @@ twilioRouter.post('/dtmf', async (req: Request, res: Response) => {
       return res.type('text/xml').send(twiml);
     } else {
       console.log(`[AGENT QUEUED] No immediate free agent under manager ${call.managerId}; placing caller in live hold poll loop...`);
-      const appUrl = process.env.APP_URL || '';
+      const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
       const pollUrl = `${appUrl}/api/twilio/queue-poll?callId=${encodeURIComponent(call.id)}&amp;attempt=1`;
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -160,7 +160,7 @@ twilioRouter.post('/dtmf', async (req: Request, res: Response) => {
     }
   } else if (action === 'REPEAT_MENU') {
     const textToSay = ivr?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
-    const appUrl = process.env.APP_URL || '';
+    const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
     const dtmfUrl = `${appUrl}/api/twilio/dtmf?callId=${encodeURIComponent(call.id)}`;
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -209,7 +209,7 @@ twilioRouter.post('/queue-poll', async (req: Request, res: Response) => {
 </Response>`);
   }
 
-  const appUrl = process.env.APP_URL || '';
+  const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
   const nextPollUrl = `${appUrl}/api/twilio/queue-poll?callId=${encodeURIComponent(call.id)}&amp;attempt=${attempt + 1}`;
   return res.type('text/xml').send(`<?xml version="1.0" encoding="UTF-8"?>
 <Response>

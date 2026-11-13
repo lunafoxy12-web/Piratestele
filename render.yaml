@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: pirates-world-tele-solution
+    name: piratessolution
     env: node
     plan: free
     region: singapore # or oregon, frankfurt, ohio
-    buildCommand: npm install --legacy-peer-deps && npm run build
+    buildCommand: npm install --include=dev --legacy-peer-deps && npm run build
     startCommand: npm start
     healthCheckPath: /api/health
     envVars:
@@ -13,6 +13,6 @@ services:
       - key: PORT
         value: 10000
       - key: APP_URL
-        value: https://pirates-world-tele-solution.onrender.com
+        value: https://piratessolution.onrender.com
       - key: GEMINI_API_KEY
         sync: false

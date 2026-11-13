@@ -4192,7 +4192,7 @@ router.all(['/twilio/call-twiml', '/carrier/call-xml'], (req: Request, res: Resp
   const ivr = campaign ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId) : data.ivr_configs[0];
   const greeting = ivr?.greetingText || 'Hello from Pirates World Tele Solution. Dispatched via carrier cloud. Press 1 to connect with an agent, or 2 to hear this greeting again.';
 
-  const appUrl = process.env.APP_URL || 'https://pirates-world-tele-solution.onrender.com';
+  const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
   const dtmfUrl = `${appUrl}/api/twilio/dtmf${callId ? `?callId=${encodeURIComponent(callId)}` : ''}`;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -4309,7 +4309,7 @@ router.post('/twilio/dtmf', async (req: Request, res: Response) => {
       return res.type('text/xml').send(twiml);
     } else {
       console.log(`[AGENT QUEUED] No immediate free agent under manager ${call.managerId}; redirecting to live queue poll...`);
-      const appUrl = process.env.APP_URL || '';
+      const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
       const pollUrl = `${appUrl}/api/twilio/queue-poll?callId=${encodeURIComponent(call.id)}&amp;attempt=1`;
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -4321,7 +4321,7 @@ router.post('/twilio/dtmf', async (req: Request, res: Response) => {
     }
   } else if (action === 'REPEAT_MENU') {
     const textToSay = ivr?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to connect with an available agent, or 2 to repeat this greeting.';
-    const appUrl = process.env.APP_URL || '';
+    const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
     const dtmfUrl = `${appUrl}/api/twilio/dtmf`;
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>

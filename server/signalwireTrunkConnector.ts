@@ -349,7 +349,7 @@ export class SignalWireTrunkConnector {
       };
     }
 
-    const hostAppUrl = appUrl || process.env.APP_URL || 'https://pirates-world-tele-solution.onrender.com';
+    const hostAppUrl = appUrl || (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || 'https://piratessolution.onrender.com';
     const authHeader = `Basic ${Buffer.from(`${cleanProjectId}:${cleanToken}`).toString('base64')}`;
 
     const textToSay =

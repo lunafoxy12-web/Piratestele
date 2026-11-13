@@ -1121,7 +1121,7 @@ class TelephonyEngine {
     const rawToken = targetProv?.apiKeyEncrypted || (isSignalWire ? undefined : process.env.TWILIO_AUTH_TOKEN);
     const authToken = rawToken ? rawToken.replace(/^KEY_/, '').trim() : undefined;
 
-    const appUrl = process.env.APP_URL || 'https://pirates-world-tele-solution.onrender.com';
+    const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || 'https://piratessolution.onrender.com';
 
     if (accountSid && authToken) {
       const carrierName = isSignalWire ? (targetProv?.name || 'SignalWire Cloud') : (targetProv?.name || 'Twilio Voice Direct');
