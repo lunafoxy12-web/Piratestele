@@ -32,6 +32,7 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [latestVoiceMessage, setLatestVoiceMessage] = useState<any>(null);
   const [latestTranslationEvent, setLatestTranslationEvent] = useState<any>(null);
   const [triggerRefresh, setTriggerRefresh] = useState<number>(0);
+  const eventSeqRef = React.useRef<number>(0);
 
   const clearLiveDtmf = useCallback(() => {
     setLiveDtmfEvents([]);
@@ -85,7 +86,7 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       }
     });
 
-    eventSource.addEventListener('call.ringing', (e) => {
+    eventSource.addEventListener('call.ringing', () => {
       setTriggerRefresh((prev) => prev + 1);
     });
 
@@ -96,7 +97,8 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     eventSource.addEventListener('call.bridged', (e) => {
       try {
         const data = JSON.parse(e.data);
-        setLatestAgentEvent({ type: 'bridged', ...data });
+        eventSeqRef.current += 1;
+        setLatestAgentEvent({ type: 'bridged', ...data, _seq: eventSeqRef.current });
         setTriggerRefresh((prev) => prev + 1);
       } catch {
         setTriggerRefresh((prev) => prev + 1);
@@ -106,7 +108,8 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     eventSource.addEventListener('agent.answered', (e) => {
       try {
         const data = JSON.parse(e.data);
-        setLatestAgentEvent({ type: 'bridged', ...data });
+        eventSeqRef.current += 1;
+        setLatestAgentEvent({ type: 'bridged', ...data, _seq: eventSeqRef.current });
         setTriggerRefresh((prev) => prev + 1);
       } catch {
         setTriggerRefresh((prev) => prev + 1);
@@ -117,7 +120,8 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       try {
         const data = JSON.parse(e.data);
         setActiveCalls((prev) => prev.filter((c) => (c.callId || c.id) !== data.callId));
-        setLatestAgentEvent({ type: 'call.ended', ...data });
+        eventSeqRef.current += 1;
+        setLatestAgentEvent({ type: 'call.ended', ...data, _seq: eventSeqRef.current });
         setTriggerRefresh((prev) => prev + 1);
       } catch (err) {
         console.error('Error parsing call.ended:', err);
@@ -140,7 +144,8 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       try {
         const data = JSON.parse(e.data);
         setActiveCalls((prev) => prev.filter((c) => (c.callId || c.id) !== data.callId));
-        setLatestAgentEvent({ type: 'call.failed', ...data });
+        eventSeqRef.current += 1;
+        setLatestAgentEvent({ type: 'call.failed', ...data, _seq: eventSeqRef.current });
         setTriggerRefresh((prev) => prev + 1);
       } catch (err) {
         console.error('Error parsing call.failed:', err);
@@ -150,7 +155,8 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     eventSource.addEventListener('agent.incoming_call', (e) => {
       try {
         const data = JSON.parse(e.data);
-        const incomingPayload = { type: 'incoming', ...data, timestamp: Date.now() };
+        eventSeqRef.current += 1;
+        const incomingPayload = { type: 'incoming', ...data, timestamp: Date.now(), _seq: eventSeqRef.current };
         setLatestIncomingCall(incomingPayload);
         setLatestAgentEvent(incomingPayload);
         setTriggerRefresh((prev) => prev + 1);
@@ -162,7 +168,8 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
     eventSource.addEventListener('agent.state_changed', (e) => {
       try {
         const data = JSON.parse(e.data);
-        setLatestAgentEvent({ type: 'state_changed', ...data });
+        eventSeqRef.current += 1;
+        setLatestAgentEvent({ type: 'state_changed', ...data, _seq: eventSeqRef.current });
         setTriggerRefresh((prev) => prev + 1);
       } catch (err) {
         console.error('Error parsing agent.state_changed:', err);

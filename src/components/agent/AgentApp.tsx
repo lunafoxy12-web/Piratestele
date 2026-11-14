@@ -97,15 +97,13 @@ export const AgentApp: React.FC = () => {
   const micSourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
   const animFrameRef = useRef<number | null>(null);
 
-  // Web Audio Mixer Engine for Zadarma WebRTC Stream
+  // Web Audio Mixer / Ring Beep Engine
   const mixerAudioContextRef = useRef<AudioContext | null>(null);
   const mixerMicGainRef = useRef<GainNode | null>(null);
   const mixerIvrGainRef = useRef<GainNode | null>(null);
-  const mixerKeepAliveGainRef = useRef<GainNode | null>(null);
   const mixerDestinationRef = useRef<MediaStreamAudioDestinationNode | null>(null);
   const ivrAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const ivrMelodyTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const originalGetUserMediaRef = useRef<((constraints?: MediaStreamConstraints) => Promise<MediaStream>) | null>(null);
 
   const [isIvrGreetingPlaying, setIsIvrGreetingPlaying] = useState<boolean>(false);
   const isIvrGreetingPlayingRef = useRef<boolean>(false);
@@ -126,18 +124,28 @@ export const AgentApp: React.FC = () => {
   const handleCallActionRef = useRef<any>(null);
   const start3SecondRingBeepAndAutoAnswerRef = useRef<any>(null);
   const connectRealPstnAudioRef = useRef<any>(null);
+  const ensureRemoteAudioPlayingRef = useRef<any>(null);
+  const handleCallEndedTransitionRef = useRef<any>(null);
+  const onZadarmaStatusRef = useRef<((status: string, data?: any) => void) | null>(null);
   const stopRingtoneRef = useRef<any>(null);
   const stopMicrophoneRef = useRef<any>(null);
   const stopAgentSpeechRecognitionRef = useRef<any>(null);
   const disconnectRealPstnAudioRef = useRef<any>(null);
   const remoteAudioBridgeRef = useRef<{ bridgeCtx: AudioContext; sourceNode: MediaStreamAudioSourceNode; gainNode: GainNode } | null>(null);
 
-  // 3-Second Ring Beep & Auto-Answer Engine
+  // 3-Second Ring Beep & Auto-Answer Engine + WebRTC Deduplication Refs
   const ringBeepIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const ringBeepTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const countdownTimerRef = useRef<NodeJS.Timeout | null>(null);
   const isAutoAnsweringRef = useRef<boolean>(false);
   const [autoAnswerSecondsLeft, setAutoAnswerSecondsLeft] = useState<number | null>(null);
+  const autoAnswerSecondsLeftRef = useRef<number | null>(null);
+  autoAnswerSecondsLeftRef.current = autoAnswerSecondsLeft;
+  const agentPhoneRef = useRef<string>('');
+  const lastHandledEventSeqRef = useRef<number>(0);
+  const lastHandledIncomingSeqRef = useRef<number>(0);
+  const zdrmAnswerInitiatedRef = useRef<boolean>(false);
+  const zdrmIncomingPendingRef = useRef<boolean>(false);
 
   const [micPermission, setMicPermission] = useState<'prompt' | 'granted' | 'denied' | 'requesting'>('prompt');
   const [micAudioLevel, setMicAudioLevel] = useState<number>(0);
@@ -191,7 +199,9 @@ export const AgentApp: React.FC = () => {
   const speakerVolumeRef = useRef<number>(speakerVolume);
   speakerVolumeRef.current = speakerVolume;
 
-  // Unlock browser AudioContext automatically on mobile/desktop interaction so incoming WebRTC & ringtone never fail
+  agentPhoneRef.current = agentPhone;
+
+  // Unlock browser AudioContext & remote media element automatically on mobile/desktop interaction
   useEffect(() => {
     const unlockAudio = () => {
       if (mixerAudioContextRef.current && mixerAudioContextRef.current.state === 'suspended') {
@@ -199,6 +209,9 @@ export const AgentApp: React.FC = () => {
       }
       if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
         audioContextRef.current.resume().catch(() => {});
+      }
+      if (remoteAudioBridgeRef.current?.bridgeCtx?.state === 'suspended') {
+        remoteAudioBridgeRef.current.bridgeCtx.resume().catch(() => {});
       }
     };
     window.addEventListener('pointerdown', unlockAudio, { passive: true });
@@ -211,34 +224,157 @@ export const AgentApp: React.FC = () => {
     };
   }, []);
 
-  // Intercept navigator.mediaDevices.getUserMedia so WebRTC engine streams from our Audio Mixer
+  // Query live browser microphone permission state on mount so agents see readiness immediately
   useEffect(() => {
-    if (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia) {
-      if (!originalGetUserMediaRef.current) {
-        originalGetUserMediaRef.current = navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices);
-      }
-      navigator.mediaDevices.getUserMedia = async (constraints?: MediaStreamConstraints) => {
-        if (constraints?.audio && !constraints.video) {
-          try {
-            const mixedStream = await initOrGetMixerStream();
-            if (mixedStream && mixedStream.getAudioTracks().some((t) => t.readyState === 'live')) {
-              return mixedStream;
-            }
-          } catch (e) {
-            console.warn('Mixer stream init note, falling back to standard getUserMedia:', e);
+    let permStatus: PermissionStatus | null = null;
+    if (typeof navigator !== 'undefined' && navigator.permissions?.query) {
+      navigator.permissions
+        .query({ name: 'microphone' as PermissionName })
+        .then((status) => {
+          permStatus = status;
+          if (status.state === 'granted' || status.state === 'denied' || status.state === 'prompt') {
+            setMicPermission(status.state);
           }
-        }
-        return originalGetUserMediaRef.current!(constraints);
-      };
+          status.onchange = () => {
+            if (status.state === 'granted' || status.state === 'denied' || status.state === 'prompt') {
+              setMicPermission(status.state);
+            }
+          };
+        })
+        .catch(() => {});
     }
+    return () => {
+      if (permStatus) {
+        permStatus.onchange = null;
+      }
+    };
   }, []);
+
+  // Wire up Zadarma status callback handler via ref so prototype wrapper always sees latest callbacks
+  onZadarmaStatusRef.current = (status: string, data?: any) => {
+    console.log('[WEBRTC PUSH/SIP STATUS]', status, data || '');
+
+    if (status === 'BROWSER_SUPPORTED') {
+      // Widget passed browser WebRTC support check
+    } else if (status === 'BROWSER_NOT_SUPPORTED') {
+      setWebrtcError('Browser does not support WebRTC audio calls.');
+      setWebrtcStatus('ERROR');
+    } else if (status === 'incoming') {
+      zdrmIncomingPendingRef.current = true;
+      // Mute Zadarma's built-in ring mp3 so our clean 3-second ring beep controls the agent UX
+      const builtInRing = document.getElementById('zdrm-incomingRing') as HTMLMediaElement | null;
+      if (builtInRing) {
+        builtInRing.muted = true;
+        builtInRing.volume = 0;
+        try { builtInRing.pause(); } catch {}
+      }
+
+      // Never restart ringing if already auto-answering, answering, or active in a call
+      if (
+        !isAutoAnsweringRef.current &&
+        !zdrmAnswerInitiatedRef.current &&
+        agentStateRef.current !== 'BUSY' &&
+        agentStateRef.current !== 'WRAP-UP' &&
+        agentStateRef.current !== 'OFFLINE'
+      ) {
+        start3SecondRingBeepAndAutoAnswerRef.current?.(
+          '1',
+          data?.callId || activeCallRef.current?.id,
+          userRef.current?.managerId
+        );
+
+        const activeTok = tokenRef.current;
+        if (activeTok) {
+          fetch('/api/agent/webrtc-incoming', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${activeTok}`,
+            },
+            body: JSON.stringify({
+              caller: data?.caller,
+              callerName: data?.callername,
+              digit: '1',
+            }),
+          })
+            .then((r) => r.json())
+            .then((resData) => {
+              if (resData?.callId) {
+                setActiveCall((prev) =>
+                  prev
+                    ? { ...prev, id: resData.callId, callId: resData.callId }
+                    : prev
+                );
+              }
+            })
+            .catch((err) => console.warn('[SYNC WEBRTC INCOMING NOTE]', err));
+        }
+      }
+    } else if (status === 'dtmf' || data?.key || data?.dtmf) {
+      const digit = String(data?.key || data?.dtmf || data?.digit || '1').trim();
+      if (!isAutoAnsweringRef.current && agentStateRef.current === 'AVAILABLE') {
+        start3SecondRingBeepAndAutoAnswerRef.current?.(
+          digit,
+          activeCallRef.current?.id,
+          userRef.current?.managerId
+        );
+      }
+    } else if (status === 'accepted') {
+      zdrmAnswerInitiatedRef.current = true;
+      // Attach track & lifecycle listeners as soon as JsSIP creates the session
+      ensureRemoteAudioPlayingRef.current?.();
+    } else if (status === 'confirmed' || status === 'talking' || status === 'connected') {
+      zdrmIncomingPendingRef.current = false;
+      setWebrtcStatus('CALL_ACTIVE');
+      setAgentState('BUSY');
+      stopRingtoneRef.current?.();
+      ensureRemoteAudioPlayingRef.current?.();
+      // Ensure WebRTC uplink sender track is unmuted unless agent explicitly muted
+      try {
+        const senders = (window as any).zdrmWebPhone?.webCallSession?.connection?.getSenders?.() || [];
+        senders.forEach((s: any) => {
+          if (s.track?.kind === 'audio') {
+            s.track.enabled = !isMutedRef.current;
+          }
+        });
+      } catch {}
+    } else if (
+      status === 'canceled' ||
+      status === 'rejected' ||
+      status === 'busy' ||
+      status === 'call_ended' ||
+      status === 'hangup'
+    ) {
+      zdrmIncomingPendingRef.current = false;
+      zdrmAnswerInitiatedRef.current = false;
+      setWebrtcStatus('REGISTERED');
+
+      // Only transition to WRAP-UP if we actually had an active/ringing call
+      const hadActiveCall = Boolean(
+        activeCallRef.current ||
+          isAutoAnsweringRef.current ||
+          agentStateRef.current === 'BUSY' ||
+          agentStateRef.current === 'RINGING'
+      );
+      if (hadActiveCall) {
+        const msg =
+          status === 'busy' || status === 'rejected'
+            ? 'Remote party line was busy or declined.'
+            : 'PSTN customer ended call. Enter wrap-up details below.';
+        handleCallEndedTransitionRef.current?.(msg, true);
+      }
+    }
+  };
 
   useEffect(() => {
     let isMounted = true;
+    if (!token || user?.role !== 'agent') return;
 
     async function initZadarmaWebphone() {
       try {
         setWebrtcStatus('INITIALIZING');
+        setWebrtcError(null);
+
         // 1. Fetch fresh live WebRTC config for this device & IP
         const res = await fetch('/api/zadarma/webrtc-config?refresh=1', {
           headers: token ? { Authorization: `Bearer ${token}` } : {},
@@ -266,147 +402,169 @@ export const AgentApp: React.FC = () => {
           }
         }
 
-        if (!key) {
+        if (!key || String(key).length < 16) {
           throw new Error('Voice WebRTC key not available.');
         }
 
-        // 2. Dynamically load WebRTC library and loader
+        // Helper to load a script tag deterministically
         const loadScript = (src: string, id: string): Promise<void> => {
           return new Promise((resolve, reject) => {
-            if (document.getElementById(id)) return resolve();
+            const existing = document.getElementById(id) as HTMLScriptElement | null;
+            if (existing) {
+              if ((existing as any)._loaded) return resolve();
+              existing.addEventListener('load', () => resolve(), { once: true });
+              existing.addEventListener('error', () => reject(new Error(`Failed to load ${src}`)), { once: true });
+              // Fallback resolve if script was already evaluated before listener attached
+              setTimeout(() => resolve(), 300);
+              return;
+            }
             const s = document.createElement('script');
             s.id = id;
             s.src = src;
-            s.async = true;
-            s.onload = () => resolve();
+            s.async = false;
+            s.onload = () => {
+              (s as any)._loaded = true;
+              resolve();
+            };
             s.onerror = () => reject(new Error(`Failed to load ${src}`));
             document.body.appendChild(s);
           });
         };
 
+        // 2. Load loader-phone-lib.js and WAIT until all 6 internal WebRTC scripts define their globals
         await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/loader-phone-lib.js', 'zdrm-lib-script');
-        await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/loader-phone-fn.js', 'zdrm-fn-script');
 
-        if (!isMounted) return;
+        const waitForSubScripts = async () => {
+          const hasCoreGlobals = () =>
+            typeof (window as any).io !== 'undefined' &&
+            typeof (window as any).DetectRTC !== 'undefined' &&
+            typeof (window as any).JsSIP !== 'undefined' &&
+            typeof (window as any).md5 !== 'undefined' &&
+            typeof (window as any).ZadarmaWebphoneAPI === 'function' &&
+            typeof (window as any).zdrmWebrtcPhoneInterface === 'function';
 
-        // 3. Initialize WebRTC widget headlessly
-        if (typeof (window as any).zadarmaWidgetFn === 'function') {
-          try {
-            (window as any).zadarmaWidgetFn(key, sipLogin, 'square', 'en', true, 'bottom-right');
-            if (isMounted) setWebrtcStatus('REGISTERED');
-          } catch (widgetErr) {
-            console.warn('[WEBRTC WIDGET INIT NOTE]', widgetErr);
-            if (isMounted) setWebrtcStatus('REGISTERED');
+          const startWait = Date.now();
+          while (!hasCoreGlobals() && Date.now() - startWait < 3500) {
+            if (!isMounted) return;
+            await new Promise((r) => setTimeout(r, 100));
           }
-        }
 
-        // 4. Hook into WebRTC push socket and status messages (always using refs so closures never go stale)
-        const pollForWebPhone = setInterval(() => {
-          const phone = (window as any).zdrmWebrtcPhone || (window as any).zdrmWebPhone;
-          if (phone) {
-            clearInterval(pollForWebPhone);
-            if (phone.apiWidget) {
-              const origGetStatus = phone.apiWidget.getStatusMessage;
-              phone.apiWidget.getStatusMessage = (status: string, data: any) => {
-                if (typeof origGetStatus === 'function') origGetStatus(status, data);
-
-                if (status === 'incoming') {
-                  // Connect audio leg immediately so media stream establishes reliably across mobile & desktop NATs
-                  connectRealPstnAudioRef.current?.();
-
-                  // Trigger 3-second ring beep pulse for available agent, then auto-answer with clear 2-way audio
-                  start3SecondRingBeepAndAutoAnswerRef.current?.(
-                    '1',
-                    data?.callId || activeCallRef.current?.id,
-                    userRef.current?.managerId
-                  );
-
-                  // Synchronize with backend
-                  const activeTok = tokenRef.current;
-                  if (activeTok) {
-                    fetch('/api/agent/webrtc-incoming', {
-                      method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/json',
-                        Authorization: `Bearer ${activeTok}`,
-                      },
-                      body: JSON.stringify({
-                        caller: data?.caller,
-                        callerName: data?.callername,
-                        digit: '1',
-                      }),
-                    })
-                      .then((r) => r.json())
-                      .then((resData) => {
-                        if (resData.callId) {
-                          setActiveCall((prev) =>
-                            prev ? { ...prev, id: resData.callId, callId: resData.callId, status: 'RINGING' } : prev
-                          );
-                        }
-                      })
-                      .catch((err) => console.warn('[SYNC WEBRTC INCOMING NOTE]', err));
-                  }
-                } else if (status === 'dtmf' || data?.key || data?.dtmf) {
-                  const digit = String(data?.key || data?.dtmf || data?.digit || '1').trim();
-                  start3SecondRingBeepAndAutoAnswerRef.current?.(
-                    digit,
-                    activeCallRef.current?.id,
-                    userRef.current?.managerId
-                  );
-                } else if (status === 'confirmed' || status === 'talking') {
-                  if (isMounted) setWebrtcStatus('CALL_ACTIVE');
-                  setAgentState('BUSY');
-                  stopRingtoneRef.current?.();
-                  const remoteEl = document.getElementById('zdrm-webRTCRemoteView') as HTMLMediaElement;
-                  if (remoteEl) {
-                    remoteEl.setAttribute('playsinline', 'true');
-                    remoteEl.muted = !isSpeakerOnRef.current;
-                    remoteEl.volume = Math.max(0.05, Math.min(1, speakerVolumeRef.current / 100));
-                    remoteEl.play().catch(() => {});
-                  }
-                } else if (status === 'canceled' || status === 'call_ended' || status === 'hangup') {
-                  if (isMounted) setWebrtcStatus('REGISTERED');
-                  stopRingtoneRef.current?.();
-                  stopMicrophoneRef.current?.();
-                  stopAgentSpeechRecognitionRef.current?.();
-                  disconnectRealPstnAudioRef.current?.();
-                  if (keepAliveTimerRef.current) {
-                    clearInterval(keepAliveTimerRef.current);
-                    keepAliveTimerRef.current = null;
-                  }
-
-                  const endedCall = activeCallRef.current;
-                  if (endedCall) {
-                    setWrapUpCall(endedCall);
-                    wrapUpCallRef.current = endedCall;
-                  }
-
-                  const currentCallId = activeCallRef.current?.id;
-                  if (currentCallId) {
-                    fetch('/api/agent/call-action', {
-                      method: 'POST',
-                      headers: {
-                        'Content-Type': 'application/json',
-                        ...(tokenRef.current ? { Authorization: `Bearer ${tokenRef.current}` } : {}),
-                      },
-                      body: JSON.stringify({
-                        callId: currentCallId,
-                        action: 'END',
-                        reason: 'PSTN caller ended call.',
-                      }),
-                    }).catch(() => {});
-                  }
-                  setActiveCall(null);
-                  setAgentState('WRAP-UP');
-                  setStatusMessage('PSTN customer ended call. Enter wrap-up details below.');
-                  setTimeout(() => setStatusMessage(null), 4000);
-                }
-              };
+          // If any child script from loader-phone-lib.js stalled, load missing ones sequentially
+          if (!hasCoreGlobals()) {
+            if (typeof (window as any).io === 'undefined') {
+              await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/socket.io.js', 'zdrm-fallback-io');
+            }
+            if (typeof (window as any).DetectRTC === 'undefined') {
+              await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/detectWebRTC.min.js', 'zdrm-fallback-detect');
+            }
+            if (typeof (window as any).JsSIP === 'undefined') {
+              await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/jssip.min.js?v=7', 'zdrm-fallback-jssip');
+            }
+            if (typeof (window as any).md5 === 'undefined') {
+              await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/md5.min.js', 'zdrm-fallback-md5');
+            }
+            if (typeof (window as any).ZadarmaWebphoneAPI !== 'function') {
+              await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/widget-api.min.js?sub_v=68', 'zdrm-fallback-api');
+            }
+            if (typeof (window as any).zdrmWebrtcPhoneInterface !== 'function') {
+              await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/widget.min.js?sub_v=68', 'zdrm-fallback-widget');
             }
           }
-        }, 500);
+        };
 
-        setTimeout(() => clearInterval(pollForWebPhone), 12000);
+        await waitForSubScripts();
+        if (!isMounted) return;
+
+        // Immediately ensure remote media element is unhidden and built-in ring is muted
+        const remoteView = document.getElementById('zdrm-webRTCRemoteView') as HTMLMediaElement | null;
+        if (remoteView) {
+          remoteView.setAttribute('playsinline', 'true');
+          remoteView.style.setProperty('display', 'block', 'important');
+          remoteView.style.setProperty('visibility', 'visible', 'important');
+          remoteView.style.setProperty('position', 'fixed', 'important');
+          remoteView.style.setProperty('bottom', '0px', 'important');
+          remoteView.style.setProperty('right', '0px', 'important');
+          remoteView.style.setProperty('width', '2px', 'important');
+          remoteView.style.setProperty('height', '2px', 'important');
+          remoteView.style.setProperty('opacity', '0.01', 'important');
+          remoteView.style.setProperty('pointer-events', 'none', 'important');
+        }
+        const builtInRing = document.getElementById('zdrm-incomingRing') as HTMLMediaElement | null;
+        if (builtInRing) {
+          builtInRing.muted = true;
+          builtInRing.volume = 0;
+        }
+
+        // 3. Wrap ZadarmaWebphoneAPI.prototype.init BEFORE calling zadarmaWidgetFn so we reliably capture ALL PushSocket & SIP events
+        const ApiCtor = (window as any).ZadarmaWebphoneAPI;
+        if (typeof ApiCtor === 'function' && ApiCtor.prototype && !ApiCtor.prototype.__pwWrapped) {
+          const origInit = ApiCtor.prototype.init;
+          ApiCtor.prototype.init = function (opts: any) {
+            const safeOpts = opts || {};
+            const origStatusCb = safeOpts.getStatusMessage;
+            const origEndCb = safeOpts.callbackEndCall;
+            safeOpts.getStatusMessage = (status: string, data: any) => {
+              if (typeof origStatusCb === 'function') {
+                try { origStatusCb(status, data); } catch {}
+              }
+              try {
+                onZadarmaStatusRef.current?.(status, data);
+              } catch (e) {
+                console.warn('[WEBRTC STATUS HOOK NOTE]', e);
+              }
+            };
+            safeOpts.callbackEndCall = (data: any) => {
+              if (typeof origEndCb === 'function') {
+                try { origEndCb(data); } catch {}
+              }
+              try {
+                onZadarmaStatusRef.current?.('call_ended', data);
+              } catch {}
+            };
+            return origInit.call(this, safeOpts);
+          };
+          ApiCtor.prototype.__pwWrapped = true;
+        }
+
+        await loadScript('https://my.zadarma.com/webphoneWebRTCWidget/v8/js/loader-phone-fn.js', 'zdrm-fn-script');
+        if (!isMounted) return;
+
+        // 4. Initialize WebRTC widget headlessly (after all scripts are confirmed loaded!)
+        if (typeof (window as any).zadarmaWidgetFn !== 'function' || typeof (window as any).zdrmWebrtcPhoneInterface !== 'function') {
+          throw new Error('Voice WebRTC engine failed to load completely.');
+        }
+
+        // Unregister any stale previous instance before initializing fresh registration
+        try {
+          (window as any).zdrmWPhI?.apiWidget?.unreg?.();
+        } catch {}
+
+        (window as any).zadarmaWidgetFn(key, sipLogin, 'square', 'en', true, 'bottom-right');
+
+        // 5. Wait for ZadarmaWebphoneAPI instance AND sipId registration via get_sips.php before reporting REGISTERED
+        const regStart = Date.now();
+        let registered = false;
+        while (Date.now() - regStart < 10000) {
+          if (!isMounted) return;
+          const phone = (window as any).zdrmWebPhone;
+          const widget = (window as any).zdrmWPhI;
+          if (phone && widget && phone.sipId) {
+            registered = true;
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 200));
+        }
+
+        if (!isMounted) return;
+        if (registered || ((window as any).zdrmWebPhone && (window as any).zdrmWPhI)) {
+          setWebrtcStatus('REGISTERED');
+          console.log('[WEBRTC ENGINE] Voice station registered & listening for incoming PSTN pushes:', {
+            sipLogin,
+            sipId: (window as any).zdrmWebPhone?.sipId || 'active',
+          });
+        } else {
+          throw new Error('Voice station registration timed out.');
+        }
       } catch (err: any) {
         console.warn('[WEBRTC INIT ERROR]', err?.message || err);
         if (isMounted) {
@@ -420,62 +578,82 @@ export const AgentApp: React.FC = () => {
 
     return () => {
       isMounted = false;
+      try {
+        (window as any).zdrmWPhI?.apiWidget?.unreg?.();
+      } catch {}
     };
-  }, [token]);
+  }, [token, user?.role]);
 
-  // Fetch current agent profile, active call & DTMF navigation log
+  // Fetch current agent profile, active call & DTMF navigation log (always reads refs to avoid stale closure clobbering)
   const fetchAgentStatus = async () => {
-    if (!token) return;
+    const activeToken = tokenRef.current;
+    if (!activeToken) return;
     try {
       const res = await fetch('/api/agent/me', {
-        headers: { Authorization: `Bearer ${token}` },
+        headers: { Authorization: `Bearer ${activeToken}` },
       });
-      if (res.ok) {
-        const data = await res.json();
-        // Prevent background polling from overriding or clobbering UI during 3-second auto-answer countdown
-        if (isAutoAnsweringRef.current || autoAnswerSecondsLeft !== null) {
-          if (data.ivrConfig) setActiveIvrConfig(data.ivrConfig);
-          if (data.activeCallDtmf) setActiveCallDtmf(data.activeCallDtmf);
-          return;
-        }
+      if (!res.ok) return;
+      const data = await res.json();
 
-        if (data.activeCall && !data.activeCall.endTime) {
-          setActiveCall(data.activeCall);
-          const isIvr = data.activeCall.status === 'IVR_ACTIVE';
-          // The agent station should ONLY ring if the call has been bridged to the agent via DTMF or direct transfer
-          const isAgentRinging = (data.agent?.state === 'RINGING' || Boolean(data.activeCall.dtmfSequence)) && data.activeCall.status === 'RINGING';
+      // Prevent background polling from clobbering UI during 3-second auto-answer countdown
+      if (isAutoAnsweringRef.current || autoAnswerSecondsLeftRef.current !== null) {
+        if (data.ivrConfig) setActiveIvrConfig(data.ivrConfig);
+        if (data.activeCallDtmf) setActiveCallDtmf(data.activeCallDtmf);
+        return;
+      }
 
-          if (isIvr) {
+      if (data.activeCall && !data.activeCall.endTime) {
+        setActiveCall(data.activeCall);
+        const isIvr = data.activeCall.status === 'IVR_ACTIVE';
+        const isAgentRinging =
+          (data.agent?.state === 'RINGING' || Boolean(data.activeCall.dtmfSequence)) &&
+          data.activeCall.status === 'RINGING';
+
+        if (isIvr) {
+          if (agentStateRef.current !== 'AVAILABLE' && agentStateRef.current !== 'WRAP-UP') {
             setAgentState('AVAILABLE');
-          } else if (isAgentRinging) {
-            if (!isAutoAnsweringRef.current && autoAnswerSecondsLeft === null) {
-              start3SecondRingBeepAndAutoAnswer(data.activeCall.dtmfSequence || '1', data.activeCall.id);
-            }
-          } else if (data.activeCall.status === 'BRIDGED') {
+          }
+        } else if (isAgentRinging) {
+          if (!isAutoAnsweringRef.current && autoAnswerSecondsLeftRef.current === null) {
+            start3SecondRingBeepAndAutoAnswer(data.activeCall.dtmfSequence || '1', data.activeCall.id);
+          }
+        } else if (data.activeCall.status === 'BRIDGED' || data.activeCall.status === 'ANSWERED') {
+          if (agentStateRef.current !== 'BUSY') {
             setAgentState('BUSY');
-          } else {
-            setAgentState(data.agent?.state || 'AVAILABLE');
           }
+        } else if (data.agent?.state && data.agent.state !== agentStateRef.current) {
+          setAgentState(data.agent.state);
+        }
+      } else {
+        // Call has ended or no active call exists: NEVER clobber WRAP-UP back to AVAILABLE during background polls!
+        if (agentStateRef.current === 'WRAP-UP' || wrapUpCallRef.current) {
+          setActiveCall(null);
+          if (agentStateRef.current !== 'WRAP-UP') {
+            setAgentState('WRAP-UP');
+          }
+        } else if (data.agent?.state === 'WRAP-UP') {
+          setActiveCall(null);
+          setAgentState('WRAP-UP');
         } else {
-          if (!isAutoAnsweringRef.current && autoAnswerSecondsLeft === null) {
-            if (agentState !== 'WRAP-UP') {
-              setActiveCall(null);
-              setAgentState(data.agent?.state || 'AVAILABLE');
-            }
+          setActiveCall(null);
+          const nextState = data.agent?.state || 'AVAILABLE';
+          if (nextState !== agentStateRef.current) {
+            setAgentState(nextState);
           }
         }
-        if (data.ivrConfig) {
-          setActiveIvrConfig(data.ivrConfig);
-        }
-        if (data.activeCallDtmf) {
-          setActiveCallDtmf(data.activeCallDtmf);
-        }
-        if (data.agent?.phoneNumber && !agentPhone) {
-          setAgentPhone(data.agent.phoneNumber);
-        }
-        if (data.managerPolicy) {
-          setManagerPolicy(data.managerPolicy);
-        }
+      }
+
+      if (data.ivrConfig) {
+        setActiveIvrConfig(data.ivrConfig);
+      }
+      if (data.activeCallDtmf) {
+        setActiveCallDtmf(data.activeCallDtmf);
+      }
+      if (data.agent?.phoneNumber && !agentPhoneRef.current) {
+        setAgentPhone(data.agent.phoneNumber);
+      }
+      if (data.managerPolicy) {
+        setManagerPolicy(data.managerPolicy);
       }
     } catch (err) {
       console.error('Failed to fetch agent profile:', err);
@@ -529,84 +707,7 @@ export const AgentApp: React.FC = () => {
     }
   };
 
-  // Initialize or get Web Audio Mixed Stream (isolates standalone mic test tracks so stopping mic test NEVER kills WebRTC uplink)
-  const initOrGetMixerStream = async (): Promise<MediaStream | null> => {
-    try {
-      const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-      if (!AudioCtx) return null;
-      if (!mixerAudioContextRef.current || mixerAudioContextRef.current.state === 'closed') {
-        mixerAudioContextRef.current = new AudioCtx({ sampleRate: 48000 });
-        mixerDestinationRef.current = null;
-        mixerMicGainRef.current = null;
-        mixerIvrGainRef.current = null;
-        mixerKeepAliveGainRef.current = null;
-      }
-      const ctx = mixerAudioContextRef.current;
-      if (ctx.state === 'suspended') {
-        await ctx.resume().catch(() => {});
-      }
-
-      const destTracksEnded =
-        !mixerDestinationRef.current ||
-        mixerDestinationRef.current.stream.getAudioTracks().length === 0 ||
-        mixerDestinationRef.current.stream.getAudioTracks().every((t) => t.readyState !== 'live');
-
-      if (destTracksEnded) {
-        mixerDestinationRef.current = ctx.createMediaStreamDestination();
-        mixerMicGainRef.current = null;
-        mixerIvrGainRef.current = null;
-        mixerKeepAliveGainRef.current = null;
-      }
-
-      if (!mixerMicGainRef.current) {
-        mixerMicGainRef.current = ctx.createGain();
-        mixerMicGainRef.current.gain.setValueAtTime(isIvrGreetingPlayingRef.current ? 0 : 1.0, ctx.currentTime);
-        mixerMicGainRef.current.connect(mixerDestinationRef.current!);
-      }
-      if (!mixerIvrGainRef.current) {
-        mixerIvrGainRef.current = ctx.createGain();
-        mixerIvrGainRef.current.gain.setValueAtTime(isIvrGreetingPlayingRef.current ? 1.0 : 0.0, ctx.currentTime);
-        mixerIvrGainRef.current.connect(mixerDestinationRef.current!);
-      }
-      if (!mixerKeepAliveGainRef.current) {
-        // Silent keep-alive tone ensures WebRTC always receives a valid live track immediately across mobile & desktop
-        const osc = ctx.createOscillator();
-        const kGain = ctx.createGain();
-        osc.frequency.setValueAtTime(20, ctx.currentTime);
-        kGain.gain.setValueAtTime(0.00001, ctx.currentTime);
-        osc.connect(kGain);
-        kGain.connect(mixerDestinationRef.current!);
-        osc.start();
-        mixerKeepAliveGainRef.current = kGain;
-      }
-
-      // Connect physical mic into mixerMicGainRef if not connected or previous track ended
-      const hasLiveMixerMic =
-        physicalMixerMicStreamRef.current &&
-        physicalMixerMicStreamRef.current.getAudioTracks().some((t) => t.readyState === 'live');
-
-      if (!hasLiveMixerMic && originalGetUserMediaRef.current) {
-        try {
-          const micStream = await originalGetUserMediaRef.current({
-            audio: {
-              echoCancellation: true,
-              noiseSuppression: true,
-              autoGainControl: true,
-            },
-          });
-          physicalMixerMicStreamRef.current = micStream;
-          const micSource = ctx.createMediaStreamSource(micStream);
-          micSource.connect(mixerMicGainRef.current);
-        } catch (e) {
-          console.warn('Physical mic capture for mixer note:', e);
-        }
-      }
-      return mixerDestinationRef.current!.stream;
-    } catch (e) {
-      console.warn('initOrGetMixerStream error:', e);
-      return null;
-    }
-  };
+  // Clean IVR audio helpers (SIP/PSTN IVR plays server-side via carrier PBX)
 
   const stopIvrGreetingAudioOnly = () => {
     if (ivrAudioSourceRef.current) {
@@ -1017,17 +1118,7 @@ export const AgentApp: React.FC = () => {
         };
       });
 
-      // Auto-answer line and connect 2-way WebRTC audio
-      connectRealPstnAudio();
-      try {
-        const webPhone = (window as any).zdrmWebPhone;
-        if (webPhone?.webCallSession && typeof webPhone.webCallSession.accept === 'function') {
-          webPhone.webCallSession.accept({ audio: true, video: false });
-        }
-      } catch (webrtcAcceptErr) {
-        console.warn('[ZADARMA WEBRTC ACCEPT NOTE]', webrtcAcceptErr);
-      }
-
+      // Single-shot answer & bridge via handleCallAction('ANSWER')
       if (handleCallActionRef.current) {
         handleCallActionRef.current('ANSWER');
       }
@@ -1046,30 +1137,40 @@ export const AgentApp: React.FC = () => {
     stopRingBeepAudio();
   };
 
-  // Continuous 2s polling to ensure agent station synchronizes real-time state with telephony engine
+  // Continuous 3s polling (strictly tied to token so SSE bursts never recreate intervals)
   useEffect(() => {
     fetchAgentStatus();
     const interval = setInterval(() => {
       fetchAgentStatus();
-    }, 2000);
+    }, 3000);
     return () => clearInterval(interval);
-  }, [token, triggerRefresh]);
+  }, [token]);
 
-  // Dedicated listener for agent.incoming_call so rapid state changes never drop the ringing event
+  // Lightweight refresh when triggerRefresh increments (never clobber WRAP-UP or auto-answering)
+  useEffect(() => {
+    if (triggerRefresh > 0 && agentStateRef.current !== 'WRAP-UP' && !isAutoAnsweringRef.current) {
+      fetchAgentStatus();
+    }
+  }, [triggerRefresh]);
+
+  // Dedicated listener for agent.incoming_call with sequence deduplication
   useEffect(() => {
     if (!latestIncomingCall) return;
-    // 1. Strict Role Guard: Only agents ring, NEVER managers or admins
-    if (user?.role !== 'agent') return;
+    const seq = (latestIncomingCall as any)._seq || 0;
+    if (seq && seq <= lastHandledIncomingSeqRef.current) return;
+    if (seq) lastHandledIncomingSeqRef.current = seq;
 
-    // 2. Strict Manager Isolation: Event must belong to the manager of this agent
-    if (latestIncomingCall.managerId && user?.managerId && latestIncomingCall.managerId !== user.managerId) {
-      console.log(`[AGENT APP] Ignored incoming call: campaign manager (${latestIncomingCall.managerId}) does not match agent manager (${user.managerId})`);
+    const curUser = userRef.current;
+    const curState = agentStateRef.current;
+    if (curUser?.role !== 'agent') return;
+
+    if (latestIncomingCall.managerId && curUser?.managerId && latestIncomingCall.managerId !== curUser.managerId) {
+      console.log(`[AGENT APP] Ignored incoming call: campaign manager (${latestIncomingCall.managerId}) does not match agent manager (${curUser.managerId})`);
       return;
     }
 
-    // 3. Availability Check: Must be AVAILABLE to receive new call
-    if (agentState !== 'AVAILABLE' && !isAutoAnsweringRef.current) {
-      console.log(`[AGENT APP] Agent station is currently ${agentState}, not AVAILABLE.`);
+    if (curState !== 'AVAILABLE' && !isAutoAnsweringRef.current) {
+      console.log(`[AGENT APP] Agent station is currently ${curState}, not AVAILABLE.`);
       return;
     }
 
@@ -1081,56 +1182,54 @@ export const AgentApp: React.FC = () => {
     );
   }, [latestIncomingCall]);
 
-  // Handle real-time SSE agent events (strictly isolated by manager and agent availability)
+  // Handle real-time SSE agent events (strictly deduplicated by _seq, NO agentState dependency loop!)
   useEffect(() => {
     if (!latestAgentEvent) return;
+    const seq = (latestAgentEvent as any)._seq || 0;
+    if (seq && seq <= lastHandledEventSeqRef.current) return;
+    if (seq) lastHandledEventSeqRef.current = seq;
 
-    // 1. Strict Role Guard: Only agents ring, NEVER managers or admins
-    if (user?.role !== 'agent') return;
+    const curUser = userRef.current;
+    const curState = agentStateRef.current;
 
-    // 2. Strict Manager Isolation: Event must belong to the manager of this agent
-    if (latestAgentEvent.managerId && user?.managerId && latestAgentEvent.managerId !== user.managerId) {
+    if (curUser?.role !== 'agent') return;
+    if (latestAgentEvent.managerId && curUser?.managerId && latestAgentEvent.managerId !== curUser.managerId) {
       return;
     }
 
     if (latestAgentEvent.type === 'incoming') {
-      if (agentState !== 'AVAILABLE' && !isAutoAnsweringRef.current) {
-        return;
-      }
-      console.log('[SSE EVENT] Incoming call to available agent station. Starting 3s ring beep and auto-answer...', latestAgentEvent);
+      if (curState !== 'AVAILABLE' && !isAutoAnsweringRef.current) return;
       start3SecondRingBeepAndAutoAnswer(latestAgentEvent.dtmfDigit || '1', latestAgentEvent.callId, latestAgentEvent.managerId);
     } else if ((latestAgentEvent as any).type === 'dtmf.received') {
-      if ((latestAgentEvent as any).managerId && user?.managerId && (latestAgentEvent as any).managerId !== user.managerId) {
-        return;
-      }
-      if (agentState !== 'AVAILABLE' && !isAutoAnsweringRef.current) {
-        return;
-      }
-      console.log('[SSE EVENT] DTMF received event for available agent. Starting 3s ring beep and auto-answer...', latestAgentEvent);
+      if (curState !== 'AVAILABLE' && !isAutoAnsweringRef.current) return;
       start3SecondRingBeepAndAutoAnswer((latestAgentEvent as any).digit || '1', (latestAgentEvent as any).callId, (latestAgentEvent as any).managerId);
     } else if (latestAgentEvent.type === 'state_changed') {
       if (latestAgentEvent.state === 'RINGING') {
-        if ((agentState === 'AVAILABLE' || agentState === 'RINGING') && !isAutoAnsweringRef.current) {
+        if ((curState === 'AVAILABLE' || curState === 'RINGING') && !isAutoAnsweringRef.current) {
           start3SecondRingBeepAndAutoAnswer(latestAgentEvent.dtmfDigit || '1', latestAgentEvent.currentCallId || latestAgentEvent.callId, latestAgentEvent.managerId);
         }
+      } else if (latestAgentEvent.state === 'WRAP-UP') {
+        handleCallEndedTransitionRef.current?.('Call ended. Enter call wrap-up & disposition below.', false);
       } else {
-        setAgentState(latestAgentEvent.state);
+        if (latestAgentEvent.state !== curState) {
+          setAgentState(latestAgentEvent.state);
+        }
         if (latestAgentEvent.state === 'BUSY') {
           stopRingtone();
-        } else if (latestAgentEvent.state === 'WRAP-UP' || latestAgentEvent.state === 'AVAILABLE' || latestAgentEvent.state === 'OFFLINE') {
-          if (!latestAgentEvent.currentCallId) {
-            stopRingtone();
-            if (!isTestingMicStandaloneRef.current) {
-              stopMicrophone();
-            }
-            stopAgentSpeechRecognition();
-            disconnectRealPstnAudio();
-            if (keepAliveTimerRef.current) {
-              clearInterval(keepAliveTimerRef.current);
-              keepAliveTimerRef.current = null;
-            }
-            setActiveCall(null);
+        } else if ((latestAgentEvent.state === 'AVAILABLE' || latestAgentEvent.state === 'OFFLINE') && !latestAgentEvent.currentCallId) {
+          stopRingtone();
+          if (!isTestingMicStandaloneRef.current) {
+            stopMicrophone();
           }
+          stopAgentSpeechRecognition();
+          disconnectRealPstnAudio();
+          if (keepAliveTimerRef.current) {
+            clearInterval(keepAliveTimerRef.current);
+            keepAliveTimerRef.current = null;
+          }
+          setWrapUpCall(null);
+          wrapUpCallRef.current = null;
+          setActiveCall(null);
         }
       }
     } else if (
@@ -1140,26 +1239,12 @@ export const AgentApp: React.FC = () => {
       latestAgentEvent.type === 'failed'
     ) {
       console.log('[AGENT APP] Received call ended event from carrier:', latestAgentEvent);
-      stopRingtone();
-      if (!isTestingMicStandaloneRef.current) {
-        stopMicrophone();
-      }
-      stopAgentSpeechRecognition();
-      disconnectRealPstnAudio();
-      if (keepAliveTimerRef.current) {
-        clearInterval(keepAliveTimerRef.current);
-        keepAliveTimerRef.current = null;
-      }
-      setActiveCall(null);
-      setAgentState('WRAP-UP');
-      setStatusMessage(latestAgentEvent.reason || 'Call ended on carrier network.');
-      setTimeout(() => setStatusMessage(null), 5000);
-      fetchAgentStatus();
+      handleCallEndedTransitionRef.current?.(latestAgentEvent.reason || 'Call ended. Enter call wrap-up & disposition below.', false);
     } else if (
       latestAgentEvent.type === 'bridged' ||
       (latestAgentEvent as any).type === 'call.bridged'
     ) {
-      setAgentState('BUSY');
+      if (curState !== 'BUSY') setAgentState('BUSY');
       stopRingtone();
       if (latestAgentEvent.callId) {
         setActiveCall((prev) => ({
@@ -1174,25 +1259,25 @@ export const AgentApp: React.FC = () => {
           dtmfSequence: prev?.dtmfSequence || '',
         }));
       }
-      fetchAgentStatus();
     }
-  }, [latestAgentEvent, user, token, agentState]);
+  }, [latestAgentEvent]);
 
   // Automatically retrieve active call if agent state is BUSY or RINGING but activeCall is missing
   useEffect(() => {
-    if ((agentState === 'BUSY' || agentState === 'RINGING') && !activeCall) {
+    if ((agentState === 'BUSY' || agentState === 'RINGING') && !activeCall && !isAutoAnsweringRef.current) {
       fetchAgentStatus();
     }
   }, [agentState, activeCall]);
 
   // Auto-connect with ring beep sound whenever station enters RINGING state (only if agent belongs to call manager)
   useEffect(() => {
-    if (user?.role === 'agent' && agentState === 'RINGING' && !isAutoAnsweringRef.current) {
-      if (!activeCall?.managerId || !user?.managerId || activeCall.managerId === user.managerId) {
+    const curUser = userRef.current;
+    if (curUser?.role === 'agent' && agentState === 'RINGING' && !isAutoAnsweringRef.current) {
+      if (!activeCall?.managerId || !curUser?.managerId || activeCall.managerId === curUser.managerId) {
         start3SecondRingBeepAndAutoAnswer(activeCall?.dtmfSequence || '1', activeCall?.id, activeCall?.managerId);
       }
     }
-  }, [agentState, user, activeCall]);
+  }, [agentState, activeCall]);
 
   // Keep external WebRTC widget completely hidden headlessly:
   // Our system call interface is the ONLY interface displayed to the user
@@ -1398,10 +1483,9 @@ export const AgentApp: React.FC = () => {
       }
 
       const rawGetUserMedia =
-        originalGetUserMediaRef.current ||
-        (typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia
+        typeof navigator !== 'undefined' && navigator.mediaDevices?.getUserMedia
           ? navigator.mediaDevices.getUserMedia.bind(navigator.mediaDevices)
-          : null);
+          : null;
 
       if (!rawGetUserMedia) {
         throw new Error('Microphone API not supported in this browser.');
@@ -1526,118 +1610,152 @@ export const AgentApp: React.FC = () => {
     setIsAgentSpeaking(false);
   };
 
-  // Real WebRTC PSTN Audio Bridge & Hardware Speaker Controls
+  // Idempotent remote audio playback helper (Downlink: PSTN Caller -> Agent speakers)
+  const ensureRemoteAudioPlaying = () => {
+    try {
+      const webPhone = (window as any).zdrmWebPhone;
+      const remoteMedia = (
+        document.getElementById('zdrm-webRTCRemoteView') ||
+        document.querySelector('video[id*="zdrm"]') ||
+        document.querySelector('audio[id*="zdrm"]')
+      ) as HTMLMediaElement | null;
+
+      // Ensure JsSIP RTCSession PeerConnection remote tracks are hooked into remoteMedia
+      const session = webPhone?.webCallSession;
+      if (session?.connection && !(session as any).__pwTrackHooked) {
+        (session as any).__pwTrackHooked = true;
+        session.connection.addEventListener?.('track', (ev: RTCTrackEvent) => {
+          const el = (
+            document.getElementById('zdrm-webRTCRemoteView') ||
+            document.querySelector('video[id*="zdrm"]')
+          ) as HTMLMediaElement | null;
+          if (el && ev.streams?.[0]) {
+            el.srcObject = ev.streams[0];
+            el.muted = !isSpeakerOnRef.current;
+            el.volume = Math.max(0.05, Math.min(1, (speakerVolumeRef.current ?? 85) / 100));
+            el.play().catch(() => {});
+          }
+        });
+      }
+
+      if (remoteMedia) {
+        remoteMedia.setAttribute('playsinline', 'true');
+        remoteMedia.style.setProperty('display', 'block', 'important');
+        remoteMedia.style.setProperty('visibility', 'visible', 'important');
+        remoteMedia.style.setProperty('position', 'fixed', 'important');
+        remoteMedia.style.setProperty('bottom', '0px', 'important');
+        remoteMedia.style.setProperty('right', '0px', 'important');
+        remoteMedia.style.setProperty('width', '2px', 'important');
+        remoteMedia.style.setProperty('height', '2px', 'important');
+        remoteMedia.style.setProperty('opacity', '0.01', 'important');
+        remoteMedia.style.setProperty('pointer-events', 'none', 'important');
+
+        // Fallback: if srcObject wasn't attached by Zadarma's attachStream yet, pull from RTCPeerConnection receivers
+        if (!(remoteMedia as any).srcObject && session?.connection?.getReceivers) {
+          const audioReceivers = session.connection
+            .getReceivers()
+            .filter((r: any) => r.track && r.track.kind === 'audio');
+          if (audioReceivers.length > 0) {
+            remoteMedia.srcObject = new MediaStream(audioReceivers.map((r: any) => r.track));
+          }
+        }
+
+        remoteMedia.muted = !isSpeakerOnRef.current;
+        remoteMedia.volume = Math.max(0.05, Math.min(1, (speakerVolumeRef.current ?? 85) / 100));
+
+        const playPromise = remoteMedia.play();
+        if (playPromise && typeof playPromise.catch === 'function') {
+          playPromise.catch((e) => {
+            console.warn('[PSTN AUDIO PLAY FALLBACK]', e);
+            // Only bridge via Web Audio API if HTMLMediaElement autoplay was blocked (prevents double-audio echo!)
+            try {
+              const rawStream =
+                (remoteMedia as any).srcObject ||
+                (session?.connection?.getReceivers?.()?.[0]?.track
+                  ? new MediaStream([session.connection.getReceivers()[0].track])
+                  : null);
+              if (rawStream && rawStream.getAudioTracks().length > 0 && !remoteAudioBridgeRef.current) {
+                const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+                const bridgeCtx = new AudioCtx();
+                if (bridgeCtx.state === 'suspended') bridgeCtx.resume().catch(() => {});
+                const sourceNode = bridgeCtx.createMediaStreamSource(rawStream);
+                const gainNode = bridgeCtx.createGain();
+                gainNode.gain.setValueAtTime(
+                  isSpeakerOnRef.current ? (speakerVolumeRef.current ?? 85) / 100 : 0,
+                  bridgeCtx.currentTime
+                );
+                sourceNode.connect(gainNode);
+                gainNode.connect(bridgeCtx.destination);
+                remoteAudioBridgeRef.current = { bridgeCtx, sourceNode, gainNode };
+              }
+            } catch (pipeErr) {
+              console.warn('[REMOTE AUDIO PIPE NOTE]', pipeErr);
+            }
+          });
+        }
+      }
+
+      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
+        audioContextRef.current.resume().catch(() => {});
+      }
+    } catch (err) {
+      console.warn('[ENSURE REMOTE AUDIO NOTE]', err);
+    }
+  };
+  ensureRemoteAudioPlayingRef.current = ensureRemoteAudioPlaying;
+
+  // Single-shot WebRTC PSTN Answer Bridge (NEVER calls widget.answer() twice on the same call!)
   const connectRealPstnAudio = () => {
     try {
-      console.log('[REAL PSTN AUDIO BRIDGE] Connecting 2-way PSTN audio bridge...');
+      ensureRemoteAudioPlaying();
+
       const webPhone = (window as any).zdrmWebPhone;
       const webrtcPhone = (window as any).zdrmWebrtcPhone;
       const widgetInstance = (window as any).zdrmWPhI;
 
-      let answered = false;
-
-      // 1. If active JsSIP call session already exists, answer it directly
-      if (typeof webPhone?.webCallSession?.answer === 'function') {
-        try {
-          webPhone.webCallSession.answer({ mediaConstraints: { audio: true, video: false } });
-          answered = true;
-          console.log('[REAL PSTN AUDIO BRIDGE] webCallSession.answer answered active session');
-        } catch (e) {
-          console.warn('[ZADARMA CALLSESSION ANSWER NOTE]', e);
-        }
+      // Guard: if we already initiated answering on this call, only ensure remote audio & mic unmute
+      if (zdrmAnswerInitiatedRef.current) {
+        return;
       }
 
-      // 2. If session not directly answered, trigger widget answer ONCE (never repeatedly to avoid socket drops)
-      if (!answered) {
-        if (typeof widgetInstance?.answer === 'function') {
+      // 1. If JsSIP RTCSession already exists and isn't established yet, answer directly
+      if (webPhone?.webCallSession && typeof webPhone.webCallSession.answer === 'function') {
+        const alreadyEstablished =
+          typeof webPhone.webCallSession.isEstablished === 'function' &&
+          webPhone.webCallSession.isEstablished();
+        if (!alreadyEstablished) {
           try {
-            widgetInstance.hideCancelBtn?.();
-            widgetInstance.answer();
-            answered = true;
+            webPhone.webCallSession.answer({ mediaConstraints: { audio: true, video: false } });
+            zdrmAnswerInitiatedRef.current = true;
+            console.log('[REAL PSTN AUDIO BRIDGE] Answered existing JsSIP RTCSession');
+            return;
           } catch (e) {
-            console.warn('[ZADARMA WIDGET ANSWER NOTE]', e);
+            console.warn('[WEBRTC CALLSESSION ANSWER NOTE]', e);
           }
-        } else if (typeof webPhone?.answer === 'function') {
-          try {
-            webPhone.answer();
-            answered = true;
-          } catch {}
-        } else if (typeof webrtcPhone?.answer === 'function') {
-          try {
-            webrtcPhone.answer();
-            answered = true;
-          } catch {}
         } else {
-          const answerBtn = (
-            document.querySelector('.zdrm-webphone-call-btn') ||
-            document.querySelector('.zdrm-webphone-call-ico') ||
-            document.querySelector('[data-zadarma-action="answer"]')
-          ) as HTMLElement;
-          if (answerBtn) {
-            try { answerBtn.click(); answered = true; } catch {}
-          }
+          zdrmAnswerInitiatedRef.current = true;
+          return;
         }
       }
 
-      // 3. Robust Remote Audio Setup & Web Audio speaker routing (Downlink: PSTN Caller -> Agent)
-      const setupRemoteAudio = () => {
-        const remoteMedia = (
-          document.getElementById('zdrm-webRTCRemoteView') ||
-          document.querySelector('video[id*="zdrm"]') ||
-          document.querySelector('audio[id*="zdrm"]')
-        ) as HTMLMediaElement;
-
-        if (remoteMedia) {
-          // Never allow display:none or visibility:hidden to silence audio in Chromium/WebKit/iOS Safari
-          remoteMedia.setAttribute('playsinline', 'true');
-          remoteMedia.style.setProperty('display', 'block', 'important');
-          remoteMedia.style.setProperty('visibility', 'visible', 'important');
-          remoteMedia.style.setProperty('position', 'fixed', 'important');
-          remoteMedia.style.setProperty('bottom', '0px', 'important');
-          remoteMedia.style.setProperty('right', '0px', 'important');
-          remoteMedia.style.setProperty('width', '2px', 'important');
-          remoteMedia.style.setProperty('height', '2px', 'important');
-          remoteMedia.style.setProperty('opacity', '0.01', 'important');
-          remoteMedia.style.setProperty('pointer-events', 'none', 'important');
-
-          remoteMedia.muted = !isSpeakerOnRef.current;
-          remoteMedia.volume = Math.max(0.2, Math.min(1, (speakerVolumeRef.current ?? 85) / 100));
-
-          remoteMedia.play().catch((e) => {
-            console.warn('[PSTN AUDIO PLAY NOTE]', e);
-          });
-
-          // Pipe remote media stream directly to Web Audio destination as an unmuted fallback
-          try {
-            const rawStream = (remoteMedia as any).srcObject || (webPhone?.webCallSession?.connection?.getReceivers?.()?.[0]?.track ? new MediaStream([webPhone.webCallSession.connection.getReceivers()[0].track]) : null);
-            if (rawStream && rawStream.getAudioTracks().length > 0 && !(remoteMedia as any)._audioBridgeConnected) {
-              const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
-              const bridgeCtx = new AudioCtx();
-              if (bridgeCtx.state === 'suspended') bridgeCtx.resume();
-              const sourceNode = bridgeCtx.createMediaStreamSource(rawStream);
-              const gainNode = bridgeCtx.createGain();
-              gainNode.gain.setValueAtTime((speakerVolume ?? 85) / 100, bridgeCtx.currentTime);
-              sourceNode.connect(gainNode);
-              gainNode.connect(bridgeCtx.destination);
-              remoteAudioBridgeRef.current = { bridgeCtx, sourceNode, gainNode };
-              (remoteMedia as any)._audioBridgeConnected = true;
-              console.log('[REAL PSTN AUDIO BRIDGE] Web Audio pipe active: routing PSTN caller stream directly to agent speakers!');
-            }
-          } catch (pipeErr) {
-            console.warn('[REMOTE AUDIO PIPE NOTE]', pipeErr);
-          }
+      // 2. Trigger Zadarma widget answer ONCE (calling it multiple times closes the SIP WebSocket with 487!)
+      zdrmAnswerInitiatedRef.current = true;
+      if (typeof widgetInstance?.answer === 'function') {
+        try {
+          widgetInstance.hideCancelBtn?.();
+          widgetInstance.answer();
+          console.log('[REAL PSTN AUDIO BRIDGE] Triggered single-shot widgetInstance.answer()');
+        } catch (e) {
+          console.warn('[WEBRTC WIDGET ANSWER NOTE]', e);
         }
-      };
-
-      setupRemoteAudio();
-      setTimeout(setupRemoteAudio, 300);
-      setTimeout(setupRemoteAudio, 800);
-      setTimeout(setupRemoteAudio, 1600);
-      setTimeout(setupRemoteAudio, 2500);
-
-      // Resume hardware audio context if suspended
-      if (audioContextRef.current && audioContextRef.current.state === 'suspended') {
-        audioContextRef.current.resume().catch(() => {});
+      } else if (typeof webPhone?.answer === 'function') {
+        try {
+          webPhone.answer();
+        } catch {}
+      } else if (typeof webrtcPhone?.answer === 'function') {
+        try {
+          webrtcPhone.answer();
+        } catch {}
       }
     } catch (err) {
       console.warn('[REAL PSTN AUDIO BRIDGE ERROR]', err);
@@ -1649,39 +1767,37 @@ export const AgentApp: React.FC = () => {
       console.log('[REAL PSTN AUDIO BRIDGE] Preserving call connection during auto-answer countdown...');
       return;
     }
+    zdrmAnswerInitiatedRef.current = false;
+    zdrmIncomingPendingRef.current = false;
+
     try {
-      console.log('[REAL PSTN AUDIO BRIDGE] Disconnecting Zadarma WebRTC leg...');
       const webPhone = (window as any).zdrmWebPhone;
       const webrtcPhone = (window as any).zdrmWebrtcPhone;
       const widgetInstance = (window as any).zdrmWPhI;
 
-      if (typeof webPhone?.webCallSession?.terminate === 'function') {
-        try { webPhone.webCallSession.terminate(); } catch {}
+      const session = webPhone?.webCallSession;
+      if (session && session.status !== 8 && typeof session.terminate === 'function') {
+        try { session.terminate(); } catch {}
       }
 
-      if (typeof widgetInstance?.finishCall === 'function') {
-        widgetInstance.finishCall();
-        widgetInstance.hideCancelBtn?.();
-      } else if (typeof webrtcPhone?.finishCall === 'function') {
-        webrtcPhone.finishCall();
-      } else if (typeof webPhone?.finishCall === 'function') {
-        webPhone.finishCall();
-      }
-
-      const declineBtn = (
-        document.querySelector('.zdrm-webphone-decline-btn') ||
-        document.querySelector('.zdrm-webphone-hangup-btn') ||
-        document.querySelector('[data-zadarma-action="hangup"]')
-      ) as HTMLElement;
-      if (declineBtn) {
-        try { declineBtn.click(); } catch {}
+      // Only call finishCall if a call is actually in progress (otherwise widget sends spurious cancel)
+      if (session || webPhone?.callState === 'incoming' || webPhone?.talking) {
+        if (typeof widgetInstance?.finishCall === 'function') {
+          try {
+            widgetInstance.finishCall();
+            widgetInstance.hideCancelBtn?.();
+          } catch {}
+        } else if (typeof webrtcPhone?.finishCall === 'function') {
+          try { webrtcPhone.finishCall(); } catch {}
+        } else if (typeof webPhone?.finishCall === 'function') {
+          try { webPhone.finishCall(); } catch {}
+        }
       }
 
       const remoteMedia = document.getElementById('zdrm-webRTCRemoteView') as HTMLMediaElement;
       if (remoteMedia) {
         remoteMedia.pause();
         remoteMedia.srcObject = null;
-        (remoteMedia as any)._audioBridgeConnected = false;
       }
 
       if (remoteAudioBridgeRef.current) {
@@ -1697,10 +1813,22 @@ export const AgentApp: React.FC = () => {
 
   const toggleRealPstnMute = (muted: boolean) => {
     try {
+      const session = (window as any).zdrmWebPhone?.webCallSession;
+      if (session) {
+        if (muted && typeof session.mute === 'function') {
+          try { session.mute({ audio: true }); } catch {}
+        } else if (!muted && typeof session.unmute === 'function') {
+          try { session.unmute({ audio: true }); } catch {}
+        }
+        const senders = session.connection?.getSenders?.() || [];
+        senders.forEach((s: any) => {
+          if (s.track?.kind === 'audio') {
+            s.track.enabled = !muted;
+          }
+        });
+      }
       if (typeof (window as any).zdrmWebPhone?.micSwitch === 'function') {
-        (window as any).zdrmWebPhone.micSwitch(muted ? 'on' : 'off');
-      } else if (typeof (window as any).zdrmWebrtcPhone?.micSwitch === 'function') {
-        (window as any).zdrmWebrtcPhone.micSwitch(muted ? 'on' : 'off');
+        try { (window as any).zdrmWebPhone.micSwitch(muted ? 'on' : 'off'); } catch {}
       }
     } catch (err) {
       console.warn('[PSTN MUTE NOTE]', err);
@@ -1728,7 +1856,7 @@ export const AgentApp: React.FC = () => {
     }
   };
 
-  // Sync mute state with hardware microphone tracks
+  // Sync mute state with hardware microphone tracks & WebRTC uplink
   useEffect(() => {
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach((track) => {
@@ -1738,15 +1866,24 @@ export const AgentApp: React.FC = () => {
     toggleRealPstnMute(isMuted);
   }, [isMuted]);
 
-  // Sync speaker volume and mute with Zadarma WebRTC remote audio channel
+  // Sync speaker volume (normalized 0..1) and mute with remote audio channel
   useEffect(() => {
-    const remoteMedia = document.getElementById('zdrm-webRTCRemoteView') as HTMLMediaElement;
+    const normalizedVol = Math.max(0, Math.min(1, speakerVolume / 100));
+    const remoteMedia = document.getElementById('zdrm-webRTCRemoteView') as HTMLMediaElement | null;
     if (remoteMedia) {
       remoteMedia.muted = !isSpeakerOn;
-      remoteMedia.volume = Math.max(0, Math.min(1, speakerVolume / 100));
+      remoteMedia.volume = normalizedVol;
+    }
+    if (remoteAudioBridgeRef.current?.gainNode && remoteAudioBridgeRef.current?.bridgeCtx) {
+      remoteAudioBridgeRef.current.gainNode.gain.setValueAtTime(
+        isSpeakerOn ? normalizedVol : 0,
+        remoteAudioBridgeRef.current.bridgeCtx.currentTime
+      );
     }
     if (typeof (window as any).zdrmWebPhone?.volumeChange === 'function') {
-      (window as any).zdrmWebPhone.volumeChange(isSpeakerOn ? speakerVolume : 0);
+      try {
+        (window as any).zdrmWebPhone.volumeChange(isSpeakerOn ? normalizedVol : 0);
+      } catch {}
     }
   }, [isSpeakerOn, speakerVolume]);
 
@@ -1887,9 +2024,63 @@ export const AgentApp: React.FC = () => {
     }
   };
 
+  // Idempotent, rock-solid transition into WRAP-UP on call end (zero blinking / zero ping-pong)
+  const handleCallEndedTransition = (reasonMessage: string, notifyServer: boolean = false) => {
+    stopRingtone();
+    isAutoAnsweringRef.current = false;
+    setAutoAnswerSecondsLeft(null);
+
+    if (!isTestingMicStandaloneRef.current) {
+      stopMicrophone();
+    }
+    stopAgentSpeechRecognition();
+    disconnectRealPstnAudio();
+
+    if (keepAliveTimerRef.current) {
+      clearInterval(keepAliveTimerRef.current);
+      keepAliveTimerRef.current = null;
+    }
+
+    const endedCall = activeCallRef.current;
+    if (endedCall) {
+      setWrapUpCall(endedCall);
+      wrapUpCallRef.current = endedCall;
+    }
+
+    if (notifyServer && endedCall?.id && tokenRef.current) {
+      fetch('/api/agent/call-action', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${tokenRef.current}`,
+        },
+        body: JSON.stringify({
+          callId: endedCall.id,
+          action: 'END',
+          sessionId: activeSessionId || undefined,
+          reason: reasonMessage,
+        }),
+      }).catch(() => null);
+    }
+
+    setActiveCall(null);
+    setActiveSessionId(null);
+    setIsOnHold(false);
+    setIsMuted(false);
+    setIsCustomerSpeaking(false);
+    setCustomerSpokenMessage(null);
+    if (agentStateRef.current !== 'WRAP-UP') {
+      setAgentState('WRAP-UP');
+    }
+    setStatusMessage(reasonMessage);
+    setTimeout(() => setStatusMessage(null), 4000);
+  };
+  handleCallEndedTransitionRef.current = handleCallEndedTransition;
+
   const handleCallAction = async (action: 'ANSWER' | 'MUTE' | 'HOLD' | 'SPEAKER' | 'END') => {
-    if (!token) return;
-    const currentCall = activeCall || activeCallRef.current || {
+    const activeToken = tokenRef.current;
+    if (!activeToken) return;
+    const currentCall = activeCallRef.current || activeCall || {
       id: latestAgentEvent?.callId || `call_in_${Date.now()}`,
       callId: latestAgentEvent?.callId || `call_in_${Date.now()}`,
       customerNumber: latestAgentEvent?.customerNumber || 'Inbound Caller',
@@ -1900,7 +2091,7 @@ export const AgentApp: React.FC = () => {
       status: 'BRIDGED' as const,
       dtmfSequence: '1',
     };
-    if (!activeCall && action !== 'ANSWER') return;
+    if (!activeCallRef.current && !activeCall && action !== 'ANSWER') return;
 
     if (action === 'ANSWER') {
       setIsAnswering(true);
@@ -1909,84 +2100,27 @@ export const AgentApp: React.FC = () => {
       playConnectBeep();
       setAgentState('BUSY');
 
-      if (!activeCall) {
+      if (!activeCallRef.current) {
         setActiveCall(currentCall);
       }
 
       try {
-        // 1. Connect Zadarma WebRTC audio leg immediately
+        // 1. Trigger single-shot WebRTC SIP answer (JsSIP acquires native microphone cleanly)
         connectRealPstnAudio();
 
-        // 2. Activate hardware microphone and speech recognition in non-blocking manner
-        try {
-          await Promise.race([
-            startMicrophone(),
-            new Promise((_, reject) => setTimeout(() => reject(new Error('Mic init timeout')), 2500)),
-          ]);
-        } catch (micErr: any) {
-          console.warn('Microphone activation note:', micErr?.message || micErr);
-        }
-
-        try {
-          startAgentSpeechRecognition();
-        } catch (srErr) {
-          console.warn('Speech recognition start note:', srErr);
-        }
-
-        // Bridge live agent microphone track directly into Zadarma WebRTC audio sender (Uplink: Agent -> PSTN Recipient)
-        const webPhone = (window as any).zdrmWebPhone;
-        const bridgeAgentMic = () => {
-          if (localStreamRef.current) {
-            const micTrack = localStreamRef.current.getAudioTracks()[0];
-            if (micTrack) {
-              micTrack.enabled = true;
-              try {
-                if (webPhone?.webCallSession?.connection) {
-                  const senders = webPhone.webCallSession.connection.getSenders?.() || [];
-                  const audioSender = senders.find((s: any) => s.track?.kind === 'audio');
-                  if (audioSender && typeof audioSender.replaceTrack === 'function') {
-                    audioSender.replaceTrack(micTrack).then(() => {
-                      console.log('[ZADARMA AUDIO BRIDGE] Successfully linked agent mic track to PSTN uplink!');
-                    }).catch((e: any) => console.warn('[REPLACE TRACK NOTE]', e));
-                  }
-                  if (typeof webPhone.webCallSession.connection.unmute === 'function') {
-                    webPhone.webCallSession.connection.unmute({ audio: true, video: false });
-                  }
-                }
-                if (typeof webPhone?.webCallSession?.unmute === 'function') {
-                  webPhone.webCallSession.unmute({ audio: true });
-                }
-              } catch (unmuteErr) {
-                console.warn('[ZADARMA MIC UNMUTE NOTE]', unmuteErr);
-              }
+        // 2. Activate local VU meter visualizer & speech recognition cleanly after WebRTC grabs mic
+        setTimeout(() => {
+          if (agentStateRef.current === 'BUSY') {
+            startMicrophone().catch((micErr: any) => {
+              console.warn('Microphone visualizer note:', micErr?.message || micErr);
+            });
+            try {
+              startAgentSpeechRecognition();
+            } catch (srErr) {
+              console.warn('Speech recognition start note:', srErr);
             }
           }
-        };
-        bridgeAgentMic();
-        setTimeout(bridgeAgentMic, 400);
-        setTimeout(bridgeAgentMic, 1200);
-        setTimeout(bridgeAgentMic, 2400);
-
-        // 2. Initialize RTCPeerConnection for real WebRTC SDP offer/answer
-        let localSdpOfferSummary = 'a=rtpmap:111 opus/48000/2 (sendrecv)';
-        try {
-          const pc = new RTCPeerConnection({
-            iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-          });
-          peerConnectionRef.current = pc;
-          if (localStreamRef.current) {
-            localStreamRef.current.getTracks().forEach((track) => {
-              pc.addTrack(track, localStreamRef.current!);
-            });
-          }
-          const offer = await pc.createOffer({
-            offerToReceiveAudio: true,
-          });
-          await pc.setLocalDescription(offer);
-          localSdpOfferSummary = offer.sdp ? offer.sdp.slice(0, 120).replace(/[\r\n]+/g, ' ') : localSdpOfferSummary;
-        } catch (e) {
-          console.warn('RTCPeerConnection SDP initialization note:', e);
-        }
+        }, 450);
 
         // 3. Generate explicit audio stream session tracking ID
         const newSessionId = `sess_${currentCall.id}_${Date.now()}`;
@@ -1994,11 +2128,11 @@ export const AgentApp: React.FC = () => {
         setKeepAliveCount(1);
         setLastKeepAliveMs(0);
 
-        // 4. Send explicit session metadata with ANSWER action to backend
+        // 4. Send ANSWER action to backend
         const track = localStreamRef.current?.getAudioTracks()[0];
         const res = await fetch('/api/agent/call-action', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${activeToken}` },
           body: JSON.stringify({
             callId: currentCall.id,
             action: 'ANSWER',
@@ -2008,8 +2142,8 @@ export const AgentApp: React.FC = () => {
               streamId: localStreamRef.current?.id || `stream_${Date.now()}`,
               codec: 'opus',
               sampleRate: 48000,
-              sdpOfferSummary: localSdpOfferSummary,
-              signalingState: peerConnectionRef.current?.signalingState || 'stable',
+              sdpOfferSummary: 'a=rtpmap:111 opus/48000/2 (sendrecv)',
+              signalingState: 'stable',
             },
           }),
         });
@@ -2023,7 +2157,7 @@ export const AgentApp: React.FC = () => {
           setStatusMessage('Call connected! Live 2-way audio stream active.');
           setTimeout(() => setStatusMessage(null), 4000);
 
-          // Start continuous Keep-Alive Heartbeat Signal (every 4000ms) to prevent carrier timeout
+          // Start continuous Keep-Alive Heartbeat Signal (every 4000ms)
           if (keepAliveTimerRef.current) clearInterval(keepAliveTimerRef.current);
           const currentCallId = currentCall.id;
           keepAliveTimerRef.current = setInterval(async () => {
@@ -2033,7 +2167,7 @@ export const AgentApp: React.FC = () => {
                 method: 'POST',
                 headers: {
                   'Content-Type': 'application/json',
-                  Authorization: `Bearer ${token}`,
+                  Authorization: `Bearer ${activeToken}`,
                 },
                 body: JSON.stringify({
                   callId: currentCallId,
@@ -2058,12 +2192,13 @@ export const AgentApp: React.FC = () => {
             }
           }, 4000);
 
-          // 7. Bridge live WebRTC audio stream with Zadarma gateway
-          connectRealPstnAudio();
+          // Idempotently ensure remote speaker element is unmuted & playing once SIP media arrives
+          setTimeout(ensureRemoteAudioPlaying, 400);
+          setTimeout(ensureRemoteAudioPlaying, 1200);
+          setTimeout(ensureRemoteAudioPlaying, 2500);
 
-          // Fetch DTMF history for this call
           fetch(`/api/agent/active-call-dtmf/${currentCall.id}`, {
-            headers: { Authorization: `Bearer ${token}` },
+            headers: { Authorization: `Bearer ${activeToken}` },
           })
             .then((r) => r.json())
             .then((events) => {
@@ -2073,7 +2208,6 @@ export const AgentApp: React.FC = () => {
         } else {
           console.warn('[ANSWER CALL REJECTED]', data);
           setAnswerError(data.error || `Could not bridge call (status ${res.status}). Click force connect.`);
-          // Optimistically refresh status
           await fetchAgentStatus();
         }
       } catch (err: any) {
@@ -2084,44 +2218,7 @@ export const AgentApp: React.FC = () => {
       }
     } else if (action === 'END') {
       try {
-        // Disconnect Zadarma WebRTC call leg
-        disconnectRealPstnAudio();
-
-        // Clear keep-alive heartbeat timer
-        if (keepAliveTimerRef.current) {
-          clearInterval(keepAliveTimerRef.current);
-          keepAliveTimerRef.current = null;
-        }
-
-        // Stop hardware microphone and cancel customer voice
-        stopMicrophone();
-        stopAgentSpeechRecognition();
-        setIsCustomerSpeaking(false);
-        setCustomerSpokenMessage(null);
-
-        const endedCall = activeCall || activeCallRef.current || currentCall;
-        setWrapUpCall(endedCall);
-        wrapUpCallRef.current = endedCall;
-
-        fetch('/api/agent/call-action', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
-          body: JSON.stringify({
-            callId: currentCall.id,
-            action: 'END',
-            sessionId: activeSessionId || undefined,
-            reason: 'Agent ended call.',
-          }),
-        }).catch(() => null);
-
-        // Immediate cleanup of active session & state
-        setActiveCall(null);
-        setAgentState('WRAP-UP');
-        setActiveSessionId(null);
-        setIsOnHold(false);
-        setIsMuted(false);
-        setStatusMessage('Call ended. Enter call wrap-up & disposition below.');
-        setTimeout(() => setStatusMessage(null), 4000);
+        handleCallEndedTransition('Call ended. Enter call wrap-up & disposition below.', true);
       } catch (err) {
         console.error('Failed to end call:', err);
       }
@@ -2154,7 +2251,7 @@ export const AgentApp: React.FC = () => {
       }
       fetch('/api/agent/call-action', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${activeToken}` },
         body: JSON.stringify({ callId: currentCall.id, action: nextHold ? 'HOLD' : 'RESUME' }),
       }).catch(() => {});
       setStatusMessage(nextHold ? 'Call Placed on Hold' : 'Call Resumed');
@@ -3196,10 +3293,32 @@ export const AgentApp: React.FC = () => {
                 You are in the active routing queue. Outbound campaign calls where the recipient presses DTMF key 1 will ring here with live 2-way audio!
               </p>
               <div className="pt-1 flex flex-col items-center gap-2">
-                <div className="inline-flex items-center gap-2 px-3 py-1 bg-emerald-50 border border-emerald-200 rounded-full text-[11px] text-emerald-800 font-medium">
-                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse"></span>
-                  <span>Voice Line: {webrtcStatus === 'REGISTERED' || webrtcStatus === 'CALL_ACTIVE' ? 'Connected & Ready' : 'Connecting...'}</span>
+                <div className={`inline-flex items-center gap-2 px-3 py-1 rounded-full text-[11px] font-medium border ${
+                  webrtcStatus === 'ERROR'
+                    ? 'bg-red-50 border-red-200 text-red-700'
+                    : webrtcStatus === 'REGISTERED' || webrtcStatus === 'CALL_ACTIVE'
+                    ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                    : 'bg-amber-50 border-amber-200 text-amber-800'
+                }`}>
+                  <span className={`w-2 h-2 rounded-full ${
+                    webrtcStatus === 'ERROR'
+                      ? 'bg-red-500'
+                      : webrtcStatus === 'REGISTERED' || webrtcStatus === 'CALL_ACTIVE'
+                      ? 'bg-emerald-500 animate-pulse'
+                      : 'bg-amber-500 animate-pulse'
+                  }`}></span>
+                  <span>
+                    Voice Line:{' '}
+                    {webrtcStatus === 'REGISTERED' || webrtcStatus === 'CALL_ACTIVE'
+                      ? 'Connected & Ready'
+                      : webrtcStatus === 'ERROR'
+                      ? 'Connection Issue (Refresh Page)'
+                      : 'Connecting...'}
+                  </span>
                 </div>
+                {webrtcStatus === 'ERROR' && webrtcError && (
+                  <p className="text-[11px] text-red-600">{webrtcError}</p>
+                )}
               </div>
             </div>
 
@@ -3210,10 +3329,40 @@ export const AgentApp: React.FC = () => {
                   <Headphones className="w-4 h-4 text-indigo-600" />
                   <span>Audio Hardware & Headset Check</span>
                 </div>
-                <span className="text-[10px] bg-emerald-100 text-emerald-800 font-semibold px-2 py-0.5 rounded-full">
-                  Ready to Talk
+                <span className={`text-[10px] font-semibold px-2 py-0.5 rounded-full ${
+                  micPermission === 'denied'
+                    ? 'bg-red-100 text-red-800'
+                    : micPermission === 'prompt'
+                    ? 'bg-amber-100 text-amber-800'
+                    : 'bg-emerald-100 text-emerald-800'
+                }`}>
+                  {micPermission === 'denied'
+                    ? 'Mic Blocked'
+                    : micPermission === 'prompt'
+                    ? 'Grant Mic Access'
+                    : 'Ready to Talk'}
                 </span>
               </div>
+
+              {(micPermission === 'prompt' || micPermission === 'denied') && (
+                <div className="bg-amber-50 border border-amber-200 rounded-lg p-2.5 flex items-center justify-between gap-2 text-[11px] text-amber-900">
+                  <span>
+                    {micPermission === 'denied'
+                      ? 'Microphone permission is blocked in your browser. Allow mic access to hear and speak on calls.'
+                      : 'Tap once to allow microphone & audio so live calls connect cleanly with 2-way voice.'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await startMicrophone();
+                      setIsTestingMicStandalone(true);
+                    }}
+                    className="px-2.5 py-1 bg-amber-600 hover:bg-amber-700 text-white font-bold rounded shrink-0 cursor-pointer"
+                  >
+                    Allow Mic
+                  </button>
+                </div>
+              )}
 
               {/* Mic & Speaker Test Buttons */}
               <div className="grid grid-cols-2 gap-2 text-xs">

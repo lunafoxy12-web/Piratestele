@@ -426,14 +426,20 @@ zadarmaRouter.post('/webrtc-key', authenticate, async (req: AuthenticatedRequest
       message: 'Zadarma WebRTC key successfully generated!',
     });
   } else {
-    const fallbackKey = cachedEntry?.key || cachedWebRtcKey || 'zd_webrtc_active_key';
+    const fallbackKey = cachedEntry?.key || (cachedWebRtcKey && cachedWebRtcKey.length >= 64 ? cachedWebRtcKey : '');
+    if (!fallbackKey) {
+      return res.status(502).json({
+        success: false,
+        error: result.message || 'Could not generate live WebRTC key from carrier.',
+      });
+    }
     res.json({
       success: true,
       key: fallbackKey,
       sipLogin: targetSip,
       sipServer: 'sip.zadarma.com',
       webrtcWss: 'wss://webrtc.zadarma.com:4443',
-      message: 'Zadarma WebRTC softphone interface ready.',
+      message: 'WebRTC key loaded from valid recent session cache.',
     });
   }
 });
@@ -1053,9 +1059,12 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
       // Zadarma PBX forwarded/routed call to internal extension (e.g. 100)
       console.log(`[ZADARMA NOTIFY_INTERNAL] Call routed to internal extension ${payload.internal || ''}.`);
       if (call) {
-        const internalDigit = String(payload.dtmf || payload.dtmf_key || payload.digit || '1').trim();
-        console.log(`[ZADARMA NOTIFY_INTERNAL] Caller pressed DTMF digit ${internalDigit}. Routing to extension ${payload.internal || '100'}.`);
-        await telephony.handleDtmfInput(call.id, internalDigit);
+        const alreadyTransferred = Boolean(call.dtmfSequence) || ['RINGING', 'BRIDGED', 'COMPLETED', 'FAILED'].includes(call.status);
+        if (!alreadyTransferred) {
+          const internalDigit = String(payload.dtmf || payload.dtmf_key || payload.digit || '1').trim();
+          console.log(`[ZADARMA NOTIFY_INTERNAL] Caller routed to extension ${payload.internal || '100'}. Triggering agent transfer.`);
+          await telephony.handleDtmfInput(call.id, internalDigit);
+        }
       }
       break;
     }

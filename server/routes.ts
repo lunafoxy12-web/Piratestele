@@ -3576,14 +3576,14 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
     } else {
       activeCall = null;
       agent.currentCallId = null;
-      if (agent.state === 'RINGING' || agent.state === 'BUSY' || agent.state === 'WRAP-UP') {
+      if (agent.state === 'RINGING' || agent.state === 'BUSY') {
         agent.state = 'AVAILABLE';
       }
       await db.update((d) => {
         const agt = d.agents.find((a) => a.id === agent!.id);
         if (agt) {
           agt.currentCallId = null;
-          if (agt.state === 'RINGING' || agt.state === 'BUSY' || agt.state === 'WRAP-UP') {
+          if (agt.state === 'RINGING' || agt.state === 'BUSY') {
             agt.state = 'AVAILABLE';
             agt.lastStateChange = new Date().toISOString();
           }
@@ -3649,13 +3649,13 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
         .filter((d) => d.callId === candidate!.id)
         .sort((a, b) => a.sequenceNumber - b.sequenceNumber);
     } else {
-      // Prevent resetting agent state during 3-second auto-answer countdown (allow 20s grace for RINGING, 60s for WRAP-UP)
+      // Prevent resetting agent state during 3-second auto-answer countdown or active wrap-up note entry
       const lastChange = agent.lastStateChange ? new Date(agent.lastStateChange).getTime() : 0;
       const ageMs = Date.now() - lastChange;
       const shouldRecoverStale =
-        (agent.state === 'RINGING' && ageMs >= 20000) ||
-        (agent.state === 'BUSY' && !agent.currentCallId && ageMs >= 15000) ||
-        (agent.state === 'WRAP-UP' && !agent.currentCallId && ageMs >= 60000);
+        (agent.state === 'RINGING' && ageMs >= 25000) ||
+        (agent.state === 'BUSY' && !agent.currentCallId && ageMs >= 20000) ||
+        (agent.state === 'WRAP-UP' && !agent.currentCallId && ageMs >= 10 * 60 * 1000);
       if (shouldRecoverStale) {
         await db.update((d) => {
           const agt = d.agents.find((a) => a.id === agent!.id);

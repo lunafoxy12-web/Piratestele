@@ -1468,7 +1468,7 @@ class TelephonyEngine {
           const pastCall = d.calls.find((item) => item.id === a.currentCallId);
           if (!pastCall || pastCall.endTime || ['COMPLETED', 'FAILED', 'BUSY', 'NO_ANSWER', 'CANCELLED'].includes(pastCall.status)) {
             a.currentCallId = null;
-            if (a.state === 'RINGING' || a.state === 'BUSY' || a.state === 'WRAP-UP') {
+            if (a.state === 'RINGING' || a.state === 'BUSY') {
               a.state = 'AVAILABLE';
               a.lastStateChange = new Date().toISOString();
               staleReleasedIds.push(a.id);
@@ -1476,8 +1476,8 @@ class TelephonyEngine {
           }
         } else if (!a.currentCallId && (a.state === 'RINGING' || a.state === 'WRAP-UP')) {
           const lastChangeMs = a.lastStateChange ? new Date(a.lastStateChange).getTime() : 0;
-          // Auto-release stale RINGING (>25s) or abandoned WRAP-UP (>45s) locks with no live call
-          if ((a.state === 'RINGING' && nowMs - lastChangeMs > 25000) || (a.state === 'WRAP-UP' && nowMs - lastChangeMs > 45000)) {
+          // Auto-release stale RINGING (>25s) or abandoned WRAP-UP (>5m) locks with no live call
+          if ((a.state === 'RINGING' && nowMs - lastChangeMs > 25000) || (a.state === 'WRAP-UP' && nowMs - lastChangeMs > 5 * 60 * 1000)) {
             a.state = 'AVAILABLE';
             a.lastStateChange = new Date().toISOString();
             staleReleasedIds.push(a.id);
@@ -1792,16 +1792,18 @@ class TelephonyEngine {
       });
     });
 
-    realtime.broadcast('agent.answered', { callId, agentId, session: audioSession });
-    realtime.broadcast('agent.state_changed', { agentId, state: 'BUSY', currentCallId: callId, sessionId });
+    const targetMgrId = call?.managerId || agent.managerId;
+    realtime.broadcast('agent.answered', { callId, agentId, managerId: targetMgrId, session: audioSession }, targetMgrId ? { managerId: targetMgrId } : undefined);
+    realtime.broadcast('agent.state_changed', { agentId, managerId: targetMgrId, state: 'BUSY', currentCallId: callId, sessionId }, targetMgrId ? { managerId: targetMgrId } : undefined);
     realtime.broadcast('call.bridged', {
       callId,
       agentId,
+      managerId: targetMgrId,
       agentName: agent.name,
       session: audioSession,
       status: 'BRIDGED',
-    });
-    realtime.broadcast('call.stream_connected', { callId, sessionId, agentId });
+    }, targetMgrId ? { managerId: targetMgrId } : undefined);
+    realtime.broadcast('call.stream_connected', { callId, sessionId, agentId, managerId: targetMgrId }, targetMgrId ? { managerId: targetMgrId } : undefined);
 
     return { success: true, session: audioSession };
   }
@@ -2069,16 +2071,18 @@ class TelephonyEngine {
       });
     });
 
-    realtime.broadcast('call.ended', { callId, duration, reason });
+    const targetMgrId = call.managerId;
+    realtime.broadcast('call.ended', { callId, duration, reason, managerId: targetMgrId, agentId: call.agentId }, targetMgrId ? { managerId: targetMgrId } : undefined);
     this.terminateAudioSession(callId);
     this.activeZadarmaCalls.delete(callId);
 
     if (call.agentId) {
       realtime.broadcast('agent.state_changed', {
         agentId: call.agentId,
+        managerId: targetMgrId,
         state: 'WRAP-UP',
         currentCallId: null,
-      });
+      }, targetMgrId ? { managerId: targetMgrId } : undefined);
     }
 
     // Trigger automated Voicemail Drop if call was unanswered or busy
