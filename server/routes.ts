@@ -460,6 +460,7 @@ router.get('/events', (req: Request, res: Response) => {
   });
 
   // Auto-heal stale non-live agent state when an agent terminal connects SSE
+  // Never wipe active post-call WRAP-UP (< 5m) or manual BUSY pause (!currentCallId)
   if (role === 'agent' && agentId) {
     const data = db.get();
     const agt = data.agents.find((a) => a.id === agentId);
@@ -468,7 +469,12 @@ router.get('/events', (req: Request, res: Response) => {
         ? data.calls.find((c) => c.id === agt.currentCallId && !c.endTime && ['BRIDGED', 'ANSWERED', 'RINGING'].includes(c.status))
         : null;
       const lastChangeMs = agt.lastStateChange ? new Date(agt.lastStateChange).getTime() : 0;
-      if (!liveCall && Date.now() - lastChangeMs > 20000) {
+      const elapsedMs = Date.now() - lastChangeMs;
+      const shouldAutoHealOnSse =
+        (agt.state === 'RINGING' && !liveCall && elapsedMs > 20000) ||
+        (agt.state === 'BUSY' && Boolean(agt.currentCallId) && !liveCall && elapsedMs > 20000) ||
+        (agt.state === 'WRAP-UP' && !liveCall && elapsedMs > 5 * 60 * 1000);
+      if (shouldAutoHealOnSse) {
         db.update((d) => {
           const target = d.agents.find((a) => a.id === agentId);
           if (target) {
@@ -3634,8 +3640,9 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
       // Priority 2: Unassigned call belonging to this manager that has bridged or is ready for AVAILABLE agent
       if (!c.agentId && c.managerId === agent!.managerId && ['BRIDGED', 'RINGING'].includes(c.status)) {
         if (agent!.state === 'AVAILABLE') return true;
-        // Also recover unassigned live calls for non-offline agent stuck in WRAP-UP with no live call if no AVAILABLE online agent exists
-        if (agent!.state === 'WRAP-UP' && !agent!.currentCallId) {
+        // Recover unassigned live calls only for genuinely abandoned WRAP-UP (> 5m) if no AVAILABLE online agent exists
+        const ageSinceChange = agent!.lastStateChange ? Date.now() - new Date(agent!.lastStateChange).getTime() : 0;
+        if (agent!.state === 'WRAP-UP' && !agent!.currentCallId && ageSinceChange > 5 * 60 * 1000) {
           const hasOtherFreeOnline = (data.agents || []).some(
             (other) =>
               other.id !== agent!.id &&
@@ -3739,7 +3746,15 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
     aiTranslationBotVoice: manager.aiTranslationBotVoice || 'Aoede',
   } : null;
 
-  res.json({ agent, activeCall, activeCallDtmf, managerPolicy, ivrConfig });
+  let wrapUpCall = null;
+  if (!activeCall && agent.state === 'WRAP-UP') {
+    wrapUpCall =
+      [...(data.calls || [])]
+        .sort((a, b) => new Date(b.endTime || b.startTime || 0).getTime() - new Date(a.endTime || a.startTime || 0).getTime())
+        .find((c) => c.agentId === agent!.id && !(c as any).wrappedUpAt) || null;
+  }
+
+  res.json({ agent, activeCall, wrapUpCall, activeCallDtmf, managerPolicy, ivrConfig });
 });
 
 // Update Agent Direct PSTN Phone Number for hardware / mobile phone bridging
@@ -3761,51 +3776,128 @@ router.post('/agent/phone', authenticate, requireRole(['agent', 'admin', 'manage
   res.json({ success: true, phoneNumber: cleanPhone, message: 'Agent phone updated successfully.' });
 });
 
-// Save Call Wrap-Up Data (Disposition, Agent Notes, Tags, Agent Name)
+// Save Call Wrap-Up Data (Disposition, Agent Notes, Tags, Agent Name) & Transition Agent back to AVAILABLE
 router.post('/agent/call-notes', authenticate, requireRole(['agent', 'admin', 'manager']), async (req: AuthenticatedRequest, res: Response) => {
-  const { callId, notes, disposition, tags } = req.body;
-  if (!callId) return res.status(400).json({ error: 'Call ID is required.' });
+  const { callId, notes, disposition, tags, completeWrapUp = true } = req.body;
+
+  const data = db.get();
+  let resolvedAgentId = req.agentId;
+  if (!resolvedAgentId && req.user?.role === 'agent') {
+    const userAgent = data.agents.find(
+      (a) =>
+        a.userId === req.user?.id ||
+        a.id === req.user?.id ||
+        (req.user?.username && a.username?.toLowerCase() === req.user.username.toLowerCase())
+    );
+    resolvedAgentId = userAgent?.id;
+  }
+
+  // Fallback: if callId wasn't preserved on client, locate agent's most recent un-wrapped-up call
+  let effectiveCallId = callId ? String(callId) : '';
+  if (!effectiveCallId && resolvedAgentId) {
+    const recentCall = [...(data.calls || [])]
+      .sort((a, b) => new Date(b.endTime || b.startTime || 0).getTime() - new Date(a.endTime || a.startTime || 0).getTime())
+      .find((c) => c.agentId === resolvedAgentId && !(c as any).wrappedUpAt);
+    if (recentCall) effectiveCallId = recentCall.id;
+  }
 
   const now = new Date().toISOString();
-  const agentUsername = req.user?.username || (req as any).agentId || 'Agent';
+  const agentUsername = req.user?.username || resolvedAgentId || 'Agent';
 
   let updatedCall: any = null;
-  let managerIdToNotify = '';
+  let managerIdToNotify = req.managerId || '';
+  let agentTransitionedToAvailable = false;
 
   await db.update((d) => {
-    const call = d.calls.find((c) => c.id === callId || c.callId === callId);
-    if (call) {
-      if (notes !== undefined) {
-        call.notes = String(notes);
-        call.wrapUpNotes = String(notes);
+    if (effectiveCallId) {
+      const call = d.calls.find((c) => c.id === effectiveCallId || c.callId === effectiveCallId);
+      if (call) {
+        if (notes !== undefined) {
+          call.notes = String(notes);
+          (call as any).wrapUpNotes = String(notes);
+        }
+        if (disposition !== undefined) {
+          call.disposition = String(disposition);
+        }
+        if (tags && Array.isArray(tags)) {
+          (call as any).wrapUpTags = tags.map((t: any) => String(t).trim()).filter(Boolean);
+        }
+        (call as any).wrappedUpAt = now;
+        (call as any).wrapUpAgentName = agentUsername;
+        updatedCall = { ...call };
+        if (call.managerId) managerIdToNotify = call.managerId;
+        if (!resolvedAgentId && call.agentId) resolvedAgentId = call.agentId;
       }
-      if (disposition !== undefined) {
-        call.disposition = String(disposition);
+    }
+
+    // Atomically return agent back to AVAILABLE once wrap-up is saved (unless agent is manually OFFLINE or explicitly opted out)
+    if (completeWrapUp !== false && resolvedAgentId) {
+      const agt = d.agents.find((a) => a.id === resolvedAgentId);
+      if (agt) {
+        const hasOtherLiveCall = agt.currentCallId && agt.currentCallId !== effectiveCallId
+          ? d.calls.some((c) => c.id === agt.currentCallId && !c.endTime && ['BRIDGED', 'ANSWERED', 'RINGING'].includes(c.status))
+          : false;
+        if (!hasOtherLiveCall && agt.state !== 'OFFLINE') {
+          const prevState = agt.state;
+          agt.state = 'AVAILABLE';
+          agt.currentCallId = null;
+          agt.lastStateChange = now;
+          agentTransitionedToAvailable = true;
+          if (!managerIdToNotify && agt.managerId) managerIdToNotify = agt.managerId;
+
+          if (prevState !== 'AVAILABLE') {
+            d.agent_states.push({
+              id: `as_${Date.now()}`,
+              agentId: agt.id,
+              previousState: prevState,
+              newState: 'AVAILABLE',
+              timestamp: now,
+              reason: effectiveCallId ? `Wrap-up saved for call ${effectiveCallId}` : 'Wrap-up saved by agent',
+            });
+          }
+        }
       }
-      if (tags && Array.isArray(tags)) {
-        call.wrapUpTags = tags.map((t: any) => String(t).trim()).filter(Boolean);
-      }
-      call.wrappedUpAt = now;
-      call.wrapUpAgentName = agentUsername;
-      updatedCall = { ...call };
-      managerIdToNotify = call.managerId || '';
     }
   });
 
-  realtime.broadcast('call.notes_updated', {
-    callId,
-    notes,
-    disposition,
-    tags,
-    wrapUpAgentName: agentUsername,
-    updatedAt: now,
-  }, managerIdToNotify ? { managerId: managerIdToNotify } : undefined);
+  if (effectiveCallId) {
+    realtime.broadcast('call.notes_updated', {
+      callId: effectiveCallId,
+      notes,
+      disposition,
+      tags,
+      wrapUpAgentName: agentUsername,
+      updatedAt: now,
+    }, managerIdToNotify ? { managerId: managerIdToNotify } : undefined);
+  }
 
   if (updatedCall) {
     realtime.broadcast('call.updated', updatedCall, managerIdToNotify ? { managerId: managerIdToNotify } : undefined);
   }
 
-  res.json({ success: true, message: 'Wrap-up details saved successfully.', call: updatedCall });
+  if (agentTransitionedToAvailable && resolvedAgentId) {
+    realtime.broadcast('agent.state_changed', {
+      agentId: resolvedAgentId,
+      managerId: managerIdToNotify,
+      state: 'AVAILABLE',
+      currentCallId: null,
+    }, managerIdToNotify ? { managerId: managerIdToNotify } : undefined);
+
+    if (managerIdToNotify) {
+      setTimeout(() => {
+        telephony.processQueueForManager(managerIdToNotify).catch((e) =>
+          console.error('Error auto-dispatching queued call after wrap-up save:', e)
+        );
+      }, 100);
+    }
+  }
+
+  res.json({
+    success: true,
+    state: agentTransitionedToAvailable ? 'AVAILABLE' : undefined,
+    message: 'Wrap-up details saved successfully.',
+    call: updatedCall,
+  });
 });
 
 // Force-bridge an active or dialing call directly with agent station

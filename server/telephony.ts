@@ -1555,15 +1555,15 @@ class TelephonyEngine {
         );
       }
 
-      // Priority 3: Recover agents actively connected via SSE (even if stuck in stale WRAP-UP/RINGING with no live call)
+      // Priority 3: Only recover agents genuinely stuck in stale RINGING (with no live call for >15s),
+      // never hijack agents actively filling out WRAP-UP notes or manually paused in BUSY
       if (availableAgents.length === 0) {
         const onlineRecoverable = sortOnlineFirst(
-          managerAgents.filter(
-            (a) =>
-              a.state !== 'OFFLINE' &&
-              !hasLiveCall(a) &&
-              (realtime.hasActiveAgentClient(a.id) || a.state === 'WRAP-UP')
-          )
+          managerAgents.filter((a) => {
+            if (a.state !== 'RINGING' || hasLiveCall(a)) return false;
+            const lastMs = a.lastStateChange ? new Date(a.lastStateChange).getTime() : 0;
+            return !a.currentCallId || nowMs - lastMs > 15000;
+          })
         );
         if (onlineRecoverable.length > 0) {
           availableAgents = [onlineRecoverable[0]];
@@ -1586,9 +1586,11 @@ class TelephonyEngine {
       }
       if (availableAgents.length === 0) {
         const onlineRecoverable = sortOnlineFirst(
-          refreshedData.agents.filter(
-            (a) => a.enabled && a.state !== 'OFFLINE' && !hasLiveCall(a) && (realtime.hasActiveAgentClient(a.id) || a.state === 'WRAP-UP')
-          )
+          refreshedData.agents.filter((a) => {
+            if (!a.enabled || a.state !== 'RINGING' || hasLiveCall(a)) return false;
+            const lastMs = a.lastStateChange ? new Date(a.lastStateChange).getTime() : 0;
+            return !a.currentCallId || nowMs - lastMs > 15000;
+          })
         );
         if (onlineRecoverable.length > 0) {
           availableAgents = [onlineRecoverable[0]];
@@ -2071,6 +2073,7 @@ class TelephonyEngine {
 
     const endTime = new Date().toISOString();
     const duration = call.answerTime ? Math.round((new Date(endTime).getTime() - new Date(call.answerTime).getTime()) / 1000) : 0;
+    let transitionedAgentToWrapUp = false;
 
     await db.update((d) => {
       const c = d.calls.find((item) => item.id === callId);
@@ -2097,15 +2100,17 @@ class TelephonyEngine {
       // Handle agent state transition to WRAP-UP and release currentCallId lock cleanly
       if (c?.agentId) {
         const agt = d.agents.find((a) => a.id === c.agentId);
-        if (agt && (agt.state === 'BUSY' || agt.state === 'RINGING')) {
+        if (agt && agt.state !== 'OFFLINE' && (agt.state === 'BUSY' || agt.state === 'RINGING' || agt.currentCallId === callId)) {
+          const prevState = agt.state;
           agt.state = 'WRAP-UP';
           agt.currentCallId = null;
           agt.lastStateChange = new Date().toISOString();
+          transitionedAgentToWrapUp = true;
 
           d.agent_states.push({
             id: `as_${Date.now()}`,
             agentId: agt.id,
-            previousState: 'BUSY',
+            previousState: prevState,
             newState: 'WRAP-UP',
             timestamp: new Date().toISOString(),
             reason: `Call ${callId} ended`,
@@ -2129,7 +2134,7 @@ class TelephonyEngine {
     this.terminateAudioSession(callId);
     this.activeZadarmaCalls.delete(callId);
 
-    if (call.agentId) {
+    if (call.agentId && transitionedAgentToWrapUp) {
       realtime.broadcast('agent.state_changed', {
         agentId: call.agentId,
         managerId: targetMgrId,

@@ -82,6 +82,11 @@ export const AgentApp: React.FC = () => {
   const [wrapUpCall, setWrapUpCall] = useState<CallItem | null>(null);
   const wrapUpCallRef = useRef<CallItem | null>(null);
   wrapUpCallRef.current = wrapUpCall;
+  const lastEndedCallRef = useRef<CallItem | null>(null);
+  const lastWrappedUpCallIdRef = useRef<string | null>(null);
+  const agentProfileIdRef = useRef<string | null>(null);
+  const [isSavingWrapUp, setIsSavingWrapUp] = useState<boolean>(false);
+  const [wrapUpError, setWrapUpError] = useState<string | null>(null);
   const [selectedDisposition, setSelectedDisposition] = useState<string>('Customer Interested / Inquiry Handled');
   const [wrapUpTags, setWrapUpTags] = useState<string[]>(['Interested']);
   const [customTagInput, setCustomTagInput] = useState<string>('');
@@ -189,6 +194,9 @@ export const AgentApp: React.FC = () => {
 
   const activeCallRef = useRef<CallItem | null>(null);
   activeCallRef.current = activeCall;
+  if (activeCall) {
+    lastEndedCallRef.current = activeCall;
+  }
   const tokenRef = useRef<string | null>(token);
   tokenRef.current = token;
   const agentStateRef = useRef<'OFFLINE' | 'AVAILABLE' | 'RINGING' | 'BUSY' | 'WRAP-UP'>(agentState);
@@ -628,6 +636,9 @@ export const AgentApp: React.FC = () => {
       });
       if (!res.ok) return;
       const data = await res.json();
+      if (data.agent?.id) {
+        agentProfileIdRef.current = data.agent.id;
+      }
 
       // Prevent background polling from clobbering UI during 3-second auto-answer countdown
       if (isAutoAnsweringRef.current || autoAnswerSecondsLeftRef.current !== null) {
@@ -637,6 +648,7 @@ export const AgentApp: React.FC = () => {
       }
 
       if (data.activeCall && !data.activeCall.endTime) {
+        lastEndedCallRef.current = data.activeCall;
         setActiveCall(data.activeCall);
         const isIvr = data.activeCall.status === 'IVR_ACTIVE';
         const isAgentRinging =
@@ -648,7 +660,7 @@ export const AgentApp: React.FC = () => {
             setAgentState('AVAILABLE');
           }
         } else if (isAgentRinging) {
-          if (!isAutoAnsweringRef.current && autoAnswerSecondsLeftRef.current === null) {
+          if (!isAutoAnsweringRef.current && autoAnswerSecondsLeftRef.current === null && agentStateRef.current !== 'WRAP-UP' && !wrapUpCallRef.current) {
             start3SecondRingBeepAndAutoAnswer(data.activeCall.dtmfSequence || '1', data.activeCall.id, data.activeCall.managerId);
           }
         } else if (data.activeCall.status === 'BRIDGED' || data.activeCall.status === 'ANSWERED') {
@@ -666,12 +678,26 @@ export const AgentApp: React.FC = () => {
         // Call has ended or no active call exists: NEVER clobber WRAP-UP back to AVAILABLE during background polls!
         if (agentStateRef.current === 'WRAP-UP' || wrapUpCallRef.current) {
           setActiveCall(null);
+          if (!wrapUpCallRef.current && (data.wrapUpCall || lastEndedCallRef.current)) {
+            const recovered = data.wrapUpCall || lastEndedCallRef.current;
+            setWrapUpCall(recovered);
+            wrapUpCallRef.current = recovered;
+          }
           if (agentStateRef.current !== 'WRAP-UP') {
             setAgentState('WRAP-UP');
           }
         } else if (data.agent?.state === 'WRAP-UP') {
-          setActiveCall(null);
-          setAgentState('WRAP-UP');
+          const recovered = data.wrapUpCall || activeCallRef.current || lastEndedCallRef.current;
+          if (agentStateRef.current === 'BUSY' || agentStateRef.current === 'RINGING' || activeCallRef.current) {
+            handleCallEndedTransitionRef.current?.('Call ended. Enter call wrap-up & disposition below.', false, recovered);
+          } else {
+            setActiveCall(null);
+            if (recovered) {
+              setWrapUpCall(recovered);
+              wrapUpCallRef.current = recovered;
+            }
+            setAgentState('WRAP-UP');
+          }
         } else {
           setActiveCall(null);
           const nextState = data.agent?.state || 'AVAILABLE';
@@ -1022,12 +1048,12 @@ export const AgentApp: React.FC = () => {
       return;
     }
 
-    // 3. Availability Check: Never interrupt an OFFLINE station or an active live BUSY call
-    // (Allow AVAILABLE, RINGING, or stale WRAP-UP to transition cleanly into incoming call)
+    // 3. Availability Check: Never interrupt an OFFLINE station, an agent actively completing WRAP-UP, or an active live BUSY call
     const curCall = activeCallRef.current;
     const isActivelyOnLiveCall = curState === 'BUSY' && Boolean(curCall && !curCall.endTime && ['BRIDGED', 'ANSWERED'].includes(curCall.status));
-    if ((curState === 'OFFLINE' || isActivelyOnLiveCall) && !isAutoAnsweringRef.current) {
-      console.log(`[AGENT AUTO-ANSWER] Ignored: agent is ${curState} (active call=${Boolean(curCall)}).`);
+    const isInWrapUp = curState === 'WRAP-UP' || Boolean(wrapUpCallRef.current);
+    if ((curState === 'OFFLINE' || isInWrapUp || isActivelyOnLiveCall) && !isAutoAnsweringRef.current) {
+      console.log(`[AGENT AUTO-ANSWER] Ignored: agent is ${curState} (active call=${Boolean(curCall)}, wrapUp=${Boolean(wrapUpCallRef.current)}).`);
       return;
     }
 
@@ -1035,14 +1061,6 @@ export const AgentApp: React.FC = () => {
     isAutoAnsweringRef.current = true;
 
     console.log(`[AGENT AUTO-ANSWER] PSTN Receiver confirmed DTMF [${digit}]. Starting 3-second ring beep for available agent, then auto-connecting...`);
-
-    // Clear stale wrap-up UI if transitioning directly from wrap-up into a new incoming call
-    if (wrapUpCallRef.current || curState === 'WRAP-UP') {
-      setWrapUpCall(null);
-      wrapUpCallRef.current = null;
-      setWrapUpNotes('');
-      setWrapUpTags([]);
-    }
 
     stopIvrGreeting();
     stopRingBeepAudio();
@@ -1211,7 +1229,13 @@ export const AgentApp: React.FC = () => {
 
     const curCall = activeCallRef.current;
     const isActivelyOnLiveCall = curState === 'BUSY' && Boolean(curCall && !curCall.endTime && ['BRIDGED', 'ANSWERED'].includes(curCall.status));
-    if (curState === 'OFFLINE' || (isActivelyOnLiveCall && !isAutoAnsweringRef.current)) {
+    const isInWrapUp = curState === 'WRAP-UP' || Boolean(wrapUpCallRef.current);
+    const myAgentId = curUser?.agentId || agentProfileIdRef.current;
+
+    if ((latestIncomingCall as any).agentId && myAgentId && (latestIncomingCall as any).agentId !== myAgentId) {
+      return;
+    }
+    if (curState === 'OFFLINE' || isInWrapUp || (isActivelyOnLiveCall && !isAutoAnsweringRef.current)) {
       console.log(`[AGENT APP] Agent station is currently ${curState}, skipping incoming ring.`);
       return;
     }
@@ -1235,21 +1259,27 @@ export const AgentApp: React.FC = () => {
     const curState = agentStateRef.current;
     const curCall = activeCallRef.current;
     const isActivelyOnLiveCall = curState === 'BUSY' && Boolean(curCall && !curCall.endTime && ['BRIDGED', 'ANSWERED'].includes(curCall.status));
+    const isInWrapUp = curState === 'WRAP-UP' || Boolean(wrapUpCallRef.current);
+    const myAgentId = curUser?.agentId || agentProfileIdRef.current;
 
     if (curUser?.role !== 'agent') return;
     if (latestAgentEvent.managerId && curUser?.managerId && latestAgentEvent.managerId !== curUser.managerId) {
       return;
     }
+    // Strictly ignore events belonging to other agents under the same manager
+    if (latestAgentEvent.agentId && myAgentId && latestAgentEvent.agentId !== myAgentId) {
+      return;
+    }
 
     if (latestAgentEvent.type === 'incoming') {
-      if ((curState === 'OFFLINE' || isActivelyOnLiveCall) && !isAutoAnsweringRef.current) return;
+      if ((curState === 'OFFLINE' || isInWrapUp || isActivelyOnLiveCall) && !isAutoAnsweringRef.current) return;
       start3SecondRingBeepAndAutoAnswer(latestAgentEvent.dtmfDigit || '1', latestAgentEvent.callId, latestAgentEvent.managerId);
     } else if ((latestAgentEvent as any).type === 'dtmf.received') {
-      if ((curState === 'OFFLINE' || isActivelyOnLiveCall) && !isAutoAnsweringRef.current) return;
+      if ((curState === 'OFFLINE' || isInWrapUp || isActivelyOnLiveCall) && !isAutoAnsweringRef.current) return;
       start3SecondRingBeepAndAutoAnswer((latestAgentEvent as any).digit || '1', (latestAgentEvent as any).callId, (latestAgentEvent as any).managerId);
     } else if (latestAgentEvent.type === 'state_changed') {
       if (latestAgentEvent.state === 'RINGING') {
-        if (curState !== 'OFFLINE' && !isActivelyOnLiveCall && !isAutoAnsweringRef.current) {
+        if (curState !== 'OFFLINE' && !isInWrapUp && !isActivelyOnLiveCall && !isAutoAnsweringRef.current) {
           start3SecondRingBeepAndAutoAnswer(latestAgentEvent.dtmfDigit || '1', latestAgentEvent.currentCallId || latestAgentEvent.callId, latestAgentEvent.managerId);
         }
       } else if (latestAgentEvent.state === 'WRAP-UP') {
@@ -1273,6 +1303,7 @@ export const AgentApp: React.FC = () => {
           }
           setWrapUpCall(null);
           wrapUpCallRef.current = null;
+          lastEndedCallRef.current = null;
           setActiveCall(null);
         }
       }
@@ -1282,6 +1313,19 @@ export const AgentApp: React.FC = () => {
       latestAgentEvent.type === 'call.failed' ||
       latestAgentEvent.type === 'failed'
     ) {
+      // Ignore campaign/IVR call.ended events that did NOT belong to this agent
+      const eventCallId = latestAgentEvent.callId;
+      if (lastWrappedUpCallIdRef.current && eventCallId && lastWrappedUpCallIdRef.current === eventCallId && curState === 'AVAILABLE') {
+        return;
+      }
+      const matchesMyActiveCall = Boolean(curCall && eventCallId && (curCall.id === eventCallId || curCall.callId === eventCallId));
+      const isMyCallViaStateOrAgent = Boolean(
+        (latestAgentEvent.agentId && (!myAgentId || latestAgentEvent.agentId === myAgentId)) ||
+        (!latestAgentEvent.agentId && (curState === 'BUSY' || curState === 'RINGING' || isAutoAnsweringRef.current))
+      );
+      if (!matchesMyActiveCall && !isMyCallViaStateOrAgent) {
+        return;
+      }
       console.log('[AGENT APP] Received call ended event from carrier:', latestAgentEvent);
       handleCallEndedTransitionRef.current?.(latestAgentEvent.reason || 'Call ended. Enter call wrap-up & disposition below.', false);
     } else if (
@@ -2151,6 +2195,13 @@ export const AgentApp: React.FC = () => {
         body: JSON.stringify({ state: newState }),
       });
       if (res.ok) {
+        if (newState === 'AVAILABLE') {
+          wrapUpCallRef.current = null;
+          lastEndedCallRef.current = null;
+          setWrapUpCall(null);
+          setWrapUpError(null);
+        }
+        agentStateRef.current = newState;
         setAgentState(newState);
         setStatusMessage(`Status switched to ${newState}`);
         setTimeout(() => setStatusMessage(null), 3000);
@@ -2161,7 +2212,19 @@ export const AgentApp: React.FC = () => {
   };
 
   // Idempotent, rock-solid transition into WRAP-UP on call end (zero blinking / zero ping-pong)
-  const handleCallEndedTransition = (reasonMessage: string, notifyServer: boolean = false) => {
+  const handleCallEndedTransition = (reasonMessage: string, notifyServer: boolean = false, fallbackCall?: any) => {
+    const incomingId = fallbackCall?.id || activeCallRef.current?.id || latestAgentEvent?.callId;
+    if (
+      !notifyServer &&
+      agentStateRef.current === 'AVAILABLE' &&
+      !activeCallRef.current &&
+      !isAutoAnsweringRef.current &&
+      incomingId &&
+      lastWrappedUpCallIdRef.current === incomingId
+    ) {
+      return;
+    }
+
     stopRingtone();
     isAutoAnsweringRef.current = false;
     setAutoAnswerSecondsLeft(null);
@@ -2177,37 +2240,68 @@ export const AgentApp: React.FC = () => {
       keepAliveTimerRef.current = null;
     }
 
-    const endedCall = activeCallRef.current;
+    const endedCall =
+      activeCallRef.current ||
+      fallbackCall ||
+      lastEndedCallRef.current ||
+      wrapUpCallRef.current ||
+      (latestAgentEvent?.callId
+        ? {
+            id: latestAgentEvent.callId,
+            callId: latestAgentEvent.callId,
+            customerNumber: latestAgentEvent.customerNumber || 'PSTN Customer',
+            callerId: latestAgentEvent.callerId || '',
+            sipConnectionId: '',
+            startTime: latestAgentEvent.startTime || new Date().toISOString(),
+            durationSeconds: callDuration,
+            status: 'COMPLETED' as const,
+            dtmfSequence: '',
+          }
+        : null);
+
     if (endedCall) {
       setWrapUpCall(endedCall);
       wrapUpCallRef.current = endedCall;
+      lastEndedCallRef.current = endedCall;
     }
 
-    if (notifyServer && endedCall?.id && tokenRef.current) {
-      fetch('/api/agent/call-action', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          Authorization: `Bearer ${tokenRef.current}`,
-        },
-        body: JSON.stringify({
-          callId: endedCall.id,
-          action: 'END',
-          sessionId: activeSessionId || undefined,
-          reason: reasonMessage,
-        }),
-      }).catch(() => null);
+    if (notifyServer && tokenRef.current) {
+      if (endedCall?.id) {
+        fetch('/api/agent/call-action', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tokenRef.current}`,
+          },
+          body: JSON.stringify({
+            callId: endedCall.id,
+            action: 'END',
+            sessionId: activeSessionId || undefined,
+            reason: reasonMessage,
+          }),
+        }).catch(() => null);
+      } else {
+        fetch('/api/agent/state', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${tokenRef.current}`,
+          },
+          body: JSON.stringify({ state: 'WRAP-UP' }),
+        }).catch(() => null);
+      }
     }
 
+    activeCallRef.current = null;
     setActiveCall(null);
     setActiveSessionId(null);
     setIsOnHold(false);
     setIsMuted(false);
     setIsCustomerSpeaking(false);
     setCustomerSpokenMessage(null);
-    if (agentStateRef.current !== 'WRAP-UP') {
-      setAgentState('WRAP-UP');
-    }
+    setWrapUpError(null);
+    agentStateRef.current = 'WRAP-UP';
+    setAgentState('WRAP-UP');
     setStatusMessage(reasonMessage);
     setTimeout(() => setStatusMessage(null), 4000);
   };
@@ -2427,34 +2521,75 @@ export const AgentApp: React.FC = () => {
   disconnectRealPstnAudioRef.current = disconnectRealPstnAudio;
 
   const handleCompleteWrapUp = async () => {
-    const targetCall = wrapUpCallRef.current || wrapUpCall || activeCallRef.current || activeCall;
+    if (isSavingWrapUp) return;
+    const activeToken = tokenRef.current;
+    const targetCall = wrapUpCallRef.current || wrapUpCall || lastEndedCallRef.current || activeCallRef.current || activeCall;
     const targetCallId = targetCall?.id || targetCall?.callId;
 
-    if (targetCallId && token) {
-      try {
-        await fetch('/api/agent/call-notes', {
+    const extraTag = customTagInput.trim();
+    const finalTags = extraTag && !wrapUpTags.includes(extraTag) ? [...wrapUpTags, extraTag] : wrapUpTags;
+
+    setIsSavingWrapUp(true);
+    setWrapUpError(null);
+
+    try {
+      let backendTransitioned = false;
+      if (activeToken) {
+        const res = await fetch('/api/agent/call-notes', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${activeToken}` },
           body: JSON.stringify({
-            callId: targetCallId,
+            callId: targetCallId || undefined,
             notes: wrapUpNotes.trim(),
             disposition: selectedDisposition,
-            tags: wrapUpTags,
+            tags: finalTags,
+            completeWrapUp: true,
           }),
         });
-      } catch (e) {
-        console.warn('Save wrap-up notes warning:', e);
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          setWrapUpError(data.error || 'Failed to save wrap-up notes. Please try again.');
+          return;
+        }
+        backendTransitioned = data.state === 'AVAILABLE';
+        lastWrappedUpCallIdRef.current = targetCallId || data?.call?.id || null;
       }
+
+      wrapUpCallRef.current = null;
+      lastEndedCallRef.current = null;
+      activeCallRef.current = null;
+      setWrapUpNotes('');
+      setWrapUpTags(['Interested']);
+      setCustomTagInput('');
+      setSelectedDisposition('Customer Interested / Inquiry Handled');
+      setWrapUpCall(null);
+      setActiveCall(null);
+      setActiveCallDtmf([]);
+      setConversationHistory([]);
+      setIsMuted(false);
+      setIsOnHold(false);
+
+      if (!backendTransitioned) {
+        await handleStateChange('AVAILABLE');
+      } else {
+        agentStateRef.current = 'AVAILABLE';
+        setAgentState('AVAILABLE');
+        await fetchAgentStatus();
+      }
+
+      if (webrtcStatus === 'ERROR') {
+        webrtcAutoRetryCountRef.current = 0;
+        setWebrtcRetryNonce((n) => n + 1);
+      }
+
+      setStatusMessage('Call wrap-up & notes saved! Station is now AVAILABLE and ready for calls.');
+      setTimeout(() => setStatusMessage(null), 4000);
+    } catch (e: any) {
+      console.warn('Save wrap-up notes error:', e);
+      setWrapUpError(e?.message || 'Network error saving wrap-up. Please retry.');
+    } finally {
+      setIsSavingWrapUp(false);
     }
-    setWrapUpNotes('');
-    setWrapUpTags([]);
-    setWrapUpCall(null);
-    wrapUpCallRef.current = null;
-    setActiveCall(null);
-    setActiveCallDtmf([]);
-    await handleStateChange('AVAILABLE');
-    setStatusMessage('Call wrap-up & notes submitted to Manager Dashboard! Station available.');
-    setTimeout(() => setStatusMessage(null), 4000);
   };
 
   const handleSimulateIvrBridgeCall = async () => {
@@ -3415,12 +3550,21 @@ export const AgentApp: React.FC = () => {
               </div>
             </div>
 
+            {wrapUpError && (
+              <div className="bg-red-50 border border-red-200 text-red-700 text-xs rounded-xl p-3 flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+                <span>{wrapUpError}</span>
+              </div>
+            )}
+
             <button
+              type="button"
               onClick={handleCompleteWrapUp}
-              className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded-xl shadow-md transition-colors flex items-center justify-center gap-2 cursor-pointer active:scale-98"
+              disabled={isSavingWrapUp}
+              className="w-full py-3 bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 text-white font-bold text-xs rounded-xl shadow-md transition-colors flex items-center justify-center gap-2 cursor-pointer active:scale-98"
             >
               <CheckCircle className="w-4 h-4" />
-              <span>Save Call Notes & Submit to Manager Dashboard</span>
+              <span>{isSavingWrapUp ? 'Saving Wrap-Up...' : 'Save Wrap-Up & Return to AVAILABLE'}</span>
             </button>
           </div>
         )}
