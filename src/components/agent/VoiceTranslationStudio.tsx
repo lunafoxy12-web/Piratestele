@@ -345,7 +345,7 @@ export const VoiceTranslationStudio: React.FC<VoiceTranslationStudioProps> = ({
 
       const data = await res.json();
       if (res.ok || data.success) {
-        setStatusBanner(`Call dispatched! Zadarma carrier connecting with ${targetPhoneNumber}. Bridging audio stream...`);
+        setStatusBanner(`Call dispatched! Voice carrier connecting with ${targetPhoneNumber}. Bridging audio stream...`);
         onCallStateChange();
       } else {
         setStatusBanner(`Carrier dispatch notice: ${data.error || data.message || 'Call initiated'}`);

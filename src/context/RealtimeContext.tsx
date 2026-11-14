@@ -70,6 +70,10 @@ export const RealtimeProvider: React.FC<{ children: React.ReactNode }> = ({ chil
       try {
         const data = JSON.parse(e.data);
         setLiveDtmfEvents((prev) => [data, ...prev.slice(0, 49)]);
+        if (data?.action === 'TRANSFER_TO_AGENT' || (!data?.action && data?.digit === '1')) {
+          eventSeqRef.current += 1;
+          setLatestAgentEvent({ type: 'dtmf.received', ...data, _seq: eventSeqRef.current });
+        }
         setTriggerRefresh((prev) => prev + 1);
       } catch (err) {
         console.error('Error parsing DTMF event:', err);

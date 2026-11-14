@@ -3275,6 +3275,21 @@ router.post('/manager/campaigns/:id/run', authenticate, requireRole(['manager', 
     });
   });
 
+  // Pre-link manager's exact selected IVR sound to carrier scenario if already uploaded
+  if (campaign.routingType !== 'AI_VOICE_TRANSLATION' && campaign.ivrConfigId) {
+    const selectedIvr = data.ivr_configs.find((i) => i.id === campaign.ivrConfigId);
+    const zdAuth = getActiveZadarmaProvider(managerId);
+    if (selectedIvr?.zadarmaSoundId && zdAuth.apiKey && zdAuth.apiSecret) {
+      ZadarmaConnector.updateIvrScenario({
+        apiKey: zdAuth.apiKey,
+        apiSecret: zdAuth.apiSecret,
+        scenarioId: '6ac669ac99688ec02e009606',
+        soundId: selectedIvr.zadarmaSoundId,
+        greetingSoundId: selectedIvr.zadarmaSoundId,
+      }).catch(() => {});
+    }
+  }
+
   realtime.broadcast('campaign.progress', {
     campaignId: id,
     status: 'RUNNING',
@@ -3606,22 +3621,31 @@ router.get('/agent/me', authenticate, requireRole(['agent', 'admin', 'manager'])
       // Must belong strictly to this agent's manager
       if (c.managerId && agent!.managerId && c.managerId !== agent!.managerId) return false;
 
-      // Agent must be AVAILABLE (or already assigned to this call) to take a new call
-      if (agent!.state !== 'AVAILABLE' && agent!.currentCallId !== c.id) return false;
-
-      // For IVR campaign calls: customer MUST have pressed DTMF 1 (or direct translation) before agent rings
+      // For IVR campaign calls: customer MUST have pressed DTMF (or direct translation) before agent rings
       if (c.campaignId && !(c as any).isDirectTranslationCall && (!c.dtmfSequence || c.dtmfSequence.length === 0)) {
         return false;
       }
 
-      // Priority 1: Call already assigned to this specific agent
+      // Priority 1: Call already explicitly assigned to this specific agent (even if state lagged in WRAP-UP/AVAILABLE)
       if (c.agentId === agent!.id && ['BRIDGED', 'RINGING', 'DIALING', 'ANSWERED'].includes(c.status)) {
-        return true;
+        return agent!.state !== 'OFFLINE';
       }
 
-      // Priority 2: Unassigned call belonging to this manager that has bridged or is ready
+      // Priority 2: Unassigned call belonging to this manager that has bridged or is ready for AVAILABLE agent
       if (!c.agentId && c.managerId === agent!.managerId && ['BRIDGED', 'RINGING'].includes(c.status)) {
-        return true;
+        if (agent!.state === 'AVAILABLE') return true;
+        // Also recover unassigned live calls for non-offline agent stuck in WRAP-UP with no live call if no AVAILABLE online agent exists
+        if (agent!.state === 'WRAP-UP' && !agent!.currentCallId) {
+          const hasOtherFreeOnline = (data.agents || []).some(
+            (other) =>
+              other.id !== agent!.id &&
+              other.managerId === agent!.managerId &&
+              other.enabled &&
+              other.state === 'AVAILABLE' &&
+              realtime.hasActiveAgentClient(other.id)
+          );
+          return !hasOtherFreeOnline;
+        }
       }
 
       return false;
@@ -3949,7 +3973,6 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
     const ivr = camp?.ivrConfigId
       ? data.ivr_configs.find((i) => i.id === camp.ivrConfigId)
       : (data.ivr_configs.find((i) => i.managerId === call!.managerId) || data.ivr_configs[0]);
-    const isIvrCall = Boolean(call.campaignId && (call as any).routingType !== 'AI_VOICE_TRANSLATION');
 
     const ivrConfigPayload = ivr ? {
       id: ivr.id,
@@ -3962,11 +3985,43 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
       options: ivr.options || [],
     } : null;
 
-    // WebRTC Extension 100 media connection reached agent station.
-    // In Zadarma PBX scenario, Extension 100 is dialed when recipient presses DTMF 1 (or direct transfer).
     const effectiveDigit = String(digit || '1').trim();
+
+    // Idempotency: if this call is already bridged/answered with this agent, do NOT downgrade to RINGING or duplicate DTMF
+    if (['BRIDGED', 'ANSWERED'].includes(call.status) && call.agentId === agentId) {
+      return res.json({
+        success: true,
+        callId: call.id,
+        status: call.status,
+        isIvrCall: false,
+        dtmfDigit: call.dtmfSequence || effectiveDigit,
+        managerId: call.managerId,
+        ivrConfig: ivrConfigPayload,
+        agentId,
+        alreadyBridged: true,
+      });
+    }
+
+    // Idempotency: if already ringing for this exact call & agent with DTMF already recorded, do not append '11'
+    if (call.status === 'RINGING' && call.agentId === agentId && Boolean(call.dtmfSequence)) {
+      return res.json({
+        success: true,
+        callId: call.id,
+        status: 'RINGING',
+        isIvrCall: false,
+        dtmfDigit: call.dtmfSequence,
+        managerId: call.managerId,
+        ivrConfig: ivrConfigPayload,
+        agentId,
+        alreadyRinging: true,
+      });
+    }
+
     const existingSeq = call.dtmfSequence || '';
-    const newSeq = existingSeq ? `${existingSeq}${effectiveDigit}` : effectiveDigit;
+    const newSeq = existingSeq.includes(effectiveDigit) ? existingSeq : (existingSeq ? `${existingSeq}${effectiveDigit}` : effectiveDigit);
+    const hasRecentSameDtmf = (data.dtmf_events || []).some(
+      (e) => e.callId === call!.id && e.digit === effectiveDigit && Date.now() - new Date(e.timestamp || 0).getTime() < 15000
+    );
 
     await db.update((d) => {
       const c = d.calls.find((item) => item.id === call!.id);
@@ -3985,25 +4040,31 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
         agt.lastStateChange = now;
       }
 
-      d.dtmf_events.push({
-        id: `dtmf_${Date.now()}`,
-        callId: call!.id,
-        customerPhone: call!.customerNumber || caller || 'PSTN Caller',
-        digit: effectiveDigit,
-        timestamp: now,
-        timeOffsetMs: 0,
-        resultingAction: 'TRANSFER_TO_AGENT',
-        sequenceNumber: (d.dtmf_events.filter((e) => e.callId === call!.id).length || 0) + 1,
-      });
+      if (!hasRecentSameDtmf) {
+        d.dtmf_events.push({
+          id: `dtmf_${Date.now()}`,
+          callId: call!.id,
+          customerPhone: call!.customerNumber || caller || 'PSTN Caller',
+          digit: effectiveDigit,
+          timestamp: now,
+          timeOffsetMs: 0,
+          resultingAction: 'TRANSFER_TO_AGENT',
+          sequenceNumber: (d.dtmf_events.filter((e) => e.callId === call!.id).length || 0) + 1,
+        });
 
-      d.call_events.push({
-        id: `evt_dtmf_${Date.now()}`,
-        callId: call!.id,
-        type: 'dtmf.received',
-        timestamp: now,
-        details: { digit: effectiveDigit, target: 'HUMAN_AGENT' },
-      });
+        d.call_events.push({
+          id: `evt_dtmf_${Date.now()}`,
+          callId: call!.id,
+          type: 'dtmf.received',
+          timestamp: now,
+          details: { digit: effectiveDigit, target: 'HUMAN_AGENT' },
+        });
+      }
     });
+
+    const sseTarget = realtime.hasActiveAgentClient(agentId!)
+      ? { role: 'agent', managerId: call.managerId, agentId }
+      : { role: 'agent', managerId: call.managerId };
 
     realtime.broadcast('agent.incoming_call', {
       callId: call.id,
@@ -4017,7 +4078,15 @@ router.post('/agent/webrtc-incoming', authenticate, requireRole(['agent', 'admin
       isTransferredFromIvr: true,
       transferReason: `Customer pressed DTMF ${effectiveDigit} in IVR menu`,
       dtmfSequence: newSeq,
-    }, { role: 'agent', managerId: call.managerId });
+    }, sseTarget);
+
+    realtime.broadcast('agent.state_changed', {
+      agentId,
+      managerId: call.managerId,
+      state: 'RINGING',
+      currentCallId: call.id,
+      dtmfDigit: effectiveDigit,
+    }, sseTarget);
 
     return res.json({
       success: true,

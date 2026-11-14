@@ -925,48 +925,118 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
   const destinationNumber = payload.called_did || payload.to || payload.destination;
 
   const data = db.get();
-  // Correlate with active call in database using normalized digits (last 10 digits)
-  const cleanDigits = (s?: string) => (s ? String(s).replace(/\D/g, '').slice(-10) : '');
-  const callerDigits = cleanDigits(callerNumber);
-  const destDigits = cleanDigits(destinationNumber);
 
-  let call = data.calls.find((c) => {
-    if (pbxCallId && (c.callSid === pbxCallId || c.id === pbxCallId)) return true;
-    return false;
+  // Build set of our own carrier DIDs so we NEVER match an outbound caller_id DID to unrelated historical calls
+  const ownDidDigits = new Set<string>(['8045930160']);
+  (data.sip_numbers || []).forEach((n) => {
+    const d = String(n.phoneNumber || '').replace(/\D/g, '').slice(-10);
+    if (d.length >= 7) ownDidDigits.add(d);
+  });
+  (data.voip_api_providers || []).forEach((p) => {
+    const d = String(p.defaultCallerId || '').replace(/\D/g, '').slice(-10);
+    if (d.length >= 7) ownDidDigits.add(d);
   });
 
-  if (!call) {
-    // Prioritize active, non-completed call matching the phone number
-    call = data.calls.find((c) => {
-      if (['COMPLETED', 'FAILED'].includes(c.status) && c.endTime) return false;
-      const cCustDigits = cleanDigits(c.customerNumber);
-      const cFromDigits = cleanDigits(c.callerId);
-      if (callerDigits && (cCustDigits === callerDigits || cFromDigits === callerDigits)) return true;
-      if (destDigits && (cCustDigits === destDigits || cFromDigits === destDigits)) return true;
-      return false;
+  const cleanCustDigits = (s?: string) => {
+    if (!s) return '';
+    const raw = String(s).replace(/\D/g, '');
+    // Ignore short internal extensions (e.g. '0', '100', '12707')
+    if (raw.length < 7) return '';
+    const last10 = raw.slice(-10);
+    // Ignore our own DID numbers
+    if (ownDidDigits.has(last10)) return '';
+    return last10;
+  };
+
+  const callerDigits = cleanCustDigits(callerNumber);
+  const destDigits = cleanCustDigits(destinationNumber);
+
+  const isTerminalEvent = ['NOTIFY_END', 'NOTIFY_OUT_END', 'NOTIFY_RECORD'].includes(event);
+  const isLiveEvent = ['NOTIFY_START', 'NOTIFY_OUT_START', 'NOTIFY_ANSWER', 'NOTIFY_IVR', 'NOTIFY_DTMF', 'NOTIFY_INTERNAL'].includes(event);
+  const terminalStatuses = new Set(['COMPLETED', 'FAILED', 'CANCELLED', 'NO_ANSWER', 'BUSY']);
+  const isActiveCall = (c: any) => !c.endTime && !terminalStatuses.has(c.status);
+
+  // Sort newest calls first so correlation always favors the live call
+  const callsNewestFirst = [...data.calls].sort(
+    (a, b) => new Date(b.startTime || 0).getTime() - new Date(a.startTime || 0).getTime()
+  );
+
+  // 1. Exact PBX Call ID match (active call first, then recent call within 30 mins)
+  let call = pbxCallId
+    ? callsNewestFirst.find((c) => isActiveCall(c) && (c.callSid === pbxCallId || c.id === pbxCallId || (c as any).pbxCallId === pbxCallId)) ||
+      callsNewestFirst.find((c) => {
+        const ageMs = Date.now() - new Date(c.startTime || 0).getTime();
+        return ageMs <= 30 * 60 * 1000 && (c.callSid === pbxCallId || c.id === pbxCallId || (c as any).pbxCallId === pbxCallId);
+      })
+    : undefined;
+
+  // 2. Active non-completed call matching actual customer phone number (never match c.callerId!)
+  if (!call && (callerDigits || destDigits)) {
+    call = callsNewestFirst.find((c) => {
+      if (!isActiveCall(c)) return false;
+      const rawCust = String(c.customerNumber || '').replace(/\D/g, '');
+      const cCustDigits = rawCust.length >= 7 ? rawCust.slice(-10) : '';
+      if (!cCustDigits) return false;
+      return Boolean((callerDigits && cCustDigits === callerDigits) || (destDigits && cCustDigits === destDigits));
     });
   }
 
-  if (!call) {
-    // Fallback to any matching call record
-    call = data.calls.find((c) => {
-      const cCustDigits = cleanDigits(c.customerNumber);
-      const cFromDigits = cleanDigits(c.callerId);
-      if (callerDigits && (cCustDigits === callerDigits || cFromDigits === callerDigits)) return true;
-      if (destDigits && (cCustDigits === destDigits || cFromDigits === destDigits)) return true;
-      return false;
+  // 3. For live events (e.g. NOTIFY_INTERNAL / NOTIFY_IVR where carrier sends internal ext 100 or masks customer digits),
+  // correlate to the newest active Zadarma call started within the last 10 minutes
+  if (!call && isLiveEvent) {
+    call = callsNewestFirst.find((c) => {
+      if (!isActiveCall(c)) return false;
+      const ageMs = Date.now() - new Date(c.startTime || 0).getTime();
+      if (ageMs > 10 * 60 * 1000) return false;
+      return Boolean(
+        c.sipConnectionId?.includes('zadarma') ||
+        c.sipConnectionId?.includes('voip_zd') ||
+        String(c.callSid || '').startsWith('zd_') ||
+        String(c.callerId || '').includes('8045930160')
+      );
     });
   }
 
-  // If this is an incoming inbound call to Zadarma virtual number not yet recorded in db.calls
-  if (!call && (callerNumber || destinationNumber || pbxCallId)) {
+  // 4. Strictly for terminal events (NOTIFY_END / NOTIFY_OUT_END / NOTIFY_RECORD), allow matching a recently ended call within 15 minutes
+  if (!call && isTerminalEvent && (callerDigits || destDigits)) {
+    call = callsNewestFirst.find((c) => {
+      const ageMs = Date.now() - new Date(c.startTime || 0).getTime();
+      if (ageMs > 15 * 60 * 1000) return false;
+      const rawCust = String(c.customerNumber || '').replace(/\D/g, '');
+      const cCustDigits = rawCust.length >= 7 ? rawCust.slice(-10) : '';
+      if (!cCustDigits) return false;
+      return Boolean((callerDigits && cCustDigits === callerDigits) || (destDigits && cCustDigits === destDigits));
+    });
+  }
+
+  // Resolve a concrete managerId if we need to create an inbound fallback call
+  const resolveFallbackManagerId = (): string => {
+    const destRaw = String(destinationNumber || '').replace(/\D/g, '').slice(-10);
+    if (destRaw.length >= 7) {
+      const matchedNum = (data.sip_numbers || []).find((n) => String(n.phoneNumber || '').replace(/\D/g, '').slice(-10) === destRaw);
+      if (matchedNum?.assignedManagerId) return matchedNum.assignedManagerId;
+    }
+    const runningCamp = (data.campaigns || []).find((c) => c.status === 'RUNNING' && c.managerId);
+    if (runningCamp?.managerId) return runningCamp.managerId;
+    const onlineAgentIds = realtime.getOnlineAgentIds();
+    if (onlineAgentIds.length > 0) {
+      const onlineAgt = (data.agents || []).find((a) => onlineAgentIds.includes(a.id) && a.managerId);
+      if (onlineAgt?.managerId) return onlineAgt.managerId;
+    }
+    return data.managers?.[0]?.id || 'mgr_alpha';
+  };
+
+  // If this is a genuinely new incoming call (not a late terminal cleanup for an unknown dead call)
+  if (!call && !isTerminalEvent && (callerNumber || destinationNumber || pbxCallId)) {
     const newCallId = `call_zd_in_${Date.now()}`;
     const callerNum = callerNumber || 'Inbound Caller';
     const didNum = destinationNumber || '+18045930160';
+    const fallbackMgrId = resolveFallbackManagerId();
 
     const newCall: any = {
       id: newCallId,
       callId: newCallId,
+      managerId: fallbackMgrId,
       customerNumber: callerNum,
       callerId: didNum,
       sipConnectionId: 'sip_conn_zadarma',
@@ -975,6 +1045,7 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
       durationSeconds: 0,
       dtmfSequence: '',
       callSid: pbxCallId || `zd_${Date.now()}`,
+      pbxCallId: pbxCallId || undefined,
     };
 
     await db.update((d) => {
@@ -984,31 +1055,53 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
         callId: newCallId,
         type: 'call.inbound',
         timestamp: new Date().toISOString(),
-        details: { callerNumber: callerNum, did: didNum, pbxCallId },
+        details: { callerNumber: callerNum, did: didNum, pbxCallId, managerId: fallbackMgrId },
       });
     });
 
     call = newCall;
-    realtime.broadcast('call.created', newCall);
-    console.log(`[ZADARMA INBOUND] Created active inbound call record ${newCallId} for ${callerNum}`);
+    realtime.broadcast('call.created', newCall, { managerId: fallbackMgrId });
+    console.log(`[ZADARMA INBOUND] Created active inbound call record ${newCallId} for ${callerNum} (Manager: ${fallbackMgrId})`);
+  }
+
+  // Persist pbxCallId across every webhook event for future correlation
+  if (call && pbxCallId) {
+    await db.update((d) => {
+      const target = d.calls.find((c) => c.id === call!.id);
+      if (target) {
+        (target as any).pbxCallId = pbxCallId;
+        if (!target.callSid || target.callSid.startsWith('zd_')) {
+          target.callSid = pbxCallId;
+        }
+      }
+    });
   }
 
   switch (event) {
     case 'NOTIFY_START':
     case 'NOTIFY_OUT_START': {
       if (call) {
+        let nextStatus = call.status;
         await db.update((d) => {
           const target = d.calls.find((c) => c.id === call!.id);
           if (target) {
-            target.status = 'RINGING';
+            // Keep status as DIALING (PSTN ringing) so agent RINGING / NOTIFY_INTERNAL are never blocked
+            if (!target.status || target.status === 'QUEUED') {
+              target.status = 'DIALING';
+            }
+            nextStatus = target.status;
             target.sipResponseCode = 180;
-            target.sipResponseText = '180 Ringing (Zadarma Carrier)';
-            if (pbxCallId) target.callSid = pbxCallId;
+            target.sipResponseText = '180 Ringing (Carrier PSTN Ringing)';
+            if (pbxCallId) {
+              target.callSid = pbxCallId;
+              (target as any).pbxCallId = pbxCallId;
+            }
           }
         });
         realtime.broadcast('call.ringing', {
           callId: call.id,
-          status: 'RINGING',
+          status: nextStatus,
+          carrierStage: 'PSTN_RINGING',
           customerNumber: call.customerNumber,
         }, { managerId: call.managerId });
       }
@@ -1017,7 +1110,7 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
 
     case 'NOTIFY_ANSWER': {
       if (call) {
-        const answerTime = new Date().toISOString();
+        const answerTime = call.answerTime || new Date().toISOString();
         let shouldBridgeImmediately = false;
         await db.update((d) => {
           const target = d.calls.find((c) => c.id === call!.id);
@@ -1026,17 +1119,29 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
           // For IVR campaigns, DO NOT bridge immediately: wait for customer to hear IVR voice and press DTMF key!
           shouldBridgeImmediately = isAiTranslation || (!target?.campaignId && Boolean((target as any)?.isDirectTranslationCall));
           if (target) {
-            target.status = isAiTranslation ? 'ANSWERED' : 'IVR_ACTIVE';
-            target.answerTime = answerTime;
+            const alreadyWithAgent = Boolean(target.agentId && ['RINGING', 'BRIDGED'].includes(target.status));
+            if (!alreadyWithAgent) {
+              target.status = isAiTranslation ? 'ANSWERED' : 'IVR_ACTIVE';
+            }
+            if (!target.answerTime) {
+              target.answerTime = answerTime;
+            }
             target.sipResponseCode = 200;
-            target.sipResponseText = isAiTranslation ? '200 OK (AI Translation Bridge Active)' : '200 OK (PSTN Recipient Answered - Playing IVR Voice)';
+            target.sipResponseText = isAiTranslation
+              ? '200 OK (AI Translation Bridge Active)'
+              : '200 OK (PSTN Recipient Answered - Playing IVR Voice)';
+            if (pbxCallId) {
+              (target as any).pbxCallId = pbxCallId;
+            }
           }
           const contact = d.campaign_contacts.find((c) => c.callId === call!.id);
-          if (contact) contact.status = 'ANSWERED';
-          if (target?.campaignId && camp) {
+          if (contact && contact.status !== 'COMPLETED') contact.status = 'ANSWERED';
+          if (target?.campaignId && camp && !call!.answerTime) {
             camp.answeredCount = (camp.answeredCount || 0) + 1;
           }
         });
+
+        telephony.markZadarmaCallAnswered(call.id);
 
         // Only bridge immediately if this is an AI Translation call (Zero-IVR)
         if (shouldBridgeImmediately) {
@@ -1056,32 +1161,56 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
     }
 
     case 'NOTIFY_INTERNAL': {
-      // Zadarma PBX forwarded/routed call to internal extension (e.g. 100)
+      // Zadarma PBX forwarded/routed call to internal extension (e.g. 100) after IVR DTMF
       console.log(`[ZADARMA NOTIFY_INTERNAL] Call routed to internal extension ${payload.internal || ''}.`);
       if (call) {
-        const alreadyTransferred = Boolean(call.dtmfSequence) || ['RINGING', 'BRIDGED', 'COMPLETED', 'FAILED'].includes(call.status);
+        const freshCall = db.get().calls.find((c) => c.id === call!.id) || call;
+        const alreadyTransferred =
+          Boolean(freshCall.dtmfSequence) ||
+          ['BRIDGED', 'COMPLETED', 'FAILED', 'CANCELLED', 'NO_ANSWER'].includes(freshCall.status) ||
+          (freshCall.status === 'RINGING' && Boolean(freshCall.agentId));
         if (!alreadyTransferred) {
-          const internalDigit = String(payload.dtmf || payload.dtmf_key || payload.digit || '1').trim();
-          console.log(`[ZADARMA NOTIFY_INTERNAL] Caller routed to extension ${payload.internal || '100'}. Triggering agent transfer.`);
-          await telephony.handleDtmfInput(call.id, internalDigit);
+          const internalDigit = String(payload.dtmf || payload.dtmf_key || payload.digit || payload.push_button || '1').trim();
+          console.log(`[ZADARMA NOTIFY_INTERNAL] Caller routed to extension ${payload.internal || '100'}. Triggering agent transfer for call ${freshCall.id}.`);
+          await telephony.handleDtmfInput(freshCall.id, internalDigit);
+        } else {
+          console.log(`[ZADARMA NOTIFY_INTERNAL] Call ${freshCall.id} already transferred/bridged (status=${freshCall.status}, agentId=${freshCall.agentId || 'none'}).`);
         }
       }
       break;
     }
 
     case 'NOTIFY_IVR': {
-      // Callee pressed a key in Zadarma PBX IVR Voice Menu!
-      const ivrDigit = String(payload.dtmf || payload.dtmf_key || payload.digit || payload.push_button || '1').trim();
-      console.log(`[ZADARMA NOTIFY_IVR] Caller pressed IVR key: ${ivrDigit} on call: ${call?.id || pbxCallId}`);
-      if (call) {
+      const rawDigit = payload.dtmf ?? payload.dtmf_key ?? payload.digit ?? payload.push_button;
+      const hasExplicitDigit = rawDigit !== undefined && rawDigit !== null && String(rawDigit).trim() !== '';
+      if (call && hasExplicitDigit) {
+        const ivrDigit = String(rawDigit).trim();
+        console.log(`[ZADARMA NOTIFY_IVR] Caller pressed IVR key: ${ivrDigit} on call: ${call.id}`);
         await telephony.handleDtmfInput(call.id, ivrDigit);
+      } else if (call) {
+        // Zadarma sends NOTIFY_IVR without digit when entering IVR playback
+        console.log(`[ZADARMA NOTIFY_IVR] IVR menu started on call ${call.id} (awaiting DTMF key).`);
+        const nowIso = new Date().toISOString();
+        await db.update((d) => {
+          const target = d.calls.find((c) => c.id === call!.id);
+          if (target) {
+            if (!target.answerTime) target.answerTime = nowIso;
+            if (['DIALING', 'QUEUED'].includes(target.status)) {
+              target.status = 'IVR_ACTIVE';
+              target.sipResponseCode = 200;
+              target.sipResponseText = '200 OK (PSTN Recipient Answered - Playing IVR Voice)';
+            }
+          }
+        });
+        telephony.markZadarmaCallAnswered(call.id);
       }
       break;
     }
 
     case 'NOTIFY_DTMF': {
       // Real DTMF Key detected from PSTN phone!
-      const digit = String(payload.dtmf || payload.dtmf_key || payload.digit || '1').trim();
+      const rawDigit = payload.dtmf ?? payload.dtmf_key ?? payload.digit;
+      const digit = rawDigit !== undefined && rawDigit !== null && String(rawDigit).trim() !== '' ? String(rawDigit).trim() : '1';
       console.log(`[ZADARMA DTMF DETECTED] Customer pressed key: ${digit} on call: ${call?.id || pbxCallId}`);
 
       if (call) {
@@ -1096,7 +1225,7 @@ zadarmaRouter.all(['/webhook', '/events', '/notifications'], async (req: Request
       if (call) {
         const duration = parseInt(String(payload.duration || '0'), 10);
         const disposition = String(payload.disposition || 'answered').toLowerCase();
-        const reason = `Zadarma Clearance: ${disposition} (Duration: ${duration}s)`;
+        const reason = `Carrier Clearance: ${disposition} (Duration: ${duration}s)`;
 
         await telephony.endCall(call.id, disposition === 'answered' ? 'COMPLETED' : 'FAILED', reason);
       }

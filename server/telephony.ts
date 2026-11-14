@@ -378,7 +378,7 @@ class TelephonyEngine {
 
         for (const item of calls) {
           const dbCall = db.get().calls.find((c) => c.id === item.callId);
-          if (!dbCall || ['COMPLETED', 'FAILED', 'BUSY', 'NO_ANSWER'].includes(dbCall.status)) {
+          if (!dbCall || ['COMPLETED', 'FAILED', 'BUSY', 'NO_ANSWER', 'CANCELLED'].includes(dbCall.status)) {
             this.activeZadarmaCalls.delete(item.callId);
             continue;
           }
@@ -426,16 +426,16 @@ class TelephonyEngine {
               const campaign = item.campaignId ? d.campaigns.find((c) => c.id === item.campaignId) : null;
               isAiTranslation = Boolean((call as any)?.isDirectTranslationCall || campaign?.routingType === 'AI_VOICE_TRANSLATION');
 
-              if (call && (call.status === 'DIALING' || call.status === 'RINGING')) {
+              if (call && (call.status === 'DIALING' || (call.status === 'RINGING' && !call.agentId && !call.dtmfSequence))) {
                 call.status = isAiTranslation ? 'ANSWERED' : 'IVR_ACTIVE';
-                call.answerTime = new Date().toISOString();
+                call.answerTime = call.answerTime || new Date().toISOString();
                 call.sipResponseCode = 200;
                 call.sipResponseText = isAiTranslation ? '200 OK (AI Translation Bridge Active)' : '200 OK (PSTN Recipient Answered - Playing IVR Voice)';
               }
               if (contact && (contact.status === 'DIALING' || contact.status === 'RINGING')) {
                 contact.status = 'ANSWERED';
               }
-              if (campaign) {
+              if (campaign && !call?.answerTime) {
                 campaign.answeredCount = (campaign.answeredCount || 0) + 1;
               }
             });
@@ -933,11 +933,11 @@ class TelephonyEngine {
       const sipLogin = targetProv.sipLogin || '12707';
       const pbxExt = targetProv.pbxExtension || undefined;
 
-      // Check if any agent assigned to this campaign has a direct physical phone number
-      const assignedAgent = (data.agents || []).find((a) => a.managerId === campaign.managerId && a.enabled && a.phoneNumber);
-      const operatorPhone = assignedAgent?.phoneNumber || undefined;
-
       const isAiTranslationMode = campaign.routingType === 'AI_VOICE_TRANSLATION';
+      // Strictly ONLY use direct operator phone bridging for non-IVR AI Translation mode;
+      // IVR campaigns MUST dial PBX Menu '0' -> play manager IVR voice -> DTMF -> Extension 100 WebRTC!
+      const assignedAgent = (data.agents || []).find((a) => a.managerId === campaign.managerId && a.enabled && a.phoneNumber);
+      const operatorPhone = isAiTranslationMode ? (assignedAgent?.phoneNumber || undefined) : undefined;
       console.log(`[ZADARMA DISPATCH] Placing real PSTN call to ${contact.phoneNumber} (Mode: ${isAiTranslationMode ? 'AI Voice Translation Bot (Zero-IVR)' : 'IVR Menu -> Direct Agent'})...`);
 
       // Ensure manager's exact IVR sound is linked to Zadarma Cloud PBX Scenario so the PSTN caller hears it
@@ -1350,7 +1350,30 @@ class TelephonyEngine {
     if (!call) return { success: false, action: 'NONE', message: 'Call not found.' };
 
     const campaign = call.campaignId ? data.campaigns.find((c) => c.id === call.campaignId) : null;
-    const ivr = campaign ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId) : data.ivr_configs[0];
+    const ivr = (campaign?.ivrConfigId ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId) : null) || data.ivr_configs.find((i) => i.managerId === call.managerId) || data.ivr_configs[0];
+
+    // Deduplicate identical webhook bursts (e.g. NOTIFY_INTERNAL + NOTIFY_IVR arriving within 8s for same keypress)
+    const nowMs = Date.now();
+    const recentSameDtmf = (data.dtmf_events || []).find(
+      (e) =>
+        e.callId === callId &&
+        e.digit === digit &&
+        nowMs - new Date(e.timestamp || 0).getTime() < 8000
+    );
+    if (recentSameDtmf) {
+      let transferResult: any = null;
+      if (recentSameDtmf.resultingAction?.startsWith('TRANSFER_TO_AGENT') && !['BRIDGED', 'RINGING'].includes(call.status)) {
+        transferResult = await this.initiateAgentTransfer(callId, call.managerId);
+      } else if (recentSameDtmf.resultingAction?.startsWith('TRANSFER_TO_AGENT') && !call.agentId) {
+        transferResult = await this.initiateAgentTransfer(callId, call.managerId);
+      }
+      return {
+        success: true,
+        action: recentSameDtmf.resultingAction?.split(':')[0] || 'TRANSFER_TO_AGENT',
+        message: `DTMF ${digit} already processed cleanly.`,
+        transferResult,
+      };
+    }
 
     const currentSequence = (call.dtmfSequence || '') + digit;
     const seqNum = currentSequence.length;
@@ -1501,34 +1524,46 @@ class TelephonyEngine {
       return Boolean(c && !c.endTime && ['BRIDGED', 'ANSWERED'].includes(c.status));
     };
 
+    const sortOnlineFirst = (list: Agent[]) =>
+      [...list].sort((a, b) => {
+        const aOnline = realtime.hasActiveAgentClient(a.id) ? 1 : 0;
+        const bOnline = realtime.hasActiveAgentClient(b.id) ? 1 : 0;
+        if (aOnline !== bOnline) return bOnline - aOnline;
+        return new Date(b.lastStateChange || 0).getTime() - new Date(a.lastStateChange || 0).getTime();
+      });
+
     if (targetManagerId) {
       // Find all enabled agents belonging to this specific manager
       const managerAgents = refreshedData.agents.filter(
         (a) => a.managerId === targetManagerId && a.enabled
       );
 
-      // Priority 1: If call already had a specific agent assigned from this manager and they are available or ringing for this exact call
+      // Priority 1: If call already had a specific agent assigned from this manager and they are available or actively online
       if (freshCall.agentId) {
         const assigned = managerAgents.find((a) => a.id === freshCall.agentId);
-        if (assigned && (assigned.state === 'AVAILABLE' || assigned.currentCallId === freshCall.id)) {
+        if (assigned && (assigned.state === 'AVAILABLE' || assigned.currentCallId === freshCall.id) && (realtime.hasActiveAgentClient(assigned.id) || !managerAgents.some((m) => m.state === 'AVAILABLE' && realtime.hasActiveAgentClient(m.id)))) {
           availableAgents = [assigned];
         }
       }
 
-      // Priority 2: Any currently free or AVAILABLE agent created by this manager
+      // Priority 2: Any currently free AVAILABLE agent created by this manager (online SSE clients strictly prioritized first!)
       if (availableAgents.length === 0) {
-        availableAgents = managerAgents.filter(
-          (a) => a.state === 'AVAILABLE' && (!a.currentCallId || a.currentCallId === callId)
+        availableAgents = sortOnlineFirst(
+          managerAgents.filter(
+            (a) => a.state === 'AVAILABLE' && (!a.currentCallId || a.currentCallId === callId)
+          )
         );
       }
 
-      // Priority 3: Prefer agents actively connected via SSE (even if stuck in stale WRAP-UP/RINGING with no live call)
+      // Priority 3: Recover agents actively connected via SSE (even if stuck in stale WRAP-UP/RINGING with no live call)
       if (availableAgents.length === 0) {
-        const onlineRecoverable = managerAgents.filter(
-          (a) =>
-            a.state !== 'OFFLINE' &&
-            !hasLiveCall(a) &&
-            (realtime.hasActiveAgentClient(a.id) || a.state === 'WRAP-UP')
+        const onlineRecoverable = sortOnlineFirst(
+          managerAgents.filter(
+            (a) =>
+              a.state !== 'OFFLINE' &&
+              !hasLiveCall(a) &&
+              (realtime.hasActiveAgentClient(a.id) || a.state === 'WRAP-UP')
+          )
         );
         if (onlineRecoverable.length > 0) {
           availableAgents = [onlineRecoverable[0]];
@@ -1543,9 +1578,21 @@ class TelephonyEngine {
         }
       }
       if (availableAgents.length === 0) {
-        availableAgents = refreshedData.agents.filter(
-          (a) => a.enabled && a.state === 'AVAILABLE' && (!a.currentCallId || a.currentCallId === callId)
+        availableAgents = sortOnlineFirst(
+          refreshedData.agents.filter(
+            (a) => a.enabled && a.state === 'AVAILABLE' && (!a.currentCallId || a.currentCallId === callId)
+          )
         );
+      }
+      if (availableAgents.length === 0) {
+        const onlineRecoverable = sortOnlineFirst(
+          refreshedData.agents.filter(
+            (a) => a.enabled && a.state !== 'OFFLINE' && !hasLiveCall(a) && (realtime.hasActiveAgentClient(a.id) || a.state === 'WRAP-UP')
+          )
+        );
+        if (onlineRecoverable.length > 0) {
+          availableAgents = [onlineRecoverable[0]];
+        }
       }
     }
 
@@ -1628,6 +1675,11 @@ class TelephonyEngine {
     });
 
     // Alert available agent browser of this specific manager via SSE
+    const isSelectedOnline = realtime.hasActiveAgentClient(selectedAgent.id);
+    const sseTarget = isSelectedOnline
+      ? { role: 'agent', managerId: targetManagerId, agentId: selectedAgent.id }
+      : { role: 'agent', managerId: targetManagerId };
+
     realtime.broadcast('agent.incoming_call', {
       callId,
       agentId: selectedAgent.id,
@@ -1636,17 +1688,18 @@ class TelephonyEngine {
       callerId: call.callerId,
       startTime: call.startTime,
       directHumanCall: true,
-      dtmfDigit: call.dtmfSequence || '1',
+      dtmfDigit: freshCall.dtmfSequence || call.dtmfSequence || '1',
       isTransferredFromIvr: true,
       transferReason: 'PSTN caller pressed DTMF 1 in IVR menu',
-    }, { role: 'agent', managerId: targetManagerId });
+    }, sseTarget);
 
     realtime.broadcast('agent.state_changed', {
       agentId: selectedAgent.id,
       managerId: targetManagerId,
       state: 'RINGING',
       currentCallId: callId,
-    }, { role: 'agent', managerId: targetManagerId });
+      dtmfDigit: freshCall.dtmfSequence || call.dtmfSequence || '1',
+    }, sseTarget);
 
     return {
       success: true,
