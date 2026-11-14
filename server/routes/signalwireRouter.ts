@@ -194,12 +194,15 @@ signalwireRouter.all('/call-laml', (req: Request, res: Response) => {
 
   const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
   const dtmfUrl = `${appUrl}/api/signalwire/dtmf?callId=${encodeURIComponent(callId)}`;
+  const publicAudioUrl = ivr?.audioUrl
+    ? (/^https?:\/\//i.test(ivr.audioUrl) ? ivr.audioUrl : `${appUrl}/api/ivr-audio/${encodeURIComponent(ivr.id)}`)
+    : null;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
   <Gather numDigits="1" timeout="10" action="${escapeXml(dtmfUrl)}" method="POST">
-    ${ivr?.audioUrl ? `<Play>${escapeXml(ivr.audioUrl)}</Play>` : `<Say voice="alice">${escapeXml(greeting)}</Say>`}
+    ${publicAudioUrl ? `<Play>${escapeXml(publicAudioUrl)}</Play>` : `<Say voice="alice">${escapeXml(greeting)}</Say>`}
     <Say voice="alice">Press 1 to speak with an agent, or 2 to repeat this greeting.</Say>
   </Gather>
   <Say voice="alice">No key was detected. Goodbye.</Say>
@@ -285,10 +288,15 @@ signalwireRouter.post('/dtmf', async (req: Request, res: Response) => {
   } else if (action === 'REPEAT_MENU') {
     const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
     const dtmfUrl = `${appUrl}/api/signalwire/dtmf?callId=${encodeURIComponent(call.id)}`;
+    const cleanGreeting = (ivr?.greetingText || 'Welcome.').replace(/^["']|["']$/g, '').trim();
+    const publicAudioUrl = ivr?.audioUrl
+      ? (/^https?:\/\//i.test(ivr.audioUrl) ? ivr.audioUrl : `${appUrl}/api/ivr-audio/${encodeURIComponent(ivr.id)}`)
+      : null;
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather numDigits="1" timeout="10" action="${escapeXml(dtmfUrl)}" method="POST">
-    <Say voice="alice">${escapeXml(ivr?.greetingText || 'Welcome.')}</Say>
+    ${publicAudioUrl ? `<Play>${escapeXml(publicAudioUrl)}</Play>` : `<Say voice="alice">${escapeXml(cleanGreeting)}</Say>`}
+    <Say voice="alice">Press 1 to speak with an agent, or 2 to repeat this greeting.</Say>
   </Gather>
   <Hangup/>
 </Response>`;

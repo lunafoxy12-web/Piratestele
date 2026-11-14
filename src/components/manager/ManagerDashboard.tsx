@@ -618,6 +618,81 @@ export const ManagerDashboard: React.FC = () => {
   // ==========================================
   // IVR AUDIO RECORDING & CREATION
   // ==========================================
+  const convertAudioBlobToWavDataUrl = async (audioBlob: Blob): Promise<string> => {
+    const arrayBuffer = await audioBlob.arrayBuffer();
+    const AudioCtx = window.AudioContext || (window as any).webkitAudioContext;
+    if (!AudioCtx) {
+      return await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error('Failed to read audio blob'));
+        reader.readAsDataURL(audioBlob);
+      });
+    }
+
+    const audioCtx = new AudioCtx();
+    try {
+      const decoded = await audioCtx.decodeAudioData(arrayBuffer.slice(0));
+      const numChannels = decoded.numberOfChannels || 1;
+      const srcRate = decoded.sampleRate || 44100;
+      const srcLen = decoded.length;
+      const mono = new Float32Array(srcLen);
+      for (let ch = 0; ch < numChannels; ch++) {
+        const data = decoded.getChannelData(ch);
+        for (let i = 0; i < srcLen; i++) {
+          mono[i] += data[i] / numChannels;
+        }
+      }
+
+      const targetRate = 16000;
+      const targetLen = Math.max(1, Math.round((srcLen * targetRate) / srcRate));
+      const pcm16 = new Int16Array(targetLen);
+      const ratio = (srcLen - 1) / Math.max(1, targetLen - 1);
+      for (let i = 0; i < targetLen; i++) {
+        const pos = i * ratio;
+        const lo = Math.floor(pos);
+        const hi = Math.min(lo + 1, srcLen - 1);
+        const frac = pos - lo;
+        const sample = Math.max(-1, Math.min(1, (1 - frac) * mono[lo] + frac * mono[hi]));
+        pcm16[i] = sample < 0 ? Math.round(sample * 32768) : Math.round(sample * 32767);
+      }
+
+      const dataBytes = pcm16.length * 2;
+      const wavBuffer = new ArrayBuffer(44 + dataBytes);
+      const view = new DataView(wavBuffer);
+      const writeStr = (offset: number, str: string) => {
+        for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+      };
+
+      writeStr(0, 'RIFF');
+      view.setUint32(4, 36 + dataBytes, true);
+      writeStr(8, 'WAVE');
+      writeStr(12, 'fmt ');
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, 1, true);
+      view.setUint32(24, targetRate, true);
+      view.setUint32(28, targetRate * 2, true);
+      view.setUint16(32, 2, true);
+      view.setUint16(34, 16, true);
+      writeStr(36, 'data');
+      view.setUint32(40, dataBytes, true);
+      for (let i = 0; i < pcm16.length; i++) {
+        view.setInt16(44 + i * 2, pcm16[i], true);
+      }
+
+      const wavBlob = new Blob([wavBuffer], { type: 'audio/wav' });
+      return await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onloadend = () => resolve(String(reader.result || ''));
+        reader.onerror = () => reject(new Error('Failed to encode WAV'));
+        reader.readAsDataURL(wavBlob);
+      });
+    } finally {
+      audioCtx.close().catch(() => {});
+    }
+  };
+
   const handleStartMicRecording = async () => {
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
@@ -642,23 +717,37 @@ export const ManagerDashboard: React.FC = () => {
         }
       };
 
-      mediaRecorder.onstop = () => {
+      mediaRecorder.onstop = async () => {
         const mimeType = mediaRecorder.mimeType || 'audio/webm';
         const audioBlob = new Blob(audioChunksRef.current, { type: mimeType });
-        const reader = new FileReader();
-        reader.readAsDataURL(audioBlob);
-        reader.onloadend = () => {
-          const base64Data = reader.result as string;
-          const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('wav') ? 'wav' : 'webm';
+        try {
+          const wavDataUrl = await convertAudioBlobToWavDataUrl(audioBlob);
+          const isWav = wavDataUrl.startsWith('data:audio/wav');
+          const ext = isWav ? 'wav' : mimeType.includes('mp4') ? 'mp4' : 'webm';
           setIvrForm((prev) => ({
             ...prev,
-            audioUrl: base64Data,
+            audioUrl: wavDataUrl,
             audioFileName: `mic_recorded_prompt_${Date.now()}.${ext}`,
             audioOption: 'RECORD',
             greetingText: prev.greetingText || 'Recorded Microphone IVR Greeting',
           }));
-          setPreviewAudioUrl(base64Data);
-        };
+          setPreviewAudioUrl(wavDataUrl);
+        } catch {
+          const reader = new FileReader();
+          reader.readAsDataURL(audioBlob);
+          reader.onloadend = () => {
+            const base64Data = reader.result as string;
+            const ext = mimeType.includes('mp4') ? 'mp4' : mimeType.includes('wav') ? 'wav' : 'webm';
+            setIvrForm((prev) => ({
+              ...prev,
+              audioUrl: base64Data,
+              audioFileName: `mic_recorded_prompt_${Date.now()}.${ext}`,
+              audioOption: 'RECORD',
+              greetingText: prev.greetingText || 'Recorded Microphone IVR Greeting',
+            }));
+            setPreviewAudioUrl(base64Data);
+          };
+        }
         stream.getTracks().forEach((track) => track.stop());
       };
 
@@ -2196,7 +2285,14 @@ export const ManagerDashboard: React.FC = () => {
 
               {/* Select Manager's IVR Voice */}
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">Select Campaign IVR Voice / Greeting</label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Select Campaign IVR Voice / Greeting
+                  </label>
+                  <span className="text-[11px] bg-indigo-100 text-indigo-800 font-bold px-2 py-0.5 rounded">
+                    {ivrs.length} Available
+                  </span>
+                </div>
                 <select
                   required
                   value={campaignForm.ivrConfigId}
@@ -2204,12 +2300,56 @@ export const ManagerDashboard: React.FC = () => {
                   className="w-full text-sm border border-slate-300 rounded-lg p-2.5 bg-white font-medium"
                 >
                   <option value="">-- Choose IVR Voice --</option>
-                  {ivrs.map((ivr) => (
-                    <option key={ivr.id} value={ivr.id}>
-                      🎙️ {ivr.name} (Key 1 &rarr; Transfer to Live Agent)
-                    </option>
-                  ))}
+                  {ivrs.map((ivr) => {
+                    const cleanSnippet = (ivr.greetingText || '').replace(/^["']|["']$/g, '').trim();
+                    const typeTag = ivr.audioUrl ? 'Recorded Audio' : 'Voice Text';
+                    return (
+                      <option key={ivr.id} value={ivr.id}>
+                        {ivr.name} [{typeTag}]{cleanSnippet ? ` — ${cleanSnippet.slice(0, 48)}${cleanSnippet.length > 48 ? '...' : ''}` : ''}
+                      </option>
+                    );
+                  })}
                 </select>
+
+                {/* All Available IVR Voices Quick Selector */}
+                {ivrs.length > 0 && (
+                  <div className="mt-2 max-h-40 overflow-y-auto border border-slate-200 rounded-lg divide-y divide-slate-100 bg-slate-50/70">
+                    {ivrs.map((ivr) => {
+                      const activeId = campaignForm.ivrConfigId || ivrs[0]?.id;
+                      const isSelected = activeId === ivr.id;
+                      const cleanPrompt = (ivr.greetingText || '').replace(/^["']|["']$/g, '').trim();
+                      return (
+                        <button
+                          key={ivr.id}
+                          type="button"
+                          onClick={() => setCampaignForm({ ...campaignForm, ivrConfigId: ivr.id })}
+                          className={`w-full text-left px-3 py-2 flex items-center justify-between gap-2 text-xs transition-colors cursor-pointer ${
+                            isSelected ? 'bg-indigo-100/90 text-indigo-950 font-semibold' : 'hover:bg-white text-slate-700'
+                          }`}
+                        >
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              {ivr.audioUrl ? (
+                                <FileAudio className="w-3.5 h-3.5 text-indigo-600 shrink-0" />
+                              ) : (
+                                <Volume2 className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                              )}
+                              <span className="truncate">{ivr.name}</span>
+                            </div>
+                            {cleanPrompt && (
+                              <p className="text-[10px] text-slate-500 truncate pl-5">"{cleanPrompt}"</p>
+                            )}
+                          </div>
+                          <span className={`text-[10px] px-1.5 py-0.5 rounded shrink-0 font-bold ${
+                            isSelected ? 'bg-indigo-600 text-white' : 'bg-slate-200 text-slate-700'
+                          }`}>
+                            {isSelected ? 'Selected' : (ivr.audioUrl ? 'Audio' : 'TTS')}
+                          </span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
 
                   {/* Selected IVR Voice Live Preview */}
                   {(() => {
@@ -2225,16 +2365,23 @@ export const ManagerDashboard: React.FC = () => {
                           <button
                             type="button"
                             onClick={() => {
+                              if (audioPlayerRef.current) {
+                                audioPlayerRef.current.pause();
+                                audioPlayerRef.current = null;
+                              }
+                              if ('speechSynthesis' in window) {
+                                window.speechSynthesis.cancel();
+                              }
                               if (selectedIvr.audioUrl) {
                                 try {
                                   const a = new Audio(selectedIvr.audioUrl);
-                                  a.play();
+                                  audioPlayerRef.current = a;
+                                  a.play().catch(() => {});
                                   showNotification('success', `Playing recorded audio: "${selectedIvr.name}"`);
                                   return;
                                 } catch {}
                               }
                               if ('speechSynthesis' in window && selectedIvr.greetingText) {
-                                window.speechSynthesis.cancel();
                                 const clean = selectedIvr.greetingText.replace(/^["']|["']$/g, '').trim();
                                 const utt = new SpeechSynthesisUtterance(clean);
                                 utt.rate = 1.0;
@@ -3004,9 +3151,14 @@ export const ManagerDashboard: React.FC = () => {
 
             <form onSubmit={handleUpdateCampaignIvr} className="space-y-4">
               <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Select New IVR Voice Prompt:
-                </label>
+                <div className="flex items-center justify-between mb-1">
+                  <label className="block text-xs font-semibold text-slate-700">
+                    Select New IVR Voice Prompt:
+                  </label>
+                  <span className="text-[11px] bg-indigo-100 text-indigo-800 font-bold px-2 py-0.5 rounded">
+                    {ivrs.length} Available
+                  </span>
+                </div>
                 <select
                   required
                   value={newIvrConfigId}
@@ -3016,7 +3168,7 @@ export const ManagerDashboard: React.FC = () => {
                   <option value="">-- Choose New IVR Voice --</option>
                   {ivrs.map((ivr) => (
                     <option key={ivr.id} value={ivr.id}>
-                      🎙️ {ivr.name} (Key 1 &rarr; Transfer to Live Agent)
+                      {ivr.name} [{ivr.audioUrl ? 'Recorded Audio' : 'Voice Text'}]
                     </option>
                   ))}
                 </select>
@@ -3027,8 +3179,36 @@ export const ManagerDashboard: React.FC = () => {
                 const selected = ivrs.find((i) => i.id === newIvrConfigId);
                 if (!selected) return null;
                 return (
-                  <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1">
-                    <div className="font-semibold text-slate-800">Prompt Text:</div>
+                  <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-xs space-y-1.5">
+                    <div className="flex items-center justify-between">
+                      <span className="font-semibold text-slate-800">Prompt Preview: {selected.name}</span>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (audioPlayerRef.current) {
+                            audioPlayerRef.current.pause();
+                            audioPlayerRef.current = null;
+                          }
+                          if ('speechSynthesis' in window) window.speechSynthesis.cancel();
+                          if (selected.audioUrl) {
+                            try {
+                              const a = new Audio(selected.audioUrl);
+                              audioPlayerRef.current = a;
+                              a.play().catch(() => {});
+                              return;
+                            } catch {}
+                          }
+                          if ('speechSynthesis' in window && selected.greetingText) {
+                            const clean = selected.greetingText.replace(/^["']|["']$/g, '').trim();
+                            window.speechSynthesis.speak(new SpeechSynthesisUtterance(clean));
+                          }
+                        }}
+                        className="text-[10px] bg-indigo-600 hover:bg-indigo-700 text-white font-bold px-2 py-0.5 rounded flex items-center gap-1 cursor-pointer"
+                      >
+                        <Volume2 className="w-3 h-3" />
+                        <span>Audition</span>
+                      </button>
+                    </div>
                     <p className="italic text-slate-600 text-[11px]">
                       "{selected.greetingText?.replace(/^["']|["']$/g, '').trim()}"
                     </p>

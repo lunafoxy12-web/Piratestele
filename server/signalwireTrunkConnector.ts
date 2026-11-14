@@ -37,6 +37,7 @@ export interface OutboundPstnCallParams {
   from: string;
   to: string;
   greetingText?: string;
+  audioUrl?: string;
   appUrl?: string;
   callId?: string;
   campaignId?: string;
@@ -214,6 +215,8 @@ export class SignalWireTrunkConnector {
     projectId: string;
     apiToken: string;
     greetingText?: string;
+    audioUrl?: string;
+    dtmfWebhookUrl?: string;
   }): Promise<{ ivrBinUrl: string; bridgeBinUrl: string }> {
     const cleanSpace = normalizeSpace(credentials.space);
     const cleanProjectId = credentials.projectId.trim().replace(/^["']|["']$/g, '');
@@ -225,7 +228,7 @@ export class SignalWireTrunkConnector {
     // 1. Create or ensure Agent Bridge & Classical Hold LamlBin
     const bridgeXml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Thank you for pressing 1. Connecting you to representative agent Edward Teach. Please hold while we bridge your call.</Say>
+  <Say voice="alice">Thank you for pressing 1. Connecting you to an available representative agent. Please hold while we bridge your call.</Say>
   <Play>https://cdn.signalwire.com/default-music/classical.mp3</Play>
   <Say voice="alice">All representative agents are currently assisting other callers. Please stay on the line.</Say>
   <Play>https://cdn.signalwire.com/default-music/classical.mp3</Play>
@@ -255,13 +258,19 @@ export class SignalWireTrunkConnector {
     }
 
     // 2. Create or ensure Main Outbound IVR LamlBin
-    const greeting = credentials.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to connect with an available agent, or 2 to repeat this greeting.';
-    const ivrActionUrl = bridgeBinUrl || `https://${cleanSpace}.signalwire.com/laml-bins/bridge`;
+    const greeting =
+      (credentials.greetingText || '').replace(/^["']|["']$/g, '').trim() ||
+      'Welcome to Pirates World Tele Solution. Press 1 to connect with an available agent, or 2 to repeat this greeting.';
+    const hasHttpAudio = Boolean(credentials.audioUrl && /^https?:\/\//i.test(credentials.audioUrl));
+    const promptElement = hasHttpAudio
+      ? `<Play>${escapeXml(credentials.audioUrl!)}</Play>`
+      : `<Say voice="alice">${escapeXml(greeting)}</Say>`;
+    const ivrActionUrl = credentials.dtmfWebhookUrl || bridgeBinUrl || `https://${cleanSpace}.signalwire.com/laml-bins/bridge`;
     const ivrXml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
   <Gather numDigits="1" timeout="10" action="${escapeXml(ivrActionUrl)}" method="POST">
-    <Say voice="alice">${escapeXml(greeting)}</Say>
+    ${promptElement}
     <Say voice="alice">Press 1 to speak with an agent, or 2 to hear this greeting again.</Say>
   </Gather>
   <Say voice="alice">No key was detected. Thank you for calling Pirates World Tele Solution. Goodbye.</Say>
@@ -334,7 +343,7 @@ export class SignalWireTrunkConnector {
    * Real telephone audio and DTMF handling.
    */
   public static async dispatchOutboundCall(params: OutboundPstnCallParams): Promise<OutboundPstnCallResult> {
-    const { space, projectId, apiToken, from, to, greetingText, appUrl, callId } = params;
+    const { space, projectId, apiToken, from, to, greetingText, audioUrl, appUrl, callId } = params;
 
     const cleanSpace = normalizeSpace(space);
     const cleanProjectId = projectId.trim().replace(/^["']|["']$/g, '');
@@ -353,8 +362,19 @@ export class SignalWireTrunkConnector {
     const authHeader = `Basic ${Buffer.from(`${cleanProjectId}:${cleanToken}`).toString('base64')}`;
 
     const textToSay =
-      greetingText ||
+      (greetingText || '').replace(/^["']|["']$/g, '').trim() ||
       'Hello from Pirates World Tele Solution. Dispatched via SignalWire cloud. Press 1 to connect with an available agent, or 2 to repeat this greeting.';
+
+    const isPublicHost = Boolean(
+      hostAppUrl &&
+      !hostAppUrl.includes('localhost') &&
+      !hostAppUrl.includes('127.0.0.1') &&
+      !hostAppUrl.includes('ais-dev-') &&
+      !hostAppUrl.includes('ais-pre-')
+    );
+    const dtmfWebhookUrl = isPublicHost
+      ? `${hostAppUrl}/api/twilio/dtmf${callId ? `?callId=${encodeURIComponent(callId)}` : ''}`
+      : undefined;
 
     // Provision hosted LamlBins directly on SignalWire CDN so audio never fails
     const { ivrBinUrl } = await this.ensureHostedBins({
@@ -362,10 +382,12 @@ export class SignalWireTrunkConnector {
       projectId: cleanProjectId,
       apiToken: cleanToken,
       greetingText: textToSay,
+      audioUrl,
+      dtmfWebhookUrl,
     });
 
     const fallbackXmlUrl = `${hostAppUrl}/api/twilio/call-twiml${callId ? `?callId=${encodeURIComponent(callId)}` : ''}`;
-    const callExecutionUrl = ivrBinUrl || fallbackXmlUrl;
+    const callExecutionUrl = isPublicHost ? fallbackXmlUrl : (ivrBinUrl || fallbackXmlUrl);
 
     const callbackUrl = `${hostAppUrl}/api/twilio/call-status`;
 

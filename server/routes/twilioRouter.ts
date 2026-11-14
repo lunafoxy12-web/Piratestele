@@ -32,12 +32,15 @@ twilioRouter.all('/call-twiml', (req: Request, res: Response) => {
 
   const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
   const dtmfUrl = `${appUrl}/api/twilio/dtmf${callId ? `?callId=${encodeURIComponent(callId)}` : ''}`;
+  const publicAudioUrl = ivr?.audioUrl
+    ? (/^https?:\/\//i.test(ivr.audioUrl) ? ivr.audioUrl : `${appUrl}/api/ivr-audio/${encodeURIComponent(ivr.id)}`)
+    : null;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
   <Gather numDigits="1" timeout="10" action="${escapeXml(dtmfUrl)}" method="POST">
-    ${ivr?.audioUrl ? `<Play>${escapeXml(ivr.audioUrl)}</Play>` : `<Say voice="alice">${escapeXml(greeting)}</Say>`}
+    ${publicAudioUrl ? `<Play>${escapeXml(publicAudioUrl)}</Play>` : `<Say voice="alice">${escapeXml(greeting)}</Say>`}
     <Say voice="alice">Press 1 to speak with an agent, or 2 to repeat.</Say>
   </Gather>
   <Say voice="alice">No key was detected. Thank you for calling Pirates World Tele Solution. Goodbye.</Say>
@@ -159,13 +162,16 @@ twilioRouter.post('/dtmf', async (req: Request, res: Response) => {
       return res.type('text/xml').send(twiml);
     }
   } else if (action === 'REPEAT_MENU') {
-    const textToSay = ivr?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+    const textToSay = (ivr?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.').replace(/^["']|["']$/g, '').trim();
     const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
     const dtmfUrl = `${appUrl}/api/twilio/dtmf?callId=${encodeURIComponent(call.id)}`;
+    const publicAudioUrl = ivr?.audioUrl
+      ? (/^https?:\/\//i.test(ivr.audioUrl) ? ivr.audioUrl : `${appUrl}/api/ivr-audio/${encodeURIComponent(ivr.id)}`)
+      : null;
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather numDigits="1" timeout="10" action="${escapeXml(dtmfUrl)}" method="POST">
-    <Say voice="alice">${escapeXml(textToSay)}</Say>
+    ${publicAudioUrl ? `<Play>${escapeXml(publicAudioUrl)}</Play>` : `<Say voice="alice">${escapeXml(textToSay)}</Say>`}
     <Say voice="alice">Press 1 to speak with an agent, or 2 to repeat.</Say>
   </Gather>
   <Say voice="alice">No key was detected. Goodbye.</Say>

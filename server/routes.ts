@@ -2503,15 +2503,68 @@ function createSimpleWavAudioBuffer(durationMs = 2500): Buffer {
   return buffer;
 }
 
+// Public binary audio streaming endpoint for IVR prompts (used by Twilio/SignalWire <Play> & previews)
+router.get('/ivr-audio/:ivrId', (req: Request, res: Response) => {
+  const { ivrId } = req.params;
+  const data = db.get();
+  const ivr = data.ivr_configs.find((i) => i.id === ivrId);
+  if (!ivr || !ivr.audioUrl) {
+    return res.status(404).json({ error: 'IVR audio not found.' });
+  }
+
+  if (/^https?:\/\//i.test(ivr.audioUrl)) {
+    return res.redirect(ivr.audioUrl);
+  }
+
+  const matches = ivr.audioUrl.match(/^data:([^;]+);base64,(.+)$/);
+  if (!matches) {
+    return res.status(400).json({ error: 'Unsupported IVR audio encoding.' });
+  }
+
+  const rawMime = matches[1].toLowerCase();
+  const contentType = rawMime.includes('mpeg') || rawMime.includes('mp3')
+    ? 'audio/mpeg'
+    : rawMime.includes('mp4')
+    ? 'audio/mp4'
+    : rawMime.includes('webm')
+    ? 'audio/webm'
+    : 'audio/wav';
+
+  const audioBuffer = Buffer.from(matches[2], 'base64');
+  res.setHeader('Content-Type', contentType);
+  res.setHeader('Content-Length', String(audioBuffer.length));
+  res.setHeader('Cache-Control', 'public, max-age=300');
+  return res.send(audioBuffer);
+});
+
 // IVR Configurations (Supports both /manager/ivr and /manager/ivr-configs endpoints)
+// Returns ALL available IVR voices so any manager can see, audition, and select any available IVR prompt
 router.get(['/manager/ivr', '/manager/ivr-configs'], authenticate, requireRole(['manager', 'admin']), (req: AuthenticatedRequest, res: Response) => {
   const managerId = req.managerId || (req.user?.role === 'manager' ? req.user.id : 'mgr_alpha');
   const data = db.get();
-  let ivrs = data.ivr_configs.filter((i) => i.managerId === managerId);
-  if (ivrs.length === 0) {
-    ivrs = data.ivr_configs;
-  }
-  res.json(ivrs);
+  const seenIds = new Set<string>();
+  const allValid = data.ivr_configs.filter((i) => {
+    if (!i || !i.id || seenIds.has(i.id)) return false;
+    if (i.name?.startsWith('VerifyMgr_')) return false;
+    seenIds.add(i.id);
+    return true;
+  });
+
+  // Sort: current manager's IVRs first, then recorded/uploaded audio IVRs, then system/other IVRs
+  const sorted = [...allValid].sort((a, b) => {
+    const aOwn = a.managerId === managerId ? 1 : 0;
+    const bOwn = b.managerId === managerId ? 1 : 0;
+    if (aOwn !== bOwn) return bOwn - aOwn;
+    const aSys = a.managerId === 'mgr_alpha' ? 1 : 0;
+    const bSys = b.managerId === 'mgr_alpha' ? 1 : 0;
+    if (aSys !== bSys) return bSys - aSys;
+    const aRec = a.audioUrl ? 1 : 0;
+    const bRec = b.audioUrl ? 1 : 0;
+    if (aRec !== bRec) return bRec - aRec;
+    return new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime();
+  });
+
+  res.json(sorted);
 });
 
 router.post(['/manager/ivr', '/manager/ivr-configs'], authenticate, requireRole(['manager', 'admin']), async (req: AuthenticatedRequest, res: Response) => {
@@ -2565,17 +2618,20 @@ router.post(['/manager/ivr', '/manager/ivr-configs'], authenticate, requireRole(
   if (zadarmaAuth.apiKey && zadarmaAuth.apiSecret) {
     try {
       let audioBuf: Buffer | null = null;
-      let cleanFile = audioFileName || `${name.trim().replace(/[^a-zA-Z0-9]/g, '_')}.wav`;
+      let isMp3 = Boolean(audioFileName?.toLowerCase().endsWith('.mp3'));
+      const baseCleanName = name.trim().replace(/[^a-zA-Z0-9_\-]/g, '_') || `ivr_${Date.now()}`;
 
       if (audioUrl && audioUrl.startsWith('data:')) {
         const matches = audioUrl.match(/^data:([^;]+);base64,(.+)$/);
         if (matches) {
+          const mime = matches[1].toLowerCase();
+          if (mime.includes('mpeg') || mime.includes('mp3')) isMp3 = true;
           audioBuf = Buffer.from(matches[2], 'base64');
         }
       }
 
       if (!audioBuf) {
-        const textToSynth = greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+        const textToSynth = (greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.').replace(/^["']|["']$/g, '').trim();
         const ttsBase64 = await TranslationService.synthesizeSpeech({
           text: textToSynth,
           language: 'English',
@@ -2588,11 +2644,12 @@ router.post(['/manager/ivr', '/manager/ivr-configs'], authenticate, requireRole(
         }
       }
 
+      const cleanFile = isMp3 ? `${baseCleanName}.mp3` : `${baseCleanName}.wav`;
       const uploadResult = await ZadarmaConnector.uploadIvrSound({
         apiKey: zadarmaAuth.apiKey,
         apiSecret: zadarmaAuth.apiSecret,
-        name: name.trim().replace(/[^a-zA-Z0-9_\-]/g, '_') || `ivr_${Date.now()}`,
-        audioBuffer: audioBuf,
+        name: baseCleanName,
+        audioBuffer: isMp3 ? audioBuf : convertTo8kMonoWav(audioBuf),
         fileName: cleanFile,
       });
 
@@ -2601,14 +2658,27 @@ router.post(['/manager/ivr', '/manager/ivr-configs'], authenticate, requireRole(
         newIvr.zadarmaSoundSyncedAt = new Date().toISOString();
         console.log(`[ZADARMA PBX IVR] Successfully uploaded voice '${name}' to Zadarma PBX (Sound ID: ${uploadResult.soundId})`);
 
-        // Automatically link this sound to PBX scenario 6ac669ac99688ec02e009606
-        await ZadarmaConnector.updateIvrScenario({
+        // Automatically link this sound to PBX scenario
+        const linkRes = await ZadarmaConnector.updateIvrScenario({
           apiKey: zadarmaAuth.apiKey,
           apiSecret: zadarmaAuth.apiSecret,
           scenarioId: '6ac669ac99688ec02e009606',
           soundId: uploadResult.soundId,
           greetingSoundId: uploadResult.soundId,
         });
+        if (!linkRes.success) {
+          const scList = await ZadarmaConnector.getIvrScenarios({ apiKey: zadarmaAuth.apiKey, apiSecret: zadarmaAuth.apiSecret });
+          const firstScenario = scList.scenarios?.find((s: any) => s?.id);
+          if (firstScenario?.id && firstScenario.id !== '6ac669ac99688ec02e009606') {
+            await ZadarmaConnector.updateIvrScenario({
+              apiKey: zadarmaAuth.apiKey,
+              apiSecret: zadarmaAuth.apiSecret,
+              scenarioId: String(firstScenario.id),
+              soundId: uploadResult.soundId,
+              greetingSoundId: uploadResult.soundId,
+            });
+          }
+        }
       }
     } catch (err: any) {
       console.warn(`[ZADARMA PBX IVR] Automatic voice upload failed: ${err.message}`);
@@ -2640,17 +2710,20 @@ router.post(['/manager/ivr/:id/sync-zadarma', '/manager/ivr-configs/:id/sync-zad
 
   try {
     let audioBuf: Buffer | null = null;
-    let cleanFile = ivr.audioFileName || `${ivr.name.trim().replace(/[^a-zA-Z0-9]/g, '_')}.wav`;
+    let isMp3 = Boolean(ivr.audioFileName?.toLowerCase().endsWith('.mp3'));
+    const baseCleanName = ivr.name.trim().replace(/[^a-zA-Z0-9_\-]/g, '_') || `ivr_${Date.now()}`;
 
     if (ivr.audioUrl && ivr.audioUrl.startsWith('data:')) {
       const matches = ivr.audioUrl.match(/^data:([^;]+);base64,(.+)$/);
       if (matches) {
+        const mime = matches[1].toLowerCase();
+        if (mime.includes('mpeg') || mime.includes('mp3')) isMp3 = true;
         audioBuf = Buffer.from(matches[2], 'base64');
       }
     }
 
     if (!audioBuf) {
-      const textToSynth = ivr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+      const textToSynth = (ivr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.').replace(/^["']|["']$/g, '').trim();
       const ttsBase64 = await TranslationService.synthesizeSpeech({
         text: textToSynth,
         language: 'English',
@@ -2663,11 +2736,12 @@ router.post(['/manager/ivr/:id/sync-zadarma', '/manager/ivr-configs/:id/sync-zad
       }
     }
 
+    const cleanFile = isMp3 ? `${baseCleanName}.mp3` : `${baseCleanName}.wav`;
     const uploadResult = await ZadarmaConnector.uploadIvrSound({
       apiKey: zadarmaAuth.apiKey,
       apiSecret: zadarmaAuth.apiSecret,
-      name: ivr.name.trim().replace(/[^a-zA-Z0-9_\-]/g, '_') || `ivr_${Date.now()}`,
-      audioBuffer: audioBuf,
+      name: baseCleanName,
+      audioBuffer: isMp3 ? audioBuf : convertTo8kMonoWav(audioBuf),
       fileName: cleanFile,
     });
 
@@ -2682,13 +2756,26 @@ router.post(['/manager/ivr/:id/sync-zadarma', '/manager/ivr-configs/:id/sync-zad
       });
 
       // Link to Scenario
-      await ZadarmaConnector.updateIvrScenario({
+      const linkRes = await ZadarmaConnector.updateIvrScenario({
         apiKey: zadarmaAuth.apiKey,
         apiSecret: zadarmaAuth.apiSecret,
         scenarioId: '6ac669ac99688ec02e009606',
         soundId: uploadResult.soundId,
         greetingSoundId: uploadResult.soundId,
       });
+      if (!linkRes.success) {
+        const scList = await ZadarmaConnector.getIvrScenarios({ apiKey: zadarmaAuth.apiKey, apiSecret: zadarmaAuth.apiSecret });
+        const firstScenario = scList.scenarios?.find((s: any) => s?.id);
+        if (firstScenario?.id && firstScenario.id !== '6ac669ac99688ec02e009606') {
+          await ZadarmaConnector.updateIvrScenario({
+            apiKey: zadarmaAuth.apiKey,
+            apiSecret: zadarmaAuth.apiSecret,
+            scenarioId: String(firstScenario.id),
+            soundId: uploadResult.soundId,
+            greetingSoundId: uploadResult.soundId,
+          });
+        }
+      }
 
       return res.json({
         success: true,
@@ -2731,6 +2818,11 @@ router.put(['/manager/ivr/:id', '/manager/ivr-configs/:id'], authenticate, requi
   await db.update((d) => {
     const target = d.ivr_configs.find((i) => i.id === id);
     if (target) {
+      const promptChanged =
+        (greetingText !== undefined && greetingText.trim() !== target.greetingText) ||
+        (audioUrl !== undefined && audioUrl !== target.audioUrl) ||
+        (audioFileName !== undefined && audioFileName !== target.audioFileName);
+
       if (name !== undefined) target.name = name.trim();
       if (greetingText !== undefined) target.greetingText = greetingText.trim();
       if (audioUrl !== undefined) target.audioUrl = audioUrl;
@@ -2749,6 +2841,10 @@ router.put(['/manager/ivr/:id', '/manager/ivr-configs/:id'], authenticate, requi
           label: opt.label || 'Action',
           transferQueue: opt.transferQueue,
         }));
+      }
+      if (promptChanged) {
+        target.zadarmaSoundId = undefined;
+        target.zadarmaSoundSyncedAt = undefined;
       }
       target.updatedAt = new Date().toISOString();
     }
@@ -3187,7 +3283,7 @@ router.post('/manager/campaigns/:id/run', authenticate, requireRole(['manager', 
 
   res.json({
     success: true,
-    message: `Campaign '${campaign.name}' started. Queue worker processing outbound calls on route ${healthySip.providerName || healthySip.connectionId || healthySip.id}.`,
+    message: `Campaign '${campaign.name}' started. Queue worker processing outbound calls.`,
   });
 });
 
@@ -3305,12 +3401,17 @@ router.patch('/manager/campaigns/:id/ivr', authenticate, requireRole(['manager',
       let soundToLink = ivr.zadarmaSoundId;
       if (!soundToLink) {
         let audioBuf: Buffer | null = null;
+        let isMp3 = Boolean(ivr.audioFileName?.toLowerCase().endsWith('.mp3'));
         if (ivr.audioUrl && ivr.audioUrl.startsWith('data:')) {
           const matches = ivr.audioUrl.match(/^data:([^;]+);base64,(.+)$/);
-          if (matches) audioBuf = Buffer.from(matches[2], 'base64');
+          if (matches) {
+            const mime = matches[1].toLowerCase();
+            if (mime.includes('mpeg') || mime.includes('mp3')) isMp3 = true;
+            audioBuf = Buffer.from(matches[2], 'base64');
+          }
         }
         if (!audioBuf) {
-          const textToSpeak = ivr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.';
+          const textToSpeak = (ivr.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to speak with an agent, or 2 to repeat.').replace(/^["']|["']$/g, '').trim();
           const ttsBase64 = await TranslationService.synthesizeSpeech({
             text: textToSpeak,
             language: 'English',
@@ -3319,13 +3420,13 @@ router.patch('/manager/campaigns/:id/ivr', authenticate, requireRole(['manager',
           if (ttsBase64) audioBuf = Buffer.from(ttsBase64, 'base64');
         }
         if (audioBuf) {
-          const wav8k = convertTo8kMonoWav(audioBuf);
+          const safeBase = (ivr.name || `ivr_${Date.now()}`).replace(/[^a-zA-Z0-9_\-]/g, '_');
           const upRes = await ZadarmaConnector.uploadIvrSound({
             apiKey: zadarmaAuth.apiKey,
             apiSecret: zadarmaAuth.apiSecret,
-            name: (ivr.name || `ivr_${Date.now()}`).replace(/[^a-zA-Z0-9_\-]/g, '_'),
-            audioBuffer: wav8k,
-            fileName: `${(ivr.name || 'ivr_voice').replace(/[^a-zA-Z0-9_\-]/g, '_')}.wav`,
+            name: safeBase,
+            audioBuffer: isMp3 ? audioBuf : convertTo8kMonoWav(audioBuf),
+            fileName: isMp3 ? `${safeBase}.mp3` : `${safeBase}.wav`,
           });
           if (upRes.success && upRes.soundId) {
             soundToLink = upRes.soundId;
@@ -3341,14 +3442,27 @@ router.patch('/manager/campaigns/:id/ivr', authenticate, requireRole(['manager',
       }
 
       if (soundToLink) {
-        await ZadarmaConnector.updateIvrScenario({
+        const linkRes = await ZadarmaConnector.updateIvrScenario({
           apiKey: zadarmaAuth.apiKey,
           apiSecret: zadarmaAuth.apiSecret,
           scenarioId: '6ac669ac99688ec02e009606',
           soundId: soundToLink,
           greetingSoundId: soundToLink,
         });
-        console.log(`[CAMPAIGN EDIT IVR] Updated PBX scenario 6ac669ac99688ec02e009606 to sound ${soundToLink} for campaign ${id}`);
+        if (!linkRes.success) {
+          const scList = await ZadarmaConnector.getIvrScenarios({ apiKey: zadarmaAuth.apiKey, apiSecret: zadarmaAuth.apiSecret });
+          const firstScenario = scList.scenarios?.find((s: any) => s?.id);
+          if (firstScenario?.id && firstScenario.id !== '6ac669ac99688ec02e009606') {
+            await ZadarmaConnector.updateIvrScenario({
+              apiKey: zadarmaAuth.apiKey,
+              apiSecret: zadarmaAuth.apiSecret,
+              scenarioId: String(firstScenario.id),
+              soundId: soundToLink,
+              greetingSoundId: soundToLink,
+            });
+          }
+        }
+        console.log(`[CAMPAIGN EDIT IVR] Updated PBX scenario to sound ${soundToLink} for campaign ${id}`);
       }
     } catch (e: any) {
       console.warn('[CAMPAIGN EDIT IVR] PBX scenario update note:', e.message);
@@ -4190,16 +4304,20 @@ router.all(['/twilio/call-twiml', '/carrier/call-xml'], (req: Request, res: Resp
   const call = callId ? data.calls.find((c) => c.id === callId || c.callSid === callId) : null;
   const campaign = call?.campaignId ? data.campaigns.find((c) => c.id === call.campaignId) : null;
   const ivr = campaign ? data.ivr_configs.find((i) => i.id === campaign.ivrConfigId) : data.ivr_configs[0];
-  const greeting = ivr?.greetingText || 'Hello from Pirates World Tele Solution. Dispatched via carrier cloud. Press 1 to connect with an agent, or 2 to hear this greeting again.';
+  const rawGreeting = ivr?.greetingText || 'Hello from Pirates World Tele Solution. Dispatched via carrier cloud. Press 1 to connect with an agent, or 2 to hear this greeting again.';
+  const greeting = rawGreeting.replace(/^["']|["']$/g, '').trim();
 
   const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
   const dtmfUrl = `${appUrl}/api/twilio/dtmf${callId ? `?callId=${encodeURIComponent(callId)}` : ''}`;
+  const publicAudioUrl = ivr?.audioUrl
+    ? (/^https?:\/\//i.test(ivr.audioUrl) ? ivr.audioUrl : `${appUrl}/api/ivr-audio/${encodeURIComponent(ivr.id)}`)
+    : null;
 
   const xml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
   <Gather numDigits="1" timeout="10" action="${escapeXml(dtmfUrl)}" method="POST">
-    ${ivr?.audioUrl ? `<Play>${escapeXml(ivr.audioUrl)}</Play>` : `<Say voice="alice">${escapeXml(greeting)}</Say>`}
+    ${publicAudioUrl ? `<Play>${escapeXml(publicAudioUrl)}</Play>` : `<Say voice="alice">${escapeXml(greeting)}</Say>`}
     <Say voice="alice">Press 1 to speak with an agent, or 2 to repeat.</Say>
   </Gather>
   <Say voice="alice">No key was detected. Thank you for testing Pirates World Tele Solution. Goodbye.</Say>
@@ -4320,13 +4438,16 @@ router.post('/twilio/dtmf', async (req: Request, res: Response) => {
       return res.type('text/xml').send(twiml);
     }
   } else if (action === 'REPEAT_MENU') {
-    const textToSay = ivr?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to connect with an available agent, or 2 to repeat this greeting.';
+    const textToSay = (ivr?.greetingText || 'Welcome to Pirates World Tele Solution. Press 1 to connect with an available agent, or 2 to repeat this greeting.').replace(/^["']|["']$/g, '').trim();
     const appUrl = (process.env.APP_URL && process.env.APP_URL !== 'MY_APP_URL' ? process.env.APP_URL : '') || process.env.RENDER_EXTERNAL_URL || (req.get('host') ? `${req.protocol}://${req.get('host')}` : 'https://piratessolution.onrender.com');
-    const dtmfUrl = `${appUrl}/api/twilio/dtmf`;
+    const dtmfUrl = `${appUrl}/api/twilio/dtmf?callId=${encodeURIComponent(call.id)}`;
+    const publicAudioUrl = ivr?.audioUrl
+      ? (/^https?:\/\//i.test(ivr.audioUrl) ? ivr.audioUrl : `${appUrl}/api/ivr-audio/${encodeURIComponent(ivr.id)}`)
+      : null;
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Gather numDigits="1" timeout="10" action="${escapeXml(dtmfUrl)}" method="POST">
-    <Say voice="alice">${escapeXml(textToSay)}</Say>
+    ${publicAudioUrl ? `<Play>${escapeXml(publicAudioUrl)}</Play>` : `<Say voice="alice">${escapeXml(textToSay)}</Say>`}
     <Say voice="alice">Press 1 to speak with an agent, or 2 to hear this greeting again.</Say>
   </Gather>
   <Say voice="alice">No key was detected. Goodbye.</Say>

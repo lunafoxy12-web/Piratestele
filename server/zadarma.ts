@@ -564,8 +564,9 @@ export class ZadarmaConnector {
       const cleanFileName = params.fileName || `${cleanName}.wav`;
 
       // Convert audio buffer to strict Zadarma PBX requirement: 16-bit Mono 8000 Hz WAV
+      const isMp3 = cleanFileName.toLowerCase().endsWith('.mp3');
       let finalBuffer = params.audioBuffer;
-      if (!cleanFileName.endsWith('.mp3')) {
+      if (!isMp3) {
         try {
           finalBuffer = convertTo8kMonoWav(params.audioBuffer);
         } catch (resampleErr: any) {
@@ -573,7 +574,7 @@ export class ZadarmaConnector {
         }
       }
 
-      const mimeType = cleanFileName.endsWith('.mp3') ? 'audio/mpeg' : 'audio/wav';
+      const mimeType = isMp3 ? 'audio/mpeg' : 'audio/wav';
 
       const fileBlob = new Blob([new Uint8Array(finalBuffer)], { type: mimeType });
       const form = new FormData();

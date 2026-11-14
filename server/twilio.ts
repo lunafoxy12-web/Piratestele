@@ -200,12 +200,13 @@ export async function makeTwilioCall(options: {
   from: string;
   to: string;
   greetingText?: string;
+  audioUrl?: string;
   appUrl?: string;
   statusCallbackUrl?: string;
   dtmfCallbackUrl?: string;
   callId?: string;
 }): Promise<TwilioCallResult> {
-  const { accountSid, authToken, from, to, greetingText, statusCallbackUrl, dtmfCallbackUrl } = options;
+  const { accountSid, authToken, from, to, greetingText, audioUrl, statusCallbackUrl, dtmfCallbackUrl, callId } = options;
 
   const cleanSid = accountSid.trim();
   const cleanToken = authToken.trim();
@@ -221,16 +222,26 @@ export async function makeTwilioCall(options: {
 
   // Build embedded TwiML
   const textToSay =
-    greetingText ||
+    (greetingText || '').replace(/^["']|["']$/g, '').trim() ||
     'Hello from Pirates World Tele Solution. This is a real test call dispatched through your carrier account. Press 1 to connect with an available agent, or press 2 to repeat this greeting.';
 
+  const resolvedDtmfUrl =
+    dtmfCallbackUrl && callId && !dtmfCallbackUrl.includes('callId=')
+      ? `${dtmfCallbackUrl}${dtmfCallbackUrl.includes('?') ? '&' : '?'}callId=${encodeURIComponent(callId)}`
+      : dtmfCallbackUrl;
+
+  const hasHttpAudio = Boolean(audioUrl && /^https?:\/\//i.test(audioUrl));
+  const promptElement = hasHttpAudio
+    ? `<Play>${escapeXml(audioUrl!)}</Play>`
+    : `<Say voice="alice">${escapeXml(textToSay)}</Say>`;
+
   // TwiML with gather for real DTMF detection
-  const gatherAction = dtmfCallbackUrl ? ` action="${escapeXml(dtmfCallbackUrl)}" method="POST"` : '';
+  const gatherAction = resolvedDtmfUrl ? ` action="${escapeXml(resolvedDtmfUrl)}" method="POST"` : '';
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Pause length="1"/>
   <Gather numDigits="1" timeout="10"${gatherAction}>
-    <Say voice="alice">${escapeXml(textToSay)}</Say>
+    ${promptElement}
     <Say voice="alice">Press 1 to speak with an agent, or 2 to hear this greeting again.</Say>
   </Gather>
   <Say voice="alice">No key was detected. Thank you for testing Pirates World Tele Solution. Goodbye.</Say>
