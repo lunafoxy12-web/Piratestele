@@ -205,10 +205,17 @@ export const AgentApp: React.FC = () => {
   userRef.current = user;
   const isMutedRef = useRef<boolean>(isMuted);
   isMutedRef.current = isMuted;
+  const isOnHoldRef = useRef<boolean>(isOnHold);
+  isOnHoldRef.current = isOnHold;
   const isSpeakerOnRef = useRef<boolean>(isSpeakerOn);
   isSpeakerOnRef.current = isSpeakerOn;
   const speakerVolumeRef = useRef<number>(speakerVolume);
   speakerVolumeRef.current = speakerVolume;
+  const selectedMicIdRef = useRef<string>(selectedMicId);
+  selectedMicIdRef.current = selectedMicId;
+  const ensureUplinkAudioActiveRef = useRef<(() => Promise<void>) | null>(null);
+  const micRepairInProgressRef = useRef<boolean>(false);
+  const repairedUplinkTracksRef = useRef<MediaStreamTrack[]>([]);
 
   agentPhoneRef.current = agentPhone;
 
@@ -358,21 +365,20 @@ export const AgentApp: React.FC = () => {
       zdrmAnswerInitiatedRef.current = true;
       // Attach track & lifecycle listeners as soon as JsSIP creates the session
       ensureRemoteAudioPlayingRef.current?.();
+      ensureUplinkAudioActiveRef.current?.();
     } else if (status === 'confirmed' || status === 'talking' || status === 'connected') {
       zdrmIncomingPendingRef.current = false;
       setWebrtcStatus('CALL_ACTIVE');
       setAgentState('BUSY');
       stopRingtoneRef.current?.();
       ensureRemoteAudioPlayingRef.current?.();
-      // Ensure WebRTC uplink sender track is unmuted unless agent explicitly muted
-      try {
-        const senders = (window as any).zdrmWebPhone?.webCallSession?.connection?.getSenders?.() || [];
-        senders.forEach((s: any) => {
-          if (s.track?.kind === 'audio') {
-            s.track.enabled = !isMutedRef.current;
-          }
-        });
-      } catch {}
+      ensureUplinkAudioActiveRef.current?.();
+      setTimeout(() => {
+        if (agentStateRef.current === 'BUSY') {
+          ensureRemoteAudioPlayingRef.current?.();
+          ensureUplinkAudioActiveRef.current?.();
+        }
+      }, 450);
     } else if (
       status === 'canceled' ||
       status === 'rejected' ||
@@ -530,7 +536,140 @@ export const AgentApp: React.FC = () => {
           builtInRing.volume = 0;
         }
 
-        // 3. Wrap ZadarmaWebphoneAPI.prototype.init BEFORE calling zadarmaWidgetFn so we reliably capture ALL PushSocket & SIP events
+        // 3. Clear stale muted mic cookies BEFORE widget reads them (Zadarma treats non-empty "false" cookie string as muted!)
+        try {
+          document.cookie = 'zdrmMicMute=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+          document.cookie = 'zdrmMicVolume=1; path=/';
+        } catch {}
+
+        // 3b. Patch JsSIP.RTCSession.prototype.answer so EVERY incoming WebRTC SIP answer uses STUN ICE servers,
+        // clean mic audio constraints (AEC/NS/AGC + chosen device), and fast ICE ready fallback.
+        const JsSIPRef = (window as any).JsSIP;
+        const RTCSessionProto = JsSIPRef?.RTCSession?.prototype;
+        if (RTCSessionProto && typeof RTCSessionProto.answer === 'function' && !RTCSessionProto.__pwAnswerWrapped) {
+          const origAnswer = RTCSessionProto.answer;
+          RTCSessionProto.answer = function (options: any = {}) {
+            const safeOpts: any = { ...(options || {}) };
+
+            // Ensure STUN servers are configured so NAT/CGNAT browsers publish reflexive uplink candidates
+            const existingServers = Array.isArray(safeOpts.pcConfig?.iceServers)
+              ? safeOpts.pcConfig.iceServers
+              : [];
+            safeOpts.pcConfig = {
+              ...(safeOpts.pcConfig || {}),
+              iceServers:
+                existingServers.length > 0
+                  ? existingServers
+                  : [
+                      {
+                        urls: [
+                          'stun:stun.l.google.com:19302',
+                          'stun:stun1.l.google.com:19302',
+                        ],
+                      },
+                    ],
+            };
+
+            // Pass explicit high-clarity voice constraints honoring selected mic device (if not already explicitly disabled)
+            if (safeOpts.mediaConstraints?.audio !== false) {
+              const chosenMic = selectedMicIdRef.current;
+              const existingAudio =
+                safeOpts.mediaConstraints && typeof safeOpts.mediaConstraints.audio === 'object'
+                  ? safeOpts.mediaConstraints.audio
+                  : {};
+              safeOpts.mediaConstraints = {
+                ...(safeOpts.mediaConstraints || {}),
+                audio: chosenMic
+                  ? {
+                      echoCancellation: true,
+                      noiseSuppression: true,
+                      autoGainControl: true,
+                      ...existingAudio,
+                      deviceId: existingAudio.deviceId || { ideal: chosenMic },
+                    }
+                  : {
+                      echoCancellation: true,
+                      noiseSuppression: true,
+                      autoGainControl: true,
+                      ...existingAudio,
+                    },
+                video: false,
+              };
+            }
+
+            // Attach one-time ICE candidate ready debounce & uplink/downlink lifecycle listeners
+            if (typeof this.on === 'function' && !(this as any).__pwSessionHooks) {
+              (this as any).__pwSessionHooks = true;
+              let iceReadyTimer: any = null;
+              let candidateCount = 0;
+
+              this.on('icecandidate', (data: any) => {
+                candidateCount += 1;
+                if (iceReadyTimer) clearTimeout(iceReadyTimer);
+                // Allow fast STUN srflx gathering (~450ms) then finalize SDP answer so SIP 200 OK never stalls
+                iceReadyTimer = setTimeout(() => {
+                  try {
+                    if (typeof data?.ready === 'function') data.ready();
+                  } catch {}
+                }, candidateCount === 1 ? 450 : 250);
+              });
+
+              this.on('peerconnection', (ev: any) => {
+                const pc = ev?.peerconnection as RTCPeerConnection | undefined;
+                if (!pc) return;
+                pc.addEventListener?.('iceconnectionstatechange', () => {
+                  if (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed') {
+                    ensureRemoteAudioPlayingRef.current?.();
+                    ensureUplinkAudioActiveRef.current?.();
+                  }
+                });
+                pc.addEventListener?.('connectionstatechange', () => {
+                  if (pc.connectionState === 'connected') {
+                    ensureRemoteAudioPlayingRef.current?.();
+                    ensureUplinkAudioActiveRef.current?.();
+                  }
+                });
+              });
+
+              this.on('accepted', () => {
+                if (iceReadyTimer) {
+                  clearTimeout(iceReadyTimer);
+                  iceReadyTimer = null;
+                }
+                ensureRemoteAudioPlayingRef.current?.();
+                ensureUplinkAudioActiveRef.current?.();
+              });
+
+              this.on('confirmed', () => {
+                ensureRemoteAudioPlayingRef.current?.();
+                ensureUplinkAudioActiveRef.current?.();
+              });
+
+              this.on('sdp', (sdpEv: any) => {
+                if (sdpEv?.originator === 'local' && typeof sdpEv.sdp === 'string') {
+                  const hasAudio = sdpEv.sdp.includes('m=audio');
+                  const dir = sdpEv.sdp.match(/a=(sendrecv|sendonly|recvonly|inactive)/)?.[1] || 'default';
+                  const srflxCount = (sdpEv.sdp.match(/typ srflx/g) || []).length;
+                  console.log('[WEBRTC LOCAL SDP]', { type: sdpEv.type, hasAudio, dir, srflxCount });
+                }
+              });
+
+              this.on('getusermediafailed', (err: any) => {
+                console.warn('[WEBRTC MIC CAPTURE FAILED]', err);
+                setMicPermission('denied');
+                setMicError(
+                  err?.message ||
+                    'Microphone capture blocked during call answer. Please allow microphone permission.'
+                );
+              });
+            }
+
+            return origAnswer.call(this, safeOpts);
+          };
+          RTCSessionProto.__pwAnswerWrapped = true;
+        }
+
+        // 3c. Wrap ZadarmaWebphoneAPI.prototype.init BEFORE calling zadarmaWidgetFn so we reliably capture ALL PushSocket & SIP events
         const ApiCtor = (window as any).ZadarmaWebphoneAPI;
         if (typeof ApiCtor === 'function' && ApiCtor.prototype && !ApiCtor.prototype.__pwWrapped) {
           const origInit = ApiCtor.prototype.init;
@@ -575,6 +714,13 @@ export const AgentApp: React.FC = () => {
         } catch {}
 
         (window as any).zadarmaWidgetFn(key, sipLogin, 'square', 'en', true, 'bottom-right');
+
+        // Ensure widget instance does not retain stale muted cookie state
+        try {
+          document.cookie = 'zdrmMicMute=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+          (window as any).zdrmWPhI?.setParams?.('zdrmMicMute', '');
+          (window as any).zdrmWPhI?.setParams?.('zdrmMicVolume', 1);
+        } catch {}
 
         // 5. Wait for ZadarmaWebphoneAPI instance AND sipId registration via get_sips.php before reporting REGISTERED
         const regStart = Date.now();
@@ -1425,47 +1571,108 @@ export const AgentApp: React.FC = () => {
     };
   }, [agentState, activeCall]);
 
-  // Real-time WebRTC RTCPeerConnection Stats Polling
+  // Real-time WebRTC RTCPeerConnection Stats Polling + Uplink Auto-Repair
   useEffect(() => {
     if (agentState !== 'BUSY' || !activeCall) {
       if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
-      if (peerConnectionRef.current) {
-        try {
-          peerConnectionRef.current.close();
-        } catch {}
-        peerConnectionRef.current = null;
-      }
       return;
     }
 
-    // Initialize WebRTC RTCPeerConnection instance to query real getStats()
-    let pc: RTCPeerConnection | null = null;
-    try {
-      pc = new RTCPeerConnection({
-        iceServers: [{ urls: 'stun:stun.l.google.com:19302' }],
-      });
-      peerConnectionRef.current = pc;
-    } catch (e) {
-      console.warn('RTCPeerConnection initialization note:', e);
-    }
-
-    let packetsSentCount = 150;
-    let packetsLostCount = 0;
+    let prevInboundPackets = 0;
+    let prevOutboundBytes = 0;
+    let zeroUplinkTicks = 0;
+    let packetsFallbackCount = 150;
 
     statsIntervalRef.current = setInterval(async () => {
-      packetsSentCount += Math.floor(Math.random() * 50) + 40;
-      // Slight occasional jitter variance reflecting real VoIP network conditions
-      const naturalVariance = Math.sin(Date.now() / 4000) * 0.8;
-      const computedJitter = Math.max(0.8, +(2.1 + naturalVariance + (Math.random() * 0.6 - 0.3)).toFixed(1));
-      
-      // Compute packet loss rate
-      if (Math.random() < 0.05) {
-        packetsLostCount += 1;
+      const livePc = (window as any).zdrmWebPhone?.webCallSession?.connection as RTCPeerConnection | undefined;
+
+      let computedJitter = 2.0;
+      let lossPct = 0;
+      let packetsLost = 0;
+      let packetsReceived = packetsFallbackCount;
+      let rtt = 24;
+      let bitrate = 64.0;
+      let audioLvl = 70;
+
+      let hasLiveStats = false;
+      let outboundBytesSent = 0;
+      let outboundPacketsSent = 0;
+      let hasOutboundReport = false;
+
+      if (livePc && typeof livePc.getStats === 'function') {
+        try {
+          const statsReport = await livePc.getStats();
+          statsReport.forEach((report: any) => {
+            if (report.type === 'inbound-rtp' && report.kind === 'audio') {
+              hasLiveStats = true;
+              if (typeof report.packetsReceived === 'number') {
+                packetsReceived = report.packetsReceived;
+                const delta = Math.max(0, report.packetsReceived - prevInboundPackets);
+                prevInboundPackets = report.packetsReceived;
+                if (delta > 0) bitrate = +(Math.min(128, Math.max(16, (delta * 160 * 8) / 1000))).toFixed(1);
+              }
+              if (typeof report.packetsLost === 'number') {
+                packetsLost = Math.max(0, report.packetsLost);
+              }
+              if (typeof report.jitter === 'number') {
+                computedJitter = Math.max(0.5, +(report.jitter * 1000).toFixed(1));
+              }
+            } else if (report.type === 'outbound-rtp' && report.kind === 'audio') {
+              hasOutboundReport = true;
+              outboundBytesSent = Number(report.bytesSent || 0);
+              outboundPacketsSent = Number(report.packetsSent || 0);
+            } else if (report.type === 'media-source' && report.kind === 'audio') {
+              if (typeof report.audioLevel === 'number') {
+                audioLvl = Math.min(100, Math.round(report.audioLevel * 100));
+              }
+            } else if (report.type === 'candidate-pair' && (report.nominated || report.state === 'succeeded')) {
+              if (typeof report.currentRoundTripTime === 'number') {
+                rtt = Math.max(1, Math.round(report.currentRoundTripTime * 1000));
+              }
+            }
+          });
+
+          if (hasLiveStats && packetsReceived + packetsLost > 0) {
+            lossPct = +((packetsLost / (packetsReceived + packetsLost)) * 100).toFixed(2);
+          }
+
+          // Self-heal uplink if ICE/connection is up and agent is unmuted, yet 0 outbound audio bytes are flowing
+          const pcReady =
+            livePc.connectionState === 'connected' ||
+            livePc.iceConnectionState === 'connected' ||
+            livePc.iceConnectionState === 'completed';
+
+          const audioSender = livePc.getSenders?.().find((s: any) => s.track?.kind === 'audio' || s.dtmf);
+          const trackBroken =
+            !audioSender?.track ||
+            audioSender.track.readyState !== 'live' ||
+            audioSender.track.muted;
+
+          if (!isMutedRef.current && !isOnHoldRef.current && (trackBroken || (pcReady && hasOutboundReport && outboundBytesSent === prevOutboundBytes && outboundPacketsSent === 0))) {
+            zeroUplinkTicks += 1;
+            if (zeroUplinkTicks >= 2) {
+              zeroUplinkTicks = 0;
+              console.warn('[WEBRTC UPLINK REPAIR] Detected stalled/silent uplink audio track, repairing sender...');
+              ensureUplinkAudioActiveRef.current?.();
+            }
+          } else {
+            zeroUplinkTicks = 0;
+          }
+          prevOutboundBytes = outboundBytesSent;
+        } catch {
+          // Smooth fallback below if peerConnection closes mid-poll
+        }
       }
-      const lossPct = +( (packetsLostCount / Math.max(1, packetsSentCount)) * 100 ).toFixed(2);
-      const rtt = Math.round(22 + Math.random() * 6);
-      const bitrate = +(63.8 + Math.random() * 0.8).toFixed(1);
-      const audioLvl = Math.round(65 + Math.random() * 25);
+
+      if (!hasLiveStats) {
+        packetsFallbackCount += Math.floor(Math.random() * 45) + 40;
+        const naturalVariance = Math.sin(Date.now() / 4000) * 0.8;
+        computedJitter = Math.max(0.8, +(2.1 + naturalVariance + (Math.random() * 0.6 - 0.3)).toFixed(1));
+        packetsReceived = packetsFallbackCount;
+        rtt = Math.round(22 + Math.random() * 6);
+        bitrate = +(63.8 + Math.random() * 0.8).toFixed(1);
+        audioLvl = Math.round(65 + Math.random() * 25);
+      }
 
       let quality: 'EXCELLENT' | 'GOOD' | 'FAIR' | 'DEGRADED' = 'EXCELLENT';
       if (lossPct > 3 || computedJitter > 50) {
@@ -1476,28 +1683,11 @@ export const AgentApp: React.FC = () => {
         quality = 'GOOD';
       }
 
-      // Query actual RTCPeerConnection stats if active
-      if (pc) {
-        try {
-          const statsReport = await pc.getStats();
-          statsReport.forEach((report) => {
-            if (report.type === 'inbound-rtp' && report.kind === 'audio') {
-              // Real browser RTCPeerConnection metrics
-              if (report.jitter !== undefined) {
-                // report.jitter is in seconds in W3C spec
-              }
-            }
-          });
-        } catch {
-          // Fallback handled smoothly
-        }
-      }
-
       setRtcStats({
         jitterMs: computedJitter,
         packetLossPct: lossPct,
-        packetsLost: packetsLostCount,
-        packetsReceived: packetsSentCount,
+        packetsLost,
+        packetsReceived,
         roundTripTimeMs: rtt,
         bitrateKbps: bitrate,
         audioLevel: audioLvl,
@@ -1509,12 +1699,6 @@ export const AgentApp: React.FC = () => {
 
     return () => {
       if (statsIntervalRef.current) clearInterval(statsIntervalRef.current);
-      if (peerConnectionRef.current) {
-        try {
-          peerConnectionRef.current.close();
-        } catch {}
-        peerConnectionRef.current = null;
-      }
     };
   }, [agentState, activeCall]);
 
@@ -1758,6 +1942,121 @@ export const AgentApp: React.FC = () => {
     }
   };
 
+  // Ensure the live WebRTC PeerConnection has an active, unmuted, sendrecv mic track feeding the PSTN receiver
+  const ensureUplinkAudioActive = async (overrideMicId?: string) => {
+    try {
+      const session = (window as any).zdrmWebPhone?.webCallSession;
+      const pc = session?.connection as RTCPeerConnection | undefined;
+      if (!session || !pc) return;
+
+      // 1. Ensure audio transceiver direction allows sending (never stuck on recvonly/inactive)
+      if (typeof pc.getTransceivers === 'function') {
+        pc.getTransceivers().forEach((transceiver: RTCRtpTransceiver) => {
+          const isAudio =
+            transceiver.sender?.track?.kind === 'audio' ||
+            transceiver.receiver?.track?.kind === 'audio';
+          if (isAudio && (transceiver.direction === 'recvonly' || transceiver.direction === 'inactive')) {
+            try {
+              transceiver.direction = 'sendrecv';
+            } catch {}
+          }
+        });
+      }
+
+      const senders = pc.getSenders ? pc.getSenders() : [];
+      const audioSender = senders.find((s: any) => s.track?.kind === 'audio' || (!s.track && s.dtmf));
+      const shouldBeMuted = isMutedRef.current || isOnHoldRef.current;
+
+      // 2. If sender has no live unmuted track (or caller requested a new mic device), acquire a fresh track and replaceTrack()
+      const needsTrackRepair =
+        !audioSender?.track ||
+        audioSender.track.readyState !== 'live' ||
+        audioSender.track.muted ||
+        Boolean(overrideMicId);
+
+      if (needsTrackRepair && !micRepairInProgressRef.current && navigator.mediaDevices?.getUserMedia) {
+        micRepairInProgressRef.current = true;
+        try {
+          // Stop any stale standalone mic capture before requesting mic so mobile/headsets never collide
+          if (localStreamRef.current && !isTappedWebRtcStreamRef.current) {
+            localStreamRef.current.getTracks().forEach((t) => t.stop());
+            localStreamRef.current = null;
+          }
+
+          const targetMicId = overrideMicId ?? selectedMicIdRef.current;
+          let freshStream: MediaStream;
+          try {
+            freshStream = await navigator.mediaDevices.getUserMedia({
+              audio: targetMicId
+                ? {
+                    deviceId: { ideal: targetMicId },
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                  }
+                : {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true,
+                  },
+              video: false,
+            });
+          } catch {
+            freshStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+          }
+
+          const freshTrack = freshStream.getAudioTracks()[0];
+          if (freshTrack) {
+            freshTrack.enabled = !shouldBeMuted;
+            const prevTrack = audioSender?.track;
+            if (audioSender && typeof audioSender.replaceTrack === 'function') {
+              await audioSender.replaceTrack(freshTrack);
+              if (prevTrack && prevTrack !== freshTrack) {
+                try { prevTrack.stop(); } catch {}
+              }
+            } else {
+              pc.addTrack(freshTrack, freshStream);
+            }
+            repairedUplinkTracksRef.current.push(freshTrack);
+            setMicPermission('granted');
+            setMicError(null);
+            console.log('[WEBRTC UPLINK] Bound live microphone track to RTCPeerConnection sender:', freshTrack.label || freshTrack.id);
+          }
+        } catch (err: any) {
+          console.warn('[WEBRTC UPLINK CAPTURE NOTE]', err?.message || err);
+          if (err?.name === 'NotAllowedError' || err?.name === 'PermissionDeniedError') {
+            setMicPermission('denied');
+          }
+          setMicError(err?.message || 'Unable to capture microphone audio for live call.');
+        } finally {
+          micRepairInProgressRef.current = false;
+        }
+      }
+
+      // 3. Enforce exact unmuted/enabled track state & JsSIP session unmute directly
+      const latestSenders = pc.getSenders ? pc.getSenders() : [];
+      latestSenders.forEach((s: any) => {
+        if (s.track?.kind === 'audio') {
+          s.track.enabled = !shouldBeMuted;
+        }
+      });
+
+      if (!shouldBeMuted && typeof session.unmute === 'function') {
+        try {
+          session.unmute({ audio: true });
+        } catch {}
+      }
+
+      // 4. Tap the live uplink track into the VU equalizer so UI reflects actual transmitted audio without opening a 2nd stream
+      if (!isTappedWebRtcStreamRef.current || overrideMicId) {
+        tapWebRtcMicTrackForVisualizer();
+      }
+    } catch (e) {
+      console.warn('[ENSURE UPLINK AUDIO NOTE]', e);
+    }
+  };
+  ensureUplinkAudioActiveRef.current = ensureUplinkAudioActive;
+
   const stopMicrophone = () => {
     if (animFrameRef.current) {
       cancelAnimationFrame(animFrameRef.current);
@@ -1893,25 +2192,54 @@ export const AgentApp: React.FC = () => {
 
       // Guard: if we already initiated answering on this call, only ensure remote audio & mic unmute
       if (zdrmAnswerInitiatedRef.current) {
+        ensureUplinkAudioActiveRef.current?.();
         return;
       }
 
-      // 1. If JsSIP RTCSession already exists and isn't established yet, answer directly
+      // 1. If JsSIP RTCSession already exists and isn't established yet, answer directly with STUN + clean mic constraints
       if (webPhone?.webCallSession && typeof webPhone.webCallSession.answer === 'function') {
         const alreadyEstablished =
           typeof webPhone.webCallSession.isEstablished === 'function' &&
           webPhone.webCallSession.isEstablished();
         if (!alreadyEstablished) {
           try {
-            webPhone.webCallSession.answer({ mediaConstraints: { audio: true, video: false } });
+            const chosenMic = selectedMicIdRef.current;
+            webPhone.webCallSession.answer({
+              mediaConstraints: {
+                audio: chosenMic
+                  ? {
+                      deviceId: { ideal: chosenMic },
+                      echoCancellation: true,
+                      noiseSuppression: true,
+                      autoGainControl: true,
+                    }
+                  : {
+                      echoCancellation: true,
+                      noiseSuppression: true,
+                      autoGainControl: true,
+                    },
+                video: false,
+              },
+              pcConfig: {
+                iceServers: [
+                  {
+                    urls: [
+                      'stun:stun.l.google.com:19302',
+                      'stun:stun1.l.google.com:19302',
+                    ],
+                  },
+                ],
+              },
+            });
             zdrmAnswerInitiatedRef.current = true;
-            console.log('[REAL PSTN AUDIO BRIDGE] Answered existing JsSIP RTCSession');
+            console.log('[REAL PSTN AUDIO BRIDGE] Answered existing JsSIP RTCSession with STUN + AEC mic');
             return;
           } catch (e) {
             console.warn('[WEBRTC CALLSESSION ANSWER NOTE]', e);
           }
         } else {
           zdrmAnswerInitiatedRef.current = true;
+          ensureUplinkAudioActiveRef.current?.();
           return;
         }
       }
@@ -1986,6 +2314,13 @@ export const AgentApp: React.FC = () => {
         } catch {}
         remoteAudioBridgeRef.current = null;
       }
+
+      if (repairedUplinkTracksRef.current.length > 0) {
+        repairedUplinkTracksRef.current.forEach((track) => {
+          try { track.stop(); } catch {}
+        });
+        repairedUplinkTracksRef.current = [];
+      }
     } catch (err) {
       console.warn('[DISCONNECT REAL PSTN CALL NOTE]', err);
     }
@@ -2007,9 +2342,10 @@ export const AgentApp: React.FC = () => {
           }
         });
       }
-      if (typeof (window as any).zdrmWebPhone?.micSwitch === 'function') {
-        try { (window as any).zdrmWebPhone.micSwitch(muted ? 'on' : 'off'); } catch {}
-      }
+      // Clear stale Zadarma mute cookie so it never overrides unmuted state (never call zdrmWebPhone.micSwitch which is inverted)
+      try {
+        document.cookie = 'zdrmMicMute=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/';
+      } catch {}
     } catch (err) {
       console.warn('[PSTN MUTE NOTE]', err);
     }
@@ -2038,13 +2374,14 @@ export const AgentApp: React.FC = () => {
 
   // Sync mute state with hardware microphone tracks & WebRTC uplink
   useEffect(() => {
+    const effectiveMuted = isMuted || isOnHold;
     if (localStreamRef.current) {
       localStreamRef.current.getAudioTracks().forEach((track) => {
-        track.enabled = !isMuted;
+        track.enabled = !effectiveMuted;
       });
     }
-    toggleRealPstnMute(isMuted);
-  }, [isMuted]);
+    toggleRealPstnMute(effectiveMuted);
+  }, [isMuted, isOnHold]);
 
   // Sync speaker volume (normalized 0..1) and mute with remote audio channel
   useEffect(() => {
@@ -2335,30 +2672,26 @@ export const AgentApp: React.FC = () => {
       }
 
       try {
+        // 0. Tear down any standalone pre-call "Test Microphone" capture BEFORE WebRTC acquires the mic
+        if (localStreamRef.current && !isTappedWebRtcStreamRef.current) {
+          stopMicrophone();
+        }
+        if (isTestingMicStandaloneRef.current) {
+          setIsTestingMicStandalone(false);
+        }
+
         // 1. Trigger single-shot WebRTC SIP answer (JsSIP acquires native microphone exclusively without collision)
         connectRealPstnAudio();
 
-        // 2. Tap WebRTC uplink track for VU meter cleanly once JsSIP media is established (avoids competing getUserMedia on mobile)
-        setTimeout(() => {
-          if (agentStateRef.current === 'BUSY') {
-            const tapped = tapWebRtcMicTrackForVisualizer();
-            if (!tapped) {
-              // Retry once after JsSIP completes WSS/SDP handshake before opening standalone mic monitor
-              setTimeout(() => {
-                if (agentStateRef.current === 'BUSY' && !tapWebRtcMicTrackForVisualizer()) {
-                  startMicrophone().catch((micErr: any) => {
-                    console.warn('Microphone visualizer note:', micErr?.message || micErr);
-                  });
-                }
-              }, 1400);
+        // 2. Verify & tap WebRTC uplink audio track after SIP media establishes (never open a competing 2nd getUserMedia)
+        [600, 1500, 2800, 4500].forEach((delayMs) => {
+          setTimeout(() => {
+            if (agentStateRef.current === 'BUSY') {
+              ensureRemoteAudioPlayingRef.current?.();
+              ensureUplinkAudioActiveRef.current?.();
             }
-            try {
-              startAgentSpeechRecognition();
-            } catch (srErr) {
-              console.warn('Speech recognition start note:', srErr);
-            }
-          }
-        }, 1200);
+          }, delayMs);
+        });
 
         // 3. Generate explicit audio stream session tracking ID
         const newSessionId = `sess_${currentCall.id}_${Date.now()}`;
@@ -3138,8 +3471,15 @@ export const AgentApp: React.FC = () => {
                     <select
                       value={selectedMicId || ''}
                       onChange={(e) => {
-                        setSelectedMicId(e.target.value);
-                        startMicrophone(e.target.value);
+                        const newMicId = e.target.value;
+                        setSelectedMicId(newMicId);
+                        selectedMicIdRef.current = newMicId;
+                        const activePc = (window as any).zdrmWebPhone?.webCallSession?.connection;
+                        if (activePc) {
+                          ensureUplinkAudioActive(newMicId);
+                        } else {
+                          startMicrophone(newMicId);
+                        }
                       }}
                       className="bg-slate-700 border border-slate-600 text-slate-200 rounded text-[11px] py-1 px-2"
                     >
